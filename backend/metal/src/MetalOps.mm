@@ -6,25 +6,72 @@
 
 namespace {
 
-NSString* const kShaderSource = @R"MSL(
+// Must match kTileSize in matmul() below -- the kernel's threadgroup
+// arrays and the C++ dispatch's threadsPerThreadgroup both have to
+// agree on the tile's edge length. Interpolated into the MSL source
+// text below (a raw string literal is never macro-expanded, so a
+// #define here would leave the *literal text* "KANSAI_MATMUL_TILE"
+// inside the shader source for Metal's own compiler to choke on as an
+// undefined identifier -- this has to be a real substitution).
+constexpr int kMatmulTile = 16;
+
+NSString* const kShaderSource = [NSString stringWithFormat:@R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
+// Tiled matmul: the naive version (one GPU thread per output element,
+// reading full rows/columns straight from device memory every time)
+// made every thread in a threadgroup re-fetch the *same* rows of A and
+// columns of B its neighbors were already fetching -- no reuse at all,
+// entirely global-memory-bandwidth bound. This stages one
+// TILE x TILE tile of A and one of B into threadgroup (on-chip shared)
+// memory per step, synchronizes once so every thread has finished
+// writing before any thread reads, then has all TILE*TILE threads in
+// the group reuse those two tiles for TILE*TILE multiply-adds each --
+// cutting global memory traffic by roughly a factor of TILE compared
+// to the naive kernel. Boundary tiles (M, K, or N not a multiple of
+// TILE) are handled by zero-padding an out-of-range read and masking
+// an out-of-range write, so correctness doesn't depend on the problem
+// size being tile-aligned.
+constant uint TILE = %d;
+
 kernel void matmul_kernel(
-    device const float* a [[buffer(0)]],
-    device const float* b [[buffer(1)]],
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
     device float* out     [[buffer(2)]],
     constant uint& M [[buffer(3)]],
     constant uint& K [[buffer(4)]],
     constant uint& N [[buffer(5)]],
+    uint2 tid [[thread_position_in_threadgroup]],
     uint2 gid [[thread_position_in_grid]])
 {
-    if (gid.x >= N || gid.y >= M) return;
+    threadgroup float Asub[%d][%d];
+    threadgroup float Bsub[%d][%d];
+
+    uint row = gid.y;
+    uint col = gid.x;
     float acc = 0.0;
-    for (uint k = 0; k < K; ++k) {
-        acc += a[gid.y * K + k] * b[k * N + gid.x];
+
+    uint numTiles = (K + TILE - 1) / TILE;
+    for (uint t = 0; t < numTiles; ++t) {
+        uint aCol = t * TILE + tid.x;
+        uint bRow = t * TILE + tid.y;
+
+        Asub[tid.y][tid.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0;
+        Bsub[tid.y][tid.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < TILE; ++k) {
+            acc += Asub[tid.y][k] * Bsub[k][tid.x];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    out[gid.y * N + gid.x] = acc;
+
+    if (row < M && col < N) {
+        out[row * N + col] = acc;
+    }
 }
 
 kernel void bias_relu_kernel(
@@ -34,7 +81,7 @@ kernel void bias_relu_kernel(
     constant uint& features [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-    float v = x[gid] + bias[gid % features];
+    float v = x[gid] + bias[gid %% features];
     out[gid] = v > 0.0 ? v : 0.0;
 }
 
@@ -45,9 +92,9 @@ kernel void add_bias_kernel(
     constant uint& features [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-    out[gid] = x[gid] + bias[gid % features];
+    out[gid] = x[gid] + bias[gid %% features];
 }
-)MSL";
+)MSL", kMatmulTile, kMatmulTile, kMatmulTile, kMatmulTile, kMatmulTile];
 
 struct MetalState {
     id<MTLDevice> device = nil;
@@ -164,10 +211,22 @@ void matmul(const float* a, const float* b, float* out, int64_t M, int64_t K, in
         [enc setBytes:&uK length:sizeof(uint32_t) atIndex:4];
         [enc setBytes:&uN length:sizeof(uint32_t) atIndex:5];
 
-        NSUInteger w = s.matmul_pipeline.threadExecutionWidth;
-        NSUInteger h = s.matmul_pipeline.maxTotalThreadsPerThreadgroup / w;
-        [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(N), static_cast<NSUInteger>(M), 1)
-        threadsPerThreadgroup:MTLSizeMake(w, h, 1)];
+        // dispatchThreadgroups (not dispatchThreads) deliberately: the
+        // tiled kernel needs every threadgroup to be the FULL
+        // kMatmulTile x kMatmulTile, even at the M/N boundary, since
+        // every thread in the group must participate in loading Asub/
+        // Bsub (its own output can still be masked out via the row/col
+        // bounds check) -- dispatchThreads's non-uniform threadgroup
+        // sizing at boundaries would hand some boundary threadgroups
+        // fewer threads than kMatmulTile*kMatmulTile, leaving parts of
+        // the shared tile unwritten for whichever threads never got
+        // scheduled.
+        MTLSize threadsPerThreadgroup = MTLSizeMake(kMatmulTile, kMatmulTile, 1);
+        MTLSize threadgroupsPerGrid = MTLSizeMake(
+            (static_cast<NSUInteger>(N) + kMatmulTile - 1) / kMatmulTile,
+            (static_cast<NSUInteger>(M) + kMatmulTile - 1) / kMatmulTile,
+            1);
+        [enc dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
         [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];

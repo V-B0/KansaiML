@@ -330,15 +330,65 @@ with more consecutive elementwise steps between matmuls -- or fusing
 matmul itself into the same command buffer -- would show a larger
 share of the isolated benchmark's win; not attempted here.
 
-Still legitimate, understood next steps: `newBufferWithBytesNoCopy` over
-page-aligned host allocations to remove the upload copy entirely
-(Apple Silicon's unified memory makes this possible in principle), and
-either a properly tiled matmul kernel or MPSGraph for the matmul path,
-which this batching fix doesn't touch. Given CUDA is physically
-impossible on this machine (no NVIDIA GPU exists to target) and Vulkan
-would mean testing against the very same GPU through an extra
-translation layer (MoltenVK), Metal was the only backend that could be
-verified end-to-end on real hardware in this pass.
+### Tiling the matmul kernel
+
+Fixed, partially: the naive kernel (one GPU thread per output element,
+reading full rows of A and columns of B straight from device memory
+every time) meant every thread in a threadgroup was independently
+re-fetching the *same* data its neighbors were already fetching -- no
+reuse at all, purely global-memory-bandwidth bound. `matmul_kernel` now
+stages one 16x16 tile of A and one of B into threadgroup (on-chip
+shared) memory per step, synchronizes once via `threadgroup_barrier` so
+every thread has finished writing before any thread reads, then has all
+256 threads in the group reuse those two tiles for 256 multiply-adds
+each before moving to the next tile along K -- cutting global memory
+traffic by roughly 16x compared to the naive version. Boundary tiles (M,
+K, or N not a multiple of 16) are handled by zero-padding an
+out-of-range read and masking an out-of-range write, verified directly
+against CPU at several non-tile-aligned sizes (17x15x19, 100x50x77,
+even 1x1x1), not just the round numbers.
+
+Dispatch had to change alongside the kernel, not just the shader source:
+`dispatchThreadgroups:threadsPerThreadgroup:` (a fixed 16x16 per group)
+replaced `dispatchThreads:`, deliberately -- the tiled kernel needs
+*every* threadgroup to be the full 16x16 even at the M/N boundary, since
+every thread must participate in loading the shared tile (only its own
+output write is masked); `dispatchThreads`'s non-uniform threadgroup
+sizing at boundaries would have handed some boundary groups fewer
+threads than 256, leaving part of the shared tile never written by
+anyone.
+
+The shader source itself is generated via `[NSString stringWithFormat:]`
+now rather than a bare string literal, so the tile size is one real
+number substituted into the MSL text rather than a C preprocessor
+`#define` that a raw string literal would never have expanded in the
+first place (the offline symptom: Metal's compiler would have seen the
+literal text `KANSAI_MATMUL_TILE` as an undefined identifier) --
+including remembering to escape the two literal `%` (modulo) operators
+already in the bias kernels as `%%`, since `stringWithFormat:` treats
+every unescaped `%` as its own format specifier.
+
+Measured, and this is the "partially" in "fixed, partially": tiling
+gets Metal to **0.22x** at 2048x2048 (up from 0.19x untiled) -- roughly
+15-27% faster than the naive kernel across the sizes tested, but still
+4-5x *slower* than Accelerate at every size, not competitive. Single-
+level tiling with one output element per thread closes only part of the
+gap to a specialized, AMX-backed CPU BLAS implementation; the standard
+next steps (register blocking -- each thread computing a small tile of
+outputs instead of one, to amortize the shared-memory load over more
+work; double-buffering tile loads against compute; a larger tile size
+where occupancy allows it) would close more of it, and MPSGraph would
+likely close the rest by reaching the same specialized hardware paths
+Accelerate does. None of that is done here -- this is one real,
+measured step on the path, not the destination.
+
+Still legitimate, understood next steps beyond that: `newBufferWithBytesNoCopy`
+over page-aligned host allocations to remove the upload copy entirely
+(Apple Silicon's unified memory makes this possible in principle).
+Given CUDA is physically impossible on this machine (no NVIDIA GPU
+exists to target) and Vulkan would mean testing against the very same
+GPU through an extra translation layer (MoltenVK), Metal was the only
+backend that could be verified end-to-end on real hardware in this pass.
 
 ## Build
 
