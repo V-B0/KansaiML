@@ -13,10 +13,13 @@ kernels, tested, benchmarked honestly.
   `Tensor::backward()`, a tape-based reverse-mode implementation)
 - `backend/cpu/` — raw float-buffer kernels (Accelerate-backed `matmul`
   on macOS, portable triple-loop fallback elsewhere)
-- `backend/metal/` — a real Metal compute backend: MSL shaders compiled
-  at runtime (`MTLDevice::newLibraryWithSource`), dispatched through
-  `MTLComputeCommandEncoder`, for `matmul`, `bias_relu` (fused), and
-  `add_bias`
+- `backend/metal/` — a real Metal compute backend: a hand-written,
+  16x16-tiled MSL `matmul` (compiled at runtime via
+  `MTLDevice::newLibraryWithSource`, dispatched through
+  `MTLComputeCommandEncoder`) plus `bias_relu` (fused) and `add_bias`;
+  `matmul_mps` (Apple's `MPSMatrixMultiplication`) is what actually
+  reaches parity with Accelerate and is `run_metal`'s default matmul --
+  see the Phase 3 section for the honest comparison between all three
 - `python/` — nanobind bindings (`_core`) plus `kansai.nn` / `kansai.optim`
 - `python/kansai/kir.py` — KIR prototype: `Graph`/`Node` schema, an
   operator-overload tracer (`kir.trace`, `kir.jit`), a reference
@@ -368,27 +371,72 @@ including remembering to escape the two literal `%` (modulo) operators
 already in the bias kernels as `%%`, since `stringWithFormat:` treats
 every unescaped `%` as its own format specifier.
 
-Measured, and this is the "partially" in "fixed, partially": tiling
-gets Metal to **0.22x** at 2048x2048 (up from 0.19x untiled) -- roughly
-15-27% faster than the naive kernel across the sizes tested, but still
-4-5x *slower* than Accelerate at every size, not competitive. Single-
-level tiling with one output element per thread closes only part of the
-gap to a specialized, AMX-backed CPU BLAS implementation; the standard
-next steps (register blocking -- each thread computing a small tile of
-outputs instead of one, to amortize the shared-memory load over more
-work; double-buffering tile loads against compute; a larger tile size
-where occupancy allows it) would close more of it, and MPSGraph would
-likely close the rest by reaching the same specialized hardware paths
-Accelerate does. None of that is done here -- this is one real,
-measured step on the path, not the destination.
+Measured: tiling gets Metal to **0.22x** at 2048x2048 (up from 0.19x
+untiled) -- roughly 15-27% faster than the naive kernel across the
+sizes tested, but still 4-5x *slower* than Accelerate everywhere, not
+competitive. Single-level tiling with one output element per thread
+closes only part of the gap to a specialized, AMX-backed CPU BLAS
+implementation. The next section is what actually closes it.
 
-Still legitimate, understood next steps beyond that: `newBufferWithBytesNoCopy`
-over page-aligned host allocations to remove the upload copy entirely
-(Apple Silicon's unified memory makes this possible in principle).
-Given CUDA is physically impossible on this machine (no NVIDIA GPU
-exists to target) and Vulkan would mean testing against the very same
-GPU through an extra translation layer (MoltenVK), Metal was the only
-backend that could be verified end-to-end on real hardware in this pass.
+### Reaching parity: MPSMatrixMultiplication
+
+`metal::matmul_mps` calls Apple's own `MPSMatrixMultiplication`
+(Metal Performance Shaders) instead of the hand-written kernel --
+still genuinely "the Metal backend" (MPS dispatches as Metal compute
+through the same command-buffer machinery this project already uses),
+just Apple's professionally-tuned GEMM instead of reinventing one by
+hand. This was always the documented next step (see "Tiling the matmul
+kernel" above) once hand-tiling alone proved insufficient, not a
+change of plan.
+
+Measured, warmed up first (see below for why that matters): **MPS
+reaches parity with Accelerate around 2048x2048 (0.85x) and wins outright
+at 4096x4096 (1.12x) and beyond (1.23x at 8192x8192)** -- a real
+crossover, not a rounding-error win. Head to head against the hand-tiled
+kernel, MPS wins everywhere measured except a wash at the smallest size
+(64x64, 0.99x) -- up to **4.1x faster** at 4096x4096 -- so it replaced
+the hand-tiled kernel as `run_metal`'s default matmul dispatch; the
+hand-tiled kernel stays available under its own name (`metal_matmul`,
+`core.metal_matmul`) as the "written by hand" reference and for direct
+comparison, not deleted.
+
+The honest caveat, not swept under the rug: this crossover is
+size-shaped, not universal. Large, roughly square matrices are where MPS
+wins -- the realistic shape a Linear layer's forward pass actually
+produces (a *small* batch dimension against *large* feature dimensions,
+e.g. 128x4096 @ 4096x4096) still loses to Accelerate, **0.35x**,
+because a thin M dimension means less total work to amortize the fixed
+per-call dispatch overhead (buffer creation, command buffer, blocking
+wait) against, regardless of how large K and N are. `run_metal` uses
+MPS unconditionally rather than switching between kernels by shape,
+since it's still a strict upgrade over the hand-tiled kernel at every
+size measured, including this one (1.54x faster than hand-tiled at this
+exact shape) -- "competitive with Accelerate" and "the best of the
+options this backend has" are different claims, and this section is
+honest about which one is true where.
+
+Caught before it produced a misleading number: MPS (like most libraries
+of its kind) pays a one-time kernel-selection/compilation cost on its
+*first* call at a new problem shape. An early, un-warmed benchmark run
+produced a 1024x1024 result *slower* than both its 512x512 and 2048x2048
+neighbors -- caught by noticing the non-monotonic shape, not by
+assuming the first number was right. Every benchmark here now makes one
+untimed warm-up call at each exact shape before starting the timed loop,
+standard practice for any kernel library with first-use compilation,
+applied because it was needed, not on principle alone.
+
+Still legitimate, understood next steps beyond this:
+`newBufferWithBytesNoCopy` over page-aligned host allocations to remove
+the upload copy entirely (Apple Silicon's unified memory makes this
+possible in principle) -- would help most exactly where MPS currently
+loses, since dispatch overhead is the bottleneck there, not compute. And
+register blocking, double-buffering, or a larger tile in the hand-tiled
+kernel remain real options for anyone who wants to keep pushing the
+hand-written path specifically rather than leaning on MPS. Given CUDA
+is physically impossible on this machine (no NVIDIA GPU exists to
+target) and Vulkan would mean testing against the very same GPU through
+an extra translation layer (MoltenVK), Metal was the only backend that
+could be verified end-to-end on real hardware in this pass.
 
 ## Build
 

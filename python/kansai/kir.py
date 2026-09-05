@@ -870,14 +870,20 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
     ops that produced it) demonstrated concretely rather than asserted.
 
     Expects an already-fused graph (elementwise_fusion's output): matmul
-    and fused_bias_relu go to Metal; a plain bias-broadcast add (a
-    layer's final, unactivated output -- elementwise_fusion only fuses
-    add+relu *pairs*, so a solo add stays a solo add) goes to
-    metal_add_bias; everything else (sub/mul/sum/mean -- the loss
-    computation, tiny and not what this is meant to demonstrate) still
-    runs on CPU. A real backend would cover the whole op set; proving
-    the contract holds for the two ops that dominate a Linear layer's
-    cost is the actual point here, not a complete GPU op library.
+    dispatches to metal_matmul_mps (MPSMatrixMultiplication, Apple's own
+    GEMM -- see the README for why this replaced the hand-tiled kernel
+    as the default here: it's a strict upgrade in every case measured
+    except a wash at the smallest sizes, and it's what actually gets
+    Metal to parity with, or past, Accelerate at large problem sizes,
+    which hand tiling alone never reached); fused_bias_relu goes to
+    Metal; a plain bias-broadcast add (a layer's final, unactivated
+    output -- elementwise_fusion only fuses add+relu *pairs*, so a solo
+    add stays a solo add) goes to metal_add_bias; everything else
+    (sub/mul/sum/mean -- the loss computation, tiny and not what this is
+    meant to demonstrate) still runs on CPU. A real backend would cover
+    the whole op set; proving the contract holds for the two ops that
+    dominate a Linear layer's cost is the actual point here, not a
+    complete GPU op library.
 
     Consecutive bias_relu/add_bias nodes -- wherever one's only
     non-bias input is the immediately preceding one, e.g. a second
@@ -941,7 +947,7 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
 
         if node.op == "matmul":
             a, b = (values[i] for i in node.inputs)
-            values[node.id] = core.metal_matmul(a, b)
+            values[node.id] = core.metal_matmul_mps(a, b)
             continue
         if node.op == "fused_sub_square":
             a, b = (values[i] for i in node.inputs)

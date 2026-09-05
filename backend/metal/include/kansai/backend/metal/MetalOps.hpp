@@ -18,10 +18,21 @@ namespace kan::metal {
 bool available();
 
 // out (M,N) = a (M,K) @ b (K,N), row-major host buffers in, host buffer
-// out. Naive: one GPU thread per output element, no shared-memory
-// tiling -- see the module README for how this actually compares to
-// Accelerate's CPU matmul (measured, not assumed).
+// out. Hand-written: one GPU thread per output element, 16x16
+// threadgroup-memory tiling (see the .mm file for how) -- see the
+// project README for how this actually compares to Accelerate's CPU
+// matmul (measured, not assumed): closer than the untiled version, but
+// nowhere near competitive. Kept as the "written by hand" reference;
+// matmul_mps below is the one that's actually fast.
 void matmul(const float* a, const float* b, float* out, int64_t M, int64_t K, int64_t N);
+
+// Same signature, Apple's own implementation (MPSMatrixMultiplication)
+// instead of a hand-written kernel -- still genuinely "the Metal
+// backend" (MPS runs as Metal compute dispatched through the same
+// command-buffer machinery), just Apple's professionally-tuned GEMM
+// instead of reinventing one by hand. See the README for how much
+// closer to (or past) Accelerate this actually gets.
+void matmul_mps(const float* a, const float* b, float* out, int64_t M, int64_t K, int64_t N);
 
 // out[i] = relu(x[i] + bias[i % features]) -- one GPU kernel for the
 // whole bias-add-then-relu chain, the Metal-side analogue of the CPU

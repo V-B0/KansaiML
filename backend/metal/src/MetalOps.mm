@@ -1,6 +1,7 @@
 #include "kansai/backend/metal/MetalOps.hpp"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #include <cstring>
 #include <stdexcept>
 
@@ -232,6 +233,59 @@ void matmul(const float* a, const float* b, float* out, int64_t M, int64_t K, in
         [cmd waitUntilCompleted];
 
         std::memcpy(out, [buf_out contents], static_cast<size_t>(M * N) * sizeof(float));
+    }
+}
+
+void matmul_mps(const float* a, const float* b, float* out, int64_t M, int64_t K, int64_t N) {
+    require_available();
+    @autoreleasepool {
+        MetalState& s = state();
+
+        NSUInteger rowBytesA = static_cast<NSUInteger>(K) * sizeof(float);
+        NSUInteger rowBytesB = static_cast<NSUInteger>(N) * sizeof(float);
+        NSUInteger rowBytesC = static_cast<NSUInteger>(N) * sizeof(float);
+
+        id<MTLBuffer> buf_a = [s.device newBufferWithBytes:a
+                                                      length:static_cast<NSUInteger>(M) * rowBytesA
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_b = [s.device newBufferWithBytes:b
+                                                      length:static_cast<NSUInteger>(K) * rowBytesB
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_out = [s.device newBufferWithLength:static_cast<NSUInteger>(M) * rowBytesC
+                                                       options:MTLResourceStorageModeShared];
+
+        MPSMatrixDescriptor* descA = [MPSMatrixDescriptor matrixDescriptorWithRows:static_cast<NSUInteger>(M)
+                                                                            columns:static_cast<NSUInteger>(K)
+                                                                           rowBytes:rowBytesA
+                                                                           dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor* descB = [MPSMatrixDescriptor matrixDescriptorWithRows:static_cast<NSUInteger>(K)
+                                                                            columns:static_cast<NSUInteger>(N)
+                                                                           rowBytes:rowBytesB
+                                                                           dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor* descC = [MPSMatrixDescriptor matrixDescriptorWithRows:static_cast<NSUInteger>(M)
+                                                                            columns:static_cast<NSUInteger>(N)
+                                                                           rowBytes:rowBytesC
+                                                                           dataType:MPSDataTypeFloat32];
+
+        MPSMatrix* matA = [[MPSMatrix alloc] initWithBuffer:buf_a descriptor:descA];
+        MPSMatrix* matB = [[MPSMatrix alloc] initWithBuffer:buf_b descriptor:descB];
+        MPSMatrix* matC = [[MPSMatrix alloc] initWithBuffer:buf_out descriptor:descC];
+
+        MPSMatrixMultiplication* gemm = [[MPSMatrixMultiplication alloc] initWithDevice:s.device
+                                                                           transposeLeft:NO
+                                                                          transposeRight:NO
+                                                                              resultRows:static_cast<NSUInteger>(M)
+                                                                           resultColumns:static_cast<NSUInteger>(N)
+                                                                         interiorColumns:static_cast<NSUInteger>(K)
+                                                                                   alpha:1.0
+                                                                                    beta:0.0];
+
+        id<MTLCommandBuffer> cmd = [s.queue commandBuffer];
+        [gemm encodeToCommandBuffer:cmd leftMatrix:matA rightMatrix:matB resultMatrix:matC];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        std::memcpy(out, [buf_out contents], static_cast<size_t>(M) * rowBytesC);
     }
 }
 

@@ -10,6 +10,7 @@ namespace kan {
 // grad_node is attached.
 bool metal_available();
 Tensor metal_matmul(const Tensor& a, const Tensor& b);
+Tensor metal_matmul_mps(const Tensor& a, const Tensor& b);
 Tensor metal_bias_relu(const Tensor& x, const Tensor& bias);
 Tensor metal_add_bias(const Tensor& x, const Tensor& bias);
 

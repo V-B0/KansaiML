@@ -7,4 +7,5 @@ set_source_files_properties(src/MetalOps.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc
 
 find_library(METAL_FRAMEWORK Metal REQUIRED)
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
-target_link_libraries(kansai_backend_metal PUBLIC ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+find_library(MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
+target_link_libraries(kansai_backend_metal PUBLIC ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${MPS_FRAMEWORK})

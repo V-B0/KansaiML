@@ -15,6 +15,15 @@ Tensor metal_matmul(const Tensor& a, const Tensor& b) {
     return out;
 }
 
+Tensor metal_matmul_mps(const Tensor& a, const Tensor& b) {
+    if (a.ndim() != 2 || b.ndim() != 2 || a.shape()[1] != b.shape()[0])
+        throw std::runtime_error("metal_matmul_mps: incompatible shapes");
+    int64_t M = a.shape()[0], K = a.shape()[1], N = b.shape()[1];
+    Tensor out = Tensor::zeros({M, N}, false);
+    metal::matmul_mps(a.data_ptr(), b.data_ptr(), out.data_ptr(), M, K, N);
+    return out;
+}
+
 Tensor metal_bias_relu(const Tensor& x, const Tensor& bias) {
     Tensor out = Tensor::zeros(x.shape(), false);
     metal::bias_relu(x.data_ptr(), bias.data_ptr(), out.data_ptr(), x.shape()[0], x.shape()[1]);

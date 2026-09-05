@@ -71,32 +71,65 @@ assert d4 < TOL, f"run_metal mismatch: {d4}"
 print(f"run_metal matches run() end-to-end (max diff {d4:.2e}): {[round(v, 4) for v in out_metal]}")
 
 # ---------------------------------------------------------------------
-# 3. Performance: does a naive (untiled, one-thread-per-output-element)
-#    Metal matmul kernel actually beat Accelerate's highly-optimized CPU
-#    BLAS? Not assumed -- measured across a size sweep, same approach as
-#    the memory planner's crossover search. A naive GPU kernel losing to
-#    a good CPU BLAS implementation at modest sizes would be a
-#    completely normal, expected result, not a bug.
+# 3. Performance: does either Metal matmul path actually beat
+#    Accelerate's highly-optimized CPU BLAS? Not assumed -- measured
+#    across a size sweep, same approach as the memory planner's
+#    crossover search. Every timed loop is preceded by an untimed warm-up
+#    call at that exact shape: MPS (like most such libraries) pays a
+#    one-time kernel-selection/compile cost on its first call at a new
+#    problem size, and skipping the warm-up here originally produced a
+#    misleadingly slow 1024x1024 result on a 3-iteration average, purely
+#    from that first call's cost dominating -- caught by cross-checking
+#    against neighboring sizes, not assumed correct.
 # ---------------------------------------------------------------------
 
-print("\nmatmul benchmark: CPU (Accelerate) vs Metal (naive kernel), square matrices")
-for dim in (64, 256, 512, 1024, 2048):
+print("\nmatmul benchmark: CPU (Accelerate) vs Metal hand-tiled vs Metal MPS, square matrices")
+for dim in (64, 256, 512, 1024, 2048, 4096):
     m1 = kansai.randn([dim, dim], std=1.0, seed=10)
     m2 = kansai.randn([dim, dim], std=1.0, seed=11)
-    iters = max(3, min(50, 200_000_000 // (dim ** 3) + 1))
+    iters = max(5, min(50, 400_000_000 // (dim ** 3) + 1))
 
+    m1.matmul(m2)
     t0 = time.perf_counter()
     for _ in range(iters):
         m1.matmul(m2)
     t_cpu = (time.perf_counter() - t0) / iters
 
+    core.metal_matmul(m1, m2)
     t0 = time.perf_counter()
     for _ in range(iters):
         core.metal_matmul(m1, m2)
-    t_metal = (time.perf_counter() - t0) / iters
+    t_tiled = (time.perf_counter() - t0) / iters
 
-    print(f"  {dim:5d}x{dim:<5d}  cpu={t_cpu*1e3:9.3f} ms  metal={t_metal*1e3:9.3f} ms  "
-          f"speedup={t_cpu/t_metal:5.2f}x  ({iters} iters)")
+    core.metal_matmul_mps(m1, m2)
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        core.metal_matmul_mps(m1, m2)
+    t_mps = (time.perf_counter() - t0) / iters
+
+    print(f"  {dim:5d}x{dim:<5d}  cpu={t_cpu*1e3:9.3f} ms  tiled={t_tiled*1e3:9.3f} ms  mps={t_mps*1e3:9.3f} ms  "
+          f"mps_vs_cpu={t_cpu/t_mps:5.2f}x  mps_vs_tiled={t_tiled/t_mps:5.2f}x  ({iters} iters)")
+
+# The realistic shape a Linear layer's forward pass actually produces:
+# a small (batch) dimension against large (feature) dimensions, not a
+# large square matrix -- MPS's win margin above shrinks, or reverses,
+# once M is small relative to K and N (less total work to amortize the
+# fixed per-call dispatch overhead against).
+m1 = kansai.randn([128, 4096], std=1.0, seed=12)
+m2 = kansai.randn([4096, 4096], std=1.0, seed=13)
+iters = 20
+m1.matmul(m2)
+t0 = time.perf_counter()
+for _ in range(iters):
+    m1.matmul(m2)
+t_cpu = (time.perf_counter() - t0) / iters
+core.metal_matmul_mps(m1, m2)
+t0 = time.perf_counter()
+for _ in range(iters):
+    core.metal_matmul_mps(m1, m2)
+t_mps = (time.perf_counter() - t0) / iters
+print(f"  128x4096 @ 4096x4096 (realistic layer shape)  cpu={t_cpu*1e3:9.3f} ms  mps={t_mps*1e3:9.3f} ms  "
+      f"mps_vs_cpu={t_cpu/t_mps:.2f}x")
 
 # ---------------------------------------------------------------------
 # 4. Batching consecutive elementwise Metal ops into one command
@@ -150,16 +183,28 @@ big_graph = kir.trace(big_chained, big_X)
 big_fused = kir.elementwise_fusion(big_graph)
 
 iters = 100
+
+# Warm up both paths at this exact shape before timing either: MPS (like
+# most such libraries) pays a one-time kernel-selection/compile cost on
+# its first call at a new problem size, and an un-warmed first iteration
+# inside the timed loop is exactly what produced a misleadingly slow
+# result the first time this benchmark ran (see the README).
+kir.run_metal(big_fused, big_X)
+core.metal_matmul_mps(big_X, big_w)
+core.metal_bias_relu(core.metal_matmul_mps(big_X, big_w), big_bias1)
+
 t0 = time.perf_counter()
 for _ in range(iters):
     kir.run_metal(big_fused, big_X)
 t_batched = (time.perf_counter() - t0) / iters
 
-# The pre-batching equivalent: the same two ops, each its own command
-# buffer -- what run_metal did before this change.
+# The pre-batching equivalent: the same three ops (same matmul kernel --
+# metal_matmul_mps, what run_metal itself now uses -- so this isolates
+# the batching effect specifically, not a mix of "batching" and
+# "switched matmul kernels"), each its own command buffer.
 t0 = time.perf_counter()
 for _ in range(iters):
-    x = core.metal_matmul(big_X, big_w)
+    x = core.metal_matmul_mps(big_X, big_w)
     x = core.metal_bias_relu(x, big_bias1)
     core.metal_add_bias(x, big_bias2)
 t_unbatched = (time.perf_counter() - t0) / iters
