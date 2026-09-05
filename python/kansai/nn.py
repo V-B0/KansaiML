@@ -39,6 +39,21 @@ class Linear(Module):
         return x.matmul(self.weight).add(self.bias)
 
 
+class Conv2d(Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
+                 stride: int = 1, padding: int = 0, seed: int = 0):
+        self.stride = stride
+        self.padding = padding
+        fan_in = in_channels * kernel_size * kernel_size
+        std = 1.0 / math.sqrt(fan_in)
+        self.weight = randn([out_channels, in_channels, kernel_size, kernel_size],
+                             std=std, requires_grad=True, seed=seed)
+        self.bias = zeros([out_channels], requires_grad=True)
+
+    def forward(self, x):
+        return x.conv2d(self.weight, self.bias, self.stride, self.padding)
+
+
 class ReLU(Module):
     def forward(self, x):
         return x.relu()

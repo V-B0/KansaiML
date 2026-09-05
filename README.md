@@ -20,7 +20,8 @@ kernels, tested, benchmarked honestly.
   `matmul_mps` (Apple's `MPSMatrixMultiplication`) is what actually
   reaches parity with Accelerate and is `run_metal`'s default matmul --
   see the Phase 3 section for the honest comparison between all three
-- `python/` — nanobind bindings (`_core`) plus `kansai.nn` / `kansai.optim`
+- `python/` — nanobind bindings (`_core`) plus `kansai.nn` (now including
+  `Conv2d`) / `kansai.optim`
 - `python/kansai/kir.py` — KIR prototype: `Graph`/`Node` schema, an
   operator-overload tracer (`kir.trace`, `kir.jit`), a reference
   interpreter (`kir.run`), dead code elimination
@@ -55,6 +56,13 @@ kernels, tested, benchmarked honestly.
   Linear graph, a size-sweep benchmark against Accelerate (see below for
   the honest result), and the batched-elementwise-chain benchmark on a
   real (not synthetic) chained graph
+- `tests/test_conv2d.py` — Conv2d: forward checked against an
+  independent direct/naive nested-loop reference (not just a
+  self-consistency check), backward checked numerically, a tiny conv
+  net trained by ordinary SGD to a real, checkable near-zero-loss target
+  (not a threshold picked by guessing -- see the file for why an
+  earlier classification-shaped target had an unreachable ~0.365
+  theoretical floor), and KIR trace/run/run_planned integration
 
 ## Phase 2 status
 
@@ -437,6 +445,56 @@ is physically impossible on this machine (no NVIDIA GPU exists to
 target) and Vulkan would mean testing against the very same GPU through
 an extra translation layer (MoltenVK), Metal was the only backend that
 could be verified end-to-end on real hardware in this pass.
+
+## Conv2d
+
+`Tensor::conv2d` (NCHW, `(N,Cin,H,W)` input against `(Cout,Cin,kH,kW)`
+weight) is real, not a stub: forward is im2col (unfold each batch
+item's input into a `(Cin*kH*kW, Hout*Wout)` patch matrix) followed by
+one `matmul` call per batch item -- the same Accelerate-backed kernel
+every other op in this codebase already uses, rather than a
+hand-written convolution inner loop. Backward reuses the same
+transpose-avoiding `matmul_nt`/`matmul_tn` the layout-optimization work
+built for `Tensor::matmul`'s own backward, plus `col2im` (im2col's
+inverse: a scatter-*add*, since overlapping patches at stride < kernel
+size means multiple output positions contribute to the same input
+pixel) for the gradient wrt the input.
+
+Correctness is checked two genuinely independent ways on purpose, not
+one: forward against a direct, textbook nested-loop convolution with no
+im2col or matmul anywhere in it (a self-consistency check like
+gradient-checking the *same* forward implementation would never catch
+an indexing bug -- both sides would reflect the identical mistake), then
+backward against central differences. A tiny `nn.Conv2d` then trains by
+ordinary SGD on a task with a *known, exactly representable* target (a
+3x3 filter regressing each non-overlapping patch to its own pixel sum,
+representable exactly by an all-ones kernel and zero bias) rather than a
+threshold picked by guessing: it converges to essentially zero loss and
+the learned weight comes out as `[1,1,1,1,1,1,1,1,1]`, exactly the
+kernel that reproduces a sum. An earlier version of that same sanity
+check used a sign-classification target instead, whose achievable MSE
+for any linear (activation-free) model turns out to be ~0.365 by a
+symmetry argument -- an assertion threshold below that would have failed
+regardless of whether conv2d's gradients were correct, which is exactly
+the kind of test that looks like it's checking correctness while
+actually just checking whether the target was reachable at all.
+
+KIR integration is real but partial, on purpose: `kir.trace` records
+`conv2d` as a first-class node, and `kir.run`/`kir.run_planned` both
+dispatch it correctly (verified against eager). Not wired in:
+`elementwise_fusion` (no known fused pattern involves conv2d -- nothing
+to gain from pretending otherwise) and `run_metal` (no Metal conv
+kernel exists yet). Both simply have no case for `"conv2d"`, so a graph
+containing one raises a clear `KeyError` there rather than silently
+mishandling it.
+
+NCHW only, deliberately: no layout optimizer exists yet to choose
+between NCHW and NHWC, so there was nothing to gain from supporting
+both from day one. Conv2d existing now is what actually gives that
+optimizer something to work on -- building it was the whole point of
+the "an actual layout optimizer once there's a layout-sensitive op"
+line in this README's own earlier Phase 2 section. Not attempted here;
+a natural next step whenever it's worth picking up.
 
 ## Build
 

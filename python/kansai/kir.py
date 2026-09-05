@@ -133,6 +133,22 @@ class TraceValue:
         out_shape = [self.shape[0], other.shape[1]]
         return self._binop(other, "matmul", out_shape)
 
+    def conv2d(self, weight, bias, stride, padding):
+        weight = self._coerce(weight)
+        bias = self._coerce(bias)
+        if len(self.shape) != 4 or len(weight.shape) != 4:
+            raise ValueError(f"conv2d: input and weight must be 4D, got {self.shape} and {weight.shape}")
+        N, Cin, H, W = self.shape
+        Cout, Cin_w, kH, kW = weight.shape
+        if Cin != Cin_w:
+            raise ValueError(f"conv2d: channel mismatch {Cin} vs {Cin_w}")
+        Hout = (H + 2 * padding - kH) // stride + 1
+        Wout = (W + 2 * padding - kW) // stride + 1
+        out_shape = [N, Cout, Hout, Wout]
+        nid = self.graph.add("conv2d", [self.node_id, weight.node_id, bias.node_id], out_shape, self.dtype,
+                              stride=stride, padding=padding)
+        return TraceValue(self.graph, nid, out_shape, self.dtype)
+
     def relu(self):
         nid = self.graph.add("relu", [self.node_id], list(self.shape), self.dtype)
         return TraceValue(self.graph, nid, list(self.shape), self.dtype)
@@ -211,6 +227,10 @@ def run(graph: Graph, *args) -> "core.Tensor":
             values[node.id] = core.broadcast_scalar(
                 values[node.inputs[0]], node.shape, node.attrs["scale"]
             )
+            continue
+        if node.op == "conv2d":
+            x, w, b = (values[i] for i in node.inputs)
+            values[node.id] = x.conv2d(w, b, node.attrs["stride"], node.attrs["padding"])
             continue
         fn = _OP_TABLE[node.op]
         values[node.id] = fn(*(values[i] for i in node.inputs))
@@ -461,6 +481,10 @@ def run_fused(graph: Graph, *args) -> "core.Tensor":
             a, b = (values[i] for i in node.inputs)
             values[node.id] = core.fused_sub_square(a, b)
             continue
+        if node.op == "conv2d":
+            x, w, b = (values[i] for i in node.inputs)
+            values[node.id] = x.conv2d(w, b, node.attrs["stride"], node.attrs["padding"])
+            continue
         fn = _OP_TABLE[node.op]
         values[node.id] = fn(*(values[i] for i in node.inputs))
 
@@ -648,6 +672,9 @@ def run_planned(graph: Graph, plan: MemoryPlan, pool, *args) -> "core.Tensor":
             elif node.op == "fused_sub_square":
                 fa, fb = (values[i] for i in node.inputs)
                 values[node.id] = core.fused_sub_square(fa, fb)
+            elif node.op == "conv2d":
+                cx, cw, cb = (values[i] for i in node.inputs)
+                values[node.id] = cx.conv2d(cw, cb, node.attrs["stride"], node.attrs["padding"])
             else:
                 fn = _OP_TABLE[node.op]
                 values[node.id] = fn(*(values[i] for i in node.inputs))

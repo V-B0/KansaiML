@@ -44,6 +44,7 @@ NB_MODULE(_core, m) {
         .def("relu", &Tensor::relu)
         .def("sum", &Tensor::sum)
         .def("mean", &Tensor::mean)
+        .def("conv2d", &Tensor::conv2d, nb::arg("weight"), nb::arg("bias"), nb::arg("stride"), nb::arg("padding"))
         .def("__add__", &Tensor::add)
         .def("__sub__", &Tensor::sub)
         .def("__mul__", &Tensor::mul)

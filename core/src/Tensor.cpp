@@ -256,6 +256,87 @@ Tensor Tensor::sum() const {
     return out;
 }
 
+Tensor Tensor::conv2d(const Tensor& weight, const Tensor& bias, int64_t stride, int64_t padding) const {
+    const Tensor& x = *this;
+    if (x.ndim() != 4)
+        throw std::runtime_error("conv2d: input must be 4D (N, Cin, H, W)");
+    if (weight.ndim() != 4)
+        throw std::runtime_error("conv2d: weight must be 4D (Cout, Cin, kH, kW)");
+
+    int64_t N = x.shape()[0], Cin = x.shape()[1], H = x.shape()[2], W = x.shape()[3];
+    int64_t Cout = weight.shape()[0], Cin_w = weight.shape()[1], kH = weight.shape()[2], kW = weight.shape()[3];
+    if (Cin != Cin_w)
+        throw std::runtime_error("conv2d: input and weight channel counts don't match");
+    if (bias.numel() != Cout)
+        throw std::runtime_error("conv2d: bias must have Cout elements");
+
+    int64_t Hout = (H + 2 * padding - kH) / stride + 1;
+    int64_t Wout = (W + 2 * padding - kW) / stride + 1;
+    if (Hout <= 0 || Wout <= 0)
+        throw std::runtime_error("conv2d: kernel/stride/padding produce a non-positive output size");
+    int64_t HWout = Hout * Wout;
+    int64_t colRows = Cin * kH * kW;
+
+    Tensor out = Tensor::zeros({N, Cout, Hout, Wout}, false);
+
+    // One im2col + one matmul per batch item -- reusing the exact matmul
+    // kernel (Accelerate-backed on this platform) every other op in this
+    // codebase already goes through, rather than a hand-written
+    // convolution inner loop.
+    std::vector<float> col(static_cast<size_t>(colRows * HWout));
+    for (int64_t n = 0; n < N; ++n) {
+        const float* xn = x.data_ptr() + n * Cin * H * W;
+        float* yn = out.data_ptr() + n * Cout * HWout;
+        cpu::im2col(xn, col.data(), Cin, H, W, kH, kW, stride, padding, Hout, Wout);
+        cpu::matmul(weight.data_ptr(), col.data(), yn, Cout, colRows, HWout);
+    }
+    cpu::add_bias_nchw(out.data_ptr(), bias.data_ptr(), out.data_ptr(), N, Cout, HWout);
+
+    if (x.requires_grad() || weight.requires_grad() || bias.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "conv2d";
+        node->inputs = {x, weight, bias};
+        node->backward_fn = [x, weight, N, Cin, H, W, Cout, kH, kW, stride, padding, Hout, Wout, HWout,
+                              colRows](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros({N, Cin, H, W}, false);
+            Tensor grad_w = Tensor::zeros({Cout, Cin, kH, kW}, false);
+            Tensor grad_b = Tensor::zeros({Cout}, false);
+
+            cpu::sum_over_batch_and_spatial(grad_output.data_ptr(), grad_b.data_ptr(), N, Cout, HWout);
+
+            std::vector<float> col(static_cast<size_t>(colRows * HWout));
+            std::vector<float> dcol(static_cast<size_t>(colRows * HWout));
+            std::vector<float> grad_w_step(static_cast<size_t>(Cout * colRows));
+
+            for (int64_t n = 0; n < N; ++n) {
+                const float* xn = x.data_ptr() + n * Cin * H * W;
+                const float* dyn = grad_output.data_ptr() + n * Cout * HWout;
+                float* dxn = grad_x.data_ptr() + n * Cin * H * W;
+
+                // grad_w's im2col needs the SAME col matrix the forward
+                // pass built for this batch item -- recomputed here
+                // (not cached from forward) to keep this closure's only
+                // captured state the inputs themselves, matching every
+                // other op's backward_fn in this file.
+                cpu::im2col(xn, col.data(), Cin, H, W, kH, kW, stride, padding, Hout, Wout);
+
+                // grad_w += dy_flat(Cout,HWout) @ col(colRows,HWout)^T -> (Cout,colRows)
+                cpu::matmul_nt(dyn, col.data(), grad_w_step.data(), Cout, HWout, colRows);
+                cpu::axpy_(grad_w.data_ptr(), grad_w_step.data(), 1.0f, Cout * colRows);
+
+                // dcol = weight_flat(Cout,colRows)^T @ dy_flat(Cout,HWout) -> (colRows,HWout)
+                cpu::matmul_tn(weight.data_ptr(), dyn, dcol.data(), Cout, colRows, HWout);
+                cpu::col2im(dcol.data(), dxn, Cin, H, W, kH, kW, stride, padding, Hout, Wout);
+            }
+
+            return {grad_x, grad_w, grad_b};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
 Tensor Tensor::mean() const {
     const Tensor& x = *this;
     Tensor out = Tensor::zeros({1}, false);

@@ -74,6 +74,16 @@ public:
     Tensor sum() const;
     Tensor mean() const;
 
+    // self: (N, Cin, H, W), weight: (Cout, Cin, kH, kW), bias: (Cout,).
+    // Forward is im2col + the same matmul kernel every other op already
+    // uses (one call per batch item); backward reuses matmul_nt/matmul_tn
+    // the same way Tensor::matmul's own backward does, plus col2im for
+    // the scatter-add back into the input's shape. NCHW only -- see the
+    // project README for why (no layout optimizer exists yet to pick
+    // between layouts, so there was nothing to gain from supporting both
+    // on day one).
+    Tensor conv2d(const Tensor& weight, const Tensor& bias, int64_t stride, int64_t padding) const;
+
     std::vector<float> to_vector() const;
 
     TensorData* impl_ptr() const { return impl_.get(); }
