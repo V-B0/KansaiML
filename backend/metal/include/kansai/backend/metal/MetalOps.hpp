@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <vector>
 
 // A real Metal compute backend: MSL shaders compiled at runtime (via
 // MTLDevice::newLibraryWithSource, a Metal.framework API -- this
@@ -30,5 +31,26 @@ void bias_relu(const float* x, const float* bias, float* out, int64_t batch, int
 // out[i] = x[i] + bias[i % features] -- the same broadcast add without
 // the relu clamp, for a layer's final (unactivated) output.
 void add_bias(const float* x, const float* bias, float* out, int64_t batch, int64_t features);
+
+// One step of a batched elementwise chain (see run_elementwise_chain):
+// which kernel to run, and its bias operand.
+enum class ElemKernel { BiasRelu, AddBias };
+
+struct ElemStep {
+    ElemKernel kernel;
+    const float* bias;
+};
+
+// Runs `steps` in sequence -- x0 -> steps[0] -> steps[1] -> ... -> out
+// -- entirely within ONE command buffer and ONE waitUntilCompleted,
+// each step's output staying resident on the GPU and feeding directly
+// into the next step's input. Calling bias_relu()/add_bias() N times in
+// a row instead pays N separate command-buffer round trips (encode,
+// commit, block on waitUntilCompleted, copy the result back to host) --
+// this pays for exactly one, no matter how many steps. Only the
+// initial upload (x0, and each step's bias) and the final download
+// (out) ever touch host memory.
+void run_elementwise_chain(const float* x0, int64_t batch, int64_t features,
+                            const std::vector<ElemStep>& steps, float* out);
 
 } // namespace kan::metal

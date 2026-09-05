@@ -97,6 +97,7 @@ NB_MODULE(_core, m) {
     m.def("metal_matmul", &metal_matmul, nb::arg("a"), nb::arg("b"));
     m.def("metal_bias_relu", &metal_bias_relu, nb::arg("x"), nb::arg("bias"));
     m.def("metal_add_bias", &metal_add_bias, nb::arg("x"), nb::arg("bias"));
+    m.def("metal_elementwise_chain", &metal_elementwise_chain, nb::arg("x"), nb::arg("kinds"), nb::arg("biases"));
 #else
     m.def("metal_available", []() { return false; });
 #endif

@@ -1,5 +1,7 @@
 #pragma once
 #include "kansai/Tensor.hpp"
+#include <string>
+#include <vector>
 
 namespace kan {
 
@@ -10,5 +12,12 @@ bool metal_available();
 Tensor metal_matmul(const Tensor& a, const Tensor& b);
 Tensor metal_bias_relu(const Tensor& x, const Tensor& bias);
 Tensor metal_add_bias(const Tensor& x, const Tensor& bias);
+
+// Runs a sequence of elementwise ops (each kind either "bias_relu" or
+// "add_bias") as ONE Metal command buffer instead of one per step --
+// see backend/metal's run_elementwise_chain for what that saves.
+// kinds.size() must equal biases.size().
+Tensor metal_elementwise_chain(const Tensor& x, const std::vector<std::string>& kinds,
+                                const std::vector<Tensor>& biases);
 
 } // namespace kan

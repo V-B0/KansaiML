@@ -49,8 +49,9 @@ kernels, tested, benchmarked honestly.
   `.backward()` is never called at all
 - `tests/test_metal_backend.py` — Phase 3: kernel correctness against
   CPU, `run_metal` correctness end-to-end on the fused Linear->ReLU->
-  Linear graph, and a size-sweep benchmark against Accelerate (see below
-  for the honest result)
+  Linear graph, a size-sweep benchmark against Accelerate (see below for
+  the honest result), and the batched-elementwise-chain benchmark on a
+  real (not synthetic) chained graph
 
 ## Phase 2 status
 
@@ -255,8 +256,8 @@ differences (GPU and CPU sum in different orders; exact bit-for-bit
 agreement was never the right bar).
 
 The honest performance result: **Metal loses to Accelerate at every
-size tested**, from 64x64 up to 2048x2048 for matmul (0.00x-0.17x) and
-from 0.1M to 16.8M elements for the fused bias+relu kernel
+size tested**, from 64x64 up to 2048x2048 for matmul (0.00x-0.19x) and
+from 0.1M to 16.8M elements for a single fused bias+relu kernel call
 (0.03x-0.67x) -- though the gap consistently narrows as size grows in
 both cases, which is the interesting part. Two real, separate causes,
 not one:
@@ -270,27 +271,74 @@ not one:
    element, no tiling at all) was never going to be competitive on raw
    matmul FLOPs -- proving the pipeline and the correctness was the
    actual goal of writing it by hand instead of reaching for MPSGraph
-   immediately.
-2. **This dispatch design pays real, avoidable overhead on every call**:
-   `newBufferWithBytes` copies host memory into a new Metal buffer for
-   every argument (even though Apple Silicon's unified memory means a
-   no-copy wrap of already-resident memory is possible in principle),
-   and each op gets its own command buffer plus a blocking
-   `waitUntilCompleted` -- no overlap, no batching multiple ops into one
-   command buffer before synchronizing once. For the elementwise kernels
-   specifically (bandwidth-bound, no blocking needed to be competitive
-   in principle), this dispatch overhead is very likely the dominant
-   cost, not the compute itself.
+   immediately. Still true, still the single biggest lever left on the
+   matmul path -- not addressed by the batching below, which is about
+   the elementwise kernels specifically.
+2. **The original dispatch design paid real, avoidable overhead on
+   every call**: `newBufferWithBytes` copies host memory into a new
+   Metal buffer for every argument, and each op got its own command
+   buffer plus a blocking `waitUntilCompleted` -- no overlap, no
+   batching multiple ops into one command buffer before synchronizing
+   once. For the elementwise kernels (bandwidth-bound, no tiling needed
+   to be competitive in principle) this was very likely the dominant
+   cost, not the compute itself -- which the next section fixes.
 
-Both are legitimate, understood next steps -- not done here:
-`newBufferWithBytesNoCopy` over page-aligned host allocations to remove
-the upload copy, batching a whole graph's worth of Metal ops into one
-command buffer instead of one round-trip per op, and either a properly
-tiled matmul kernel or MPSGraph for the matmul path specifically. Given
-CUDA is physically impossible on this machine (no NVIDIA GPU exists to
-target) and Vulkan would mean testing against the very same GPU through
-an extra translation layer (MoltenVK), Metal was the only backend that
-could be verified end-to-end on real hardware in this pass.
+### Batching the elementwise kernels into one command buffer
+
+Fixed: `metal::run_elementwise_chain` (backend/metal) encodes a whole
+sequence of `bias_relu`/`add_bias` steps into ONE command buffer with
+ONE `waitUntilCompleted`, each step's output staying resident on the GPU
+and feeding directly into the next step's input -- a new encoder per
+step (ended before the next begins), which is the standard way to chain
+several dispatches without an explicit fence, since Metal's automatic
+hazard tracking makes each step's writes visible to the next step's
+reads within one command buffer. Only the first upload and the final
+download ever touch host memory, however long the chain.
+
+Measured on an isolated synthetic chain (N steps of alternating
+bias_relu/add_bias, nothing else involved): **4-10x faster** than
+calling the equivalent stepwise functions N times, depending on batch
+size and chain length -- confirming the per-call round trip really was
+the dominant cost, not the compute.
+
+Wiring this into `kir.run_metal` needed a second, independent fix, not
+just calling the new function: `elementwise_fusion`'s greedy single-use
+grouping absorbs a layer's `add,relu` pair *and* the next layer's
+unactivated `add` into one three-member group whenever nothing else
+consumes the first layer's output, and the fusion pass used to require
+a group to match one whole known pattern (`("add","relu")` or
+`("sub","mul")`) -- a 3-member group matched neither, so *nothing* in
+it got fused at all, silently, for any graph shaped like two chained
+layers. Confirmed this directly on a real traced graph before fixing
+it, not assumed. Fixed by having `elementwise_fusion` greedily segment
+a group into a *sequence* of known 2-node patterns (`_segment_group`)
+instead of requiring the whole group to match one shape -- a group
+longer than a single recognized pair now fuses each recognizable pair
+inside it, chained to whatever's on either side, rather than being
+rejected wholesale. `run_metal` then batches any run of consecutive
+`fused_bias_relu`/bias-broadcast-`add` nodes it finds (there can be
+more than one such run per graph, separated by matmuls, each batched
+independently) into a single `metal_elementwise_chain` call.
+
+Measured on the real, now-correctly-fused graph (one matmul feeding a
+fused bias+relu immediately followed by another layer's bias-add, batch
+128, dim 512): **1.22x** -- smaller than the isolated benchmark's
+4-10x, because savings scale with how long the elementwise-only run is,
+and this graph has only a two-step run bookended by one matmul (whose
+own cost dominates and isn't touched by this fix). A deeper network
+with more consecutive elementwise steps between matmuls -- or fusing
+matmul itself into the same command buffer -- would show a larger
+share of the isolated benchmark's win; not attempted here.
+
+Still legitimate, understood next steps: `newBufferWithBytesNoCopy` over
+page-aligned host allocations to remove the upload copy entirely
+(Apple Silicon's unified memory makes this possible in principle), and
+either a properly tiled matmul kernel or MPSGraph for the matmul path,
+which this batching fix doesn't touch. Given CUDA is physically
+impossible on this machine (no NVIDIA GPU exists to target) and Vulkan
+would mean testing against the very same GPU through an extra
+translation layer (MoltenVK), Metal was the only backend that could be
+verified end-to-end on real hardware in this pass.
 
 ## Build
 

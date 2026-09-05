@@ -98,4 +98,76 @@ for dim in (64, 256, 512, 1024, 2048):
     print(f"  {dim:5d}x{dim:<5d}  cpu={t_cpu*1e3:9.3f} ms  metal={t_metal*1e3:9.3f} ms  "
           f"speedup={t_cpu/t_metal:5.2f}x  ({iters} iters)")
 
+# ---------------------------------------------------------------------
+# 4. Batching consecutive elementwise Metal ops into one command
+#    buffer. elementwise_fusion's greedy single-use grouping absorbs a
+#    layer's bias_relu and the *next* layer's unactivated bias-add into
+#    one group whenever nothing else consumes the first layer's output
+#    -- and (since this pass now segments a longer group into known
+#    2-node patterns instead of rejecting the whole group when it's not
+#    an exact match) that produces exactly the adjacency run_metal's
+#    batching looks for: fused_bias_relu immediately followed by add,
+#    no matmul in between.
+# ---------------------------------------------------------------------
+
+w = kansai.randn([2, 8], std=0.5, seed=20)
+extra_bias1 = kansai.randn([8], std=0.3, seed=21)
+extra_bias2 = kansai.randn([8], std=0.3, seed=22)
+
+
+def chained(x):
+    pred = x.matmul(w).add(extra_bias1).relu()
+    return pred.add(extra_bias2)
+
+
+chain_graph = kir.trace(chained, X)
+chain_fused = kir.elementwise_fusion(chain_graph)
+chain_ops = [n.op for n in chain_fused.nodes]
+assert "fused_bias_relu" in chain_ops and chain_ops.count("add") >= 1, (
+    f"expected a fused_bias_relu directly followed by add, got {chain_ops}"
+)
+print(f"\nadjacent-elementwise graph fused as: {chain_ops}")
+
+d5 = max_diff(kir.run(chain_graph, X).tolist(), kir.run_metal(chain_fused, X).tolist())
+assert d5 < TOL, f"run_metal mismatch on the chained graph: {d5}"
+print(f"run_metal matches run() on the chained graph (max diff {d5:.2e})")
+
+# Same graph, larger, to show the batching this enables actually saves
+# time (real GPU dispatch, real graph, not the isolated synthetic chain
+# used to first measure the technique).
+big_w = kansai.randn([512, 512], std=0.05, seed=23)
+big_bias1 = kansai.randn([512], std=0.1, seed=24)
+big_bias2 = kansai.randn([512], std=0.1, seed=25)
+big_X = kansai.randn([128, 512], std=1.0, seed=26)
+
+
+def big_chained(x):
+    pred = x.matmul(big_w).add(big_bias1).relu()
+    return pred.add(big_bias2)
+
+
+big_graph = kir.trace(big_chained, big_X)
+big_fused = kir.elementwise_fusion(big_graph)
+
+iters = 100
+t0 = time.perf_counter()
+for _ in range(iters):
+    kir.run_metal(big_fused, big_X)
+t_batched = (time.perf_counter() - t0) / iters
+
+# The pre-batching equivalent: the same two ops, each its own command
+# buffer -- what run_metal did before this change.
+t0 = time.perf_counter()
+for _ in range(iters):
+    x = core.metal_matmul(big_X, big_w)
+    x = core.metal_bias_relu(x, big_bias1)
+    core.metal_add_bias(x, big_bias2)
+t_unbatched = (time.perf_counter() - t0) / iters
+
+print(f"\nbatching benchmark on the real chained graph (batch 128, dim 512):")
+print(f"  unbatched (3 command buffers): {t_unbatched*1e3:7.3f} ms/iter")
+print(f"  run_metal (batched elementwise): {t_batched*1e3:7.3f} ms/iter")
+print(f"  speedup: {t_unbatched/t_batched:.2f}x")
+assert t_batched < t_unbatched, "batching should be faster on the real graph, not just the synthetic benchmark"
+
 print("\nMetal backend test passed.")

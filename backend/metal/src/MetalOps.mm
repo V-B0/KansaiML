@@ -184,4 +184,52 @@ void add_bias(const float* x, const float* bias, float* out, int64_t batch, int6
     dispatch_elementwise_bias_op(state().add_bias_pipeline, x, bias, out, batch, features);
 }
 
+void run_elementwise_chain(const float* x0, int64_t batch, int64_t features,
+                            const std::vector<ElemStep>& steps, float* out) {
+    require_available();
+    @autoreleasepool {
+        MetalState& s = state();
+        int64_t n = batch * features;
+        NSUInteger nbytes = static_cast<NSUInteger>(n * sizeof(float));
+        uint32_t uF = static_cast<uint32_t>(features);
+
+        id<MTLCommandBuffer> cmd = [s.queue commandBuffer];
+
+        id<MTLBuffer> cur = [s.device newBufferWithBytes:x0 length:nbytes options:MTLResourceStorageModeShared];
+
+        for (const ElemStep& step : steps) {
+            id<MTLBuffer> bias_buf = [s.device newBufferWithBytes:step.bias
+                                                            length:static_cast<NSUInteger>(features * sizeof(float))
+                                                           options:MTLResourceStorageModeShared];
+            id<MTLBuffer> next = [s.device newBufferWithLength:nbytes options:MTLResourceStorageModeShared];
+            id<MTLComputePipelineState> pipeline =
+                step.kernel == ElemKernel::BiasRelu ? s.bias_relu_pipeline : s.add_bias_pipeline;
+
+            // A new encoder per step (ended before the next begins) is
+            // the standard way to chain several dispatches into one
+            // command buffer -- Metal's automatic hazard tracking makes
+            // this step's writes to `next` visible to the following
+            // step's read of it as `cur`, with no explicit fence needed.
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:cur offset:0 atIndex:0];
+            [enc setBuffer:bias_buf offset:0 atIndex:1];
+            [enc setBuffer:next offset:0 atIndex:2];
+            [enc setBytes:&uF length:sizeof(uint32_t) atIndex:3];
+
+            NSUInteger tw = MIN(static_cast<NSUInteger>(n), pipeline.maxTotalThreadsPerThreadgroup);
+            [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+            [enc endEncoding];
+
+            cur = next;
+        }
+
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        std::memcpy(out, [cur contents], static_cast<size_t>(nbytes));
+    }
+}
+
 } // namespace kan::metal

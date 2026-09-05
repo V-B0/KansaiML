@@ -27,4 +27,24 @@ Tensor metal_add_bias(const Tensor& x, const Tensor& bias) {
     return out;
 }
 
+Tensor metal_elementwise_chain(const Tensor& x, const std::vector<std::string>& kinds,
+                                const std::vector<Tensor>& biases) {
+    if (kinds.size() != biases.size())
+        throw std::runtime_error("metal_elementwise_chain: kinds and biases must be the same length");
+
+    std::vector<metal::ElemStep> steps;
+    steps.reserve(kinds.size());
+    for (size_t i = 0; i < kinds.size(); ++i) {
+        metal::ElemKernel k;
+        if (kinds[i] == "bias_relu") k = metal::ElemKernel::BiasRelu;
+        else if (kinds[i] == "add_bias") k = metal::ElemKernel::AddBias;
+        else throw std::runtime_error("metal_elementwise_chain: unknown kind '" + kinds[i] + "'");
+        steps.push_back({k, biases[i].data_ptr()});
+    }
+
+    Tensor out = Tensor::zeros(x.shape(), false);
+    metal::run_elementwise_chain(x.data_ptr(), x.shape()[0], x.shape()[1], steps, out.data_ptr());
+    return out;
+}
+
 } // namespace kan
