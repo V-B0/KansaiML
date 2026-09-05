@@ -2,7 +2,9 @@
 
 A deep learning framework, in progress. Milestone 0 (Phase 1) is done: a
 CPU-only tensor engine with working reverse-mode autograd, proven by
-training a 2-layer MLP on XOR. Phase 2 (KIR) is now underway — see below.
+training a 2-layer MLP on XOR. Phase 2 (KIR) is done -- see below. A real
+Metal (Phase 3) backend now also exists, on the same terms: real GPU
+kernels, tested, benchmarked honestly.
 
 ## What's here
 
@@ -11,6 +13,10 @@ training a 2-layer MLP on XOR. Phase 2 (KIR) is now underway — see below.
   `Tensor::backward()`, a tape-based reverse-mode implementation)
 - `backend/cpu/` — raw float-buffer kernels (Accelerate-backed `matmul`
   on macOS, portable triple-loop fallback elsewhere)
+- `backend/metal/` — a real Metal compute backend: MSL shaders compiled
+  at runtime (`MTLDevice::newLibraryWithSource`), dispatched through
+  `MTLComputeCommandEncoder`, for `matmul`, `bias_relu` (fused), and
+  `add_bias`
 - `python/` — nanobind bindings (`_core`) plus `kansai.nn` / `kansai.optim`
 - `python/kansai/kir.py` — KIR prototype: `Graph`/`Node` schema, an
   operator-overload tracer (`kir.trace`, `kir.jit`), a reference
@@ -41,6 +47,10 @@ training a 2-layer MLP on XOR. Phase 2 (KIR) is now underway — see below.
   never involved, an exact cross-check against the eager engine as an
   independent second implementation, and a full XOR training loop where
   `.backward()` is never called at all
+- `tests/test_metal_backend.py` — Phase 3: kernel correctness against
+  CPU, `run_metal` correctness end-to-end on the fused Linear->ReLU->
+  Linear graph, and a size-sweep benchmark against Accelerate (see below
+  for the honest result)
 
 ## Phase 2 status
 
@@ -225,6 +235,62 @@ Known limitations:
   explicit assertion that no pre-activation sits within 0.05 of zero,
   so a future coincidence like this fails with a clear message instead
   of a confusing gradient mismatch.
+
+## Phase 3 status: a real Metal backend
+
+`backend/metal/` runs actual GPU compute on this machine's own GPU --
+three MSL shaders (`matmul`, `bias_relu`, `add_bias`), compiled at
+runtime via `MTLDevice::newLibraryWithSource` (this machine has only
+Command Line Tools, not full Xcode, so the offline `metal`/`metallib`
+compilers aren't available -- runtime compilation doesn't need them),
+dispatched through `MTLComputeCommandEncoder`. `kir.run_metal(graph,
+*args)` takes an *already-fused* graph (`elementwise_fusion`'s output)
+and dispatches `matmul` and `fused_bias_relu` to Metal, a plain
+bias-broadcast `add` (a layer's unactivated final output) to
+`metal_add_bias`, and everything else (the loss computation -- tiny,
+and not what this demonstrates) to CPU. Correctness is verified at the
+kernel level and end-to-end on the real Linear->ReLU->Linear graph,
+matching CPU to within expected floating-point reduction-order
+differences (GPU and CPU sum in different orders; exact bit-for-bit
+agreement was never the right bar).
+
+The honest performance result: **Metal loses to Accelerate at every
+size tested**, from 64x64 up to 2048x2048 for matmul (0.00x-0.17x) and
+from 0.1M to 16.8M elements for the fused bias+relu kernel
+(0.03x-0.67x) -- though the gap consistently narrows as size grows in
+both cases, which is the interesting part. Two real, separate causes,
+not one:
+
+1. **Accelerate is exceptional on Apple Silicon.** It uses the AMX
+   matrix coprocessor -- a specialized hardware matrix-multiply unit --
+   not just NEON/AVX-style vectorization. Beating it needs a seriously
+   optimized GPU kernel (shared-memory tiling, register blocking) or
+   Apple's own MPSGraph, which likely exploits its own specialized
+   hardware paths. The naive kernel here (one GPU thread per output
+   element, no tiling at all) was never going to be competitive on raw
+   matmul FLOPs -- proving the pipeline and the correctness was the
+   actual goal of writing it by hand instead of reaching for MPSGraph
+   immediately.
+2. **This dispatch design pays real, avoidable overhead on every call**:
+   `newBufferWithBytes` copies host memory into a new Metal buffer for
+   every argument (even though Apple Silicon's unified memory means a
+   no-copy wrap of already-resident memory is possible in principle),
+   and each op gets its own command buffer plus a blocking
+   `waitUntilCompleted` -- no overlap, no batching multiple ops into one
+   command buffer before synchronizing once. For the elementwise kernels
+   specifically (bandwidth-bound, no blocking needed to be competitive
+   in principle), this dispatch overhead is very likely the dominant
+   cost, not the compute itself.
+
+Both are legitimate, understood next steps -- not done here:
+`newBufferWithBytesNoCopy` over page-aligned host allocations to remove
+the upload copy, batching a whole graph's worth of Metal ops into one
+command buffer instead of one round-trip per op, and either a properly
+tiled matmul kernel or MPSGraph for the matmul path specifically. Given
+CUDA is physically impossible on this machine (no NVIDIA GPU exists to
+target) and Vulkan would mean testing against the very same GPU through
+an extra translation layer (MoltenVK), Metal was the only backend that
+could be verified end-to-end on real hardware in this pass.
 
 ## Build
 

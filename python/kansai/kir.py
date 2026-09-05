@@ -803,3 +803,67 @@ def grad(graph: Graph, wrt: list) -> Graph:
         bwd.output = bwd.add("tuple", result_ids, [], "float32")
 
     return bwd
+
+
+# ---------------------------------------------------------------------
+# Metal backend (Phase 3)
+# ---------------------------------------------------------------------
+
+def run_metal(graph: Graph, *args) -> "core.Tensor":
+    """Like run_fused(), but matmul and the fused bias+activation chain
+    dispatch to the Metal backend (backend/metal) instead of Accelerate
+    -- real GPU compute, same KIR graph, same op vocabulary, a different
+    backend underneath. This is the architecture's central claim (KIR is
+    the contract between frontend and backend; swapping backends means
+    writing a new codegen/dispatch target, not touching the graph or the
+    ops that produced it) demonstrated concretely rather than asserted.
+
+    Expects an already-fused graph (elementwise_fusion's output): matmul
+    and fused_bias_relu go to Metal; a plain bias-broadcast add (a
+    layer's final, unactivated output -- elementwise_fusion only fuses
+    add+relu *pairs*, so a solo add stays a solo add) goes to
+    metal_add_bias; everything else (sub/mul/sum/mean -- the loss
+    computation, tiny and not what this is meant to demonstrate) still
+    runs on CPU. A real backend would cover the whole op set; proving
+    the contract holds for the two ops that dominate a Linear layer's
+    cost is the actual point here, not a complete GPU op library.
+
+    Forward-only, same scope as run_fused/run_planned: no grad_node is
+    attached to anything computed here.
+    """
+    if not core.metal_available():
+        raise RuntimeError("run_metal: no Metal device available on this system")
+
+    by_id = {n.id: n for n in graph.nodes}
+    values = {}
+    for nid, arg in zip(graph.inputs, args):
+        values[nid] = arg
+
+    for node in graph.nodes:
+        if node.op == "placeholder":
+            continue
+        if node.op == "constant":
+            values[node.id] = node.attrs["value"]
+            continue
+        if node.op == "matmul":
+            a, b = (values[i] for i in node.inputs)
+            values[node.id] = core.metal_matmul(a, b)
+            continue
+        if node.op == "fused_bias_relu":
+            x, bias = (values[i] for i in node.inputs)
+            values[node.id] = core.metal_bias_relu(x, bias)
+            continue
+        if node.op == "add":
+            a_id, b_id = node.inputs
+            if by_id[a_id].shape != by_id[b_id].shape:  # bias-broadcast, no relu following
+                x, bias = values[a_id], values[b_id]
+                values[node.id] = core.metal_add_bias(x, bias)
+                continue
+        if node.op == "fused_sub_square":
+            a, b = (values[i] for i in node.inputs)
+            values[node.id] = core.fused_sub_square(a, b)
+            continue
+        fn = _OP_TABLE[node.op]
+        values[node.id] = fn(*(values[i] for i in node.inputs))
+
+    return values[graph.output]

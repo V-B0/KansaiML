@@ -7,6 +7,9 @@
 #include "kansai/GradOps.hpp"
 #include "kansai/StoragePool.hpp"
 #include "kansai/Tensor.hpp"
+#ifdef KANSAI_HAS_METAL
+#include "kansai/MetalOps.hpp"
+#endif
 
 namespace nb = nanobind;
 using namespace kan;
@@ -88,4 +91,13 @@ NB_MODULE(_core, m) {
     m.def("release_to_pool", [](StoragePool& pool, const Tensor& t) {
         pool.release(t.storage_ptr());
     });
+
+#ifdef KANSAI_HAS_METAL
+    m.def("metal_available", &metal_available);
+    m.def("metal_matmul", &metal_matmul, nb::arg("a"), nb::arg("b"));
+    m.def("metal_bias_relu", &metal_bias_relu, nb::arg("x"), nb::arg("bias"));
+    m.def("metal_add_bias", &metal_add_bias, nb::arg("x"), nb::arg("bias"));
+#else
+    m.def("metal_available", []() { return false; });
+#endif
 }
