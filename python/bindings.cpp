@@ -32,9 +32,33 @@ NB_MODULE(_core, m) {
         .def_prop_ro("shape", [](const Tensor& t) { return t.shape(); })
         .def_prop_ro("requires_grad", &Tensor::requires_grad)
         .def_prop_ro("grad", [](const Tensor& t) -> std::optional<Tensor> { return t.grad(); })
+        // Deliberately private-ish (a leading underscore, not a public
+        // property/setter): `requires_grad` itself stays read-only from
+        // Python for everything except this one low-level escape hatch,
+        // which kansai.checkpoint (python/kansai/__init__.py) needs to
+        // mark a freshly `detach()`-ed recomputation input as a real
+        // autograd leaf again, without a full data round trip through
+        // tolist()/from_flat just to flip one flag.
+        .def("_set_requires_grad", &Tensor::set_requires_grad, nb::arg("requires_grad"))
         .def("numel", &Tensor::numel)
         .def("tolist", &Tensor::to_vector)
-        .def("backward", &Tensor::backward)
+        // Two C++ overloads (scalar-only implicit ones() seed, or an
+        // explicit grad_output matching this tensor's own shape) collapse
+        // into one Python method with an optional argument, the same
+        // `tensor.backward(gradient=None)` shape every other framework
+        // exposes -- kansai.checkpoint (python/kansai/__init__.py) is
+        // what actually needs the explicit-seed form, to backpropagate
+        // a recomputed segment starting from whatever gradient flowed in
+        // from downstream rather than from 1.
+        .def(
+            "backward",
+            [](Tensor& t, std::optional<Tensor> grad_output) {
+                if (grad_output.has_value())
+                    t.backward(*grad_output);
+                else
+                    t.backward();
+            },
+            nb::arg("grad_output") = nb::none())
         .def("zero_grad", &Tensor::zero_grad)
         // call_guard<gil_scoped_release> on every compute-heavy method
         // below: each is pure C++ number-crunching on its own Tensor's
@@ -182,6 +206,33 @@ NB_MODULE(_core, m) {
     // wrapped code raises.
     m.def("set_grad_enabled", &set_grad_enabled, nb::arg("enabled"));
     m.def("grad_enabled", &grad_enabled);
+
+    // Attaches a GradNode whose backward_fn is a PYTHON callable --
+    // every other op in this codebase attaches a GradNode from C++
+    // with a C++ closure; this is the one general escape hatch letting
+    // Python-level code (kansai.checkpoint, python/kansai/__init__.py)
+    // do the same. `backward_fn` must accept one Tensor (grad_output,
+    // matching `output`'s own shape) and return a list of Tensors, one
+    // per entry in `inputs`, in the same order -- the exact contract
+    // GradNode::backward_fn already has in C++ (Tensor.hpp), just
+    // callable from the other side of the language boundary. The
+    // closure re-acquires the GIL before calling back into Python --
+    // needed defensively even though today's one caller (Tensor::backward,
+    // never releasing the GIL itself) never actually invokes this with
+    // it already released, since nothing guarantees that stays true of
+    // every future caller.
+    m.def("attach_custom_grad", [](Tensor& output, std::vector<Tensor> inputs, nb::callable backward_fn) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "custom";
+        node->inputs = std::move(inputs);
+        node->backward_fn = [backward_fn](const Tensor& grad_output) -> std::vector<Tensor> {
+            nb::gil_scoped_acquire gil;
+            nb::object result = backward_fn(grad_output);
+            return nb::cast<std::vector<Tensor>>(result);
+        };
+        output.set_grad_node(node);
+        output.set_requires_grad(true);
+    }, nb::arg("output"), nb::arg("inputs"), nb::arg("backward_fn"));
 
 #ifdef KANSAI_HAS_METAL
     // Every one of these blocks on waitUntilCompleted internally (see

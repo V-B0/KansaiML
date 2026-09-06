@@ -1119,6 +1119,12 @@ Tensor Tensor::cat(const std::vector<Tensor>& tensors, int64_t dim) {
 void Tensor::backward() {
     if (numel() != 1)
         throw std::runtime_error("backward() only supported on scalar (numel==1) tensors");
+    backward(Tensor::ones_like(*this));
+}
+
+void Tensor::backward(const Tensor& grad_output_seed) {
+    if (grad_output_seed.shape() != shape())
+        throw std::runtime_error("backward: grad_output shape must match this tensor's own shape");
 
     std::vector<Tensor> topo;
     std::unordered_set<TensorData*> visited;
@@ -1136,7 +1142,7 @@ void Tensor::backward() {
     visit(*this);
 
     std::unordered_map<TensorData*, Tensor> grad_map;
-    grad_map[impl_ptr()] = Tensor::ones_like(*this);
+    grad_map[impl_ptr()] = grad_output_seed;
 
     for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
         Tensor t = *it;

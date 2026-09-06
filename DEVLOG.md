@@ -2559,6 +2559,81 @@ eval-mode output does NOT match the original -- proving the buffers
 were correctly left at the fresh instance's own defaults rather than
 silently (and wrongly) restored alongside `weight`/`bias`.
 
+## Gradient checkpointing
+
+The memory-scaling story this session's own investigation opened up
+(the reference-cycle leak, the honest tinyshakespeare-large run) needed
+one more real lever: activation checkpointing, the standard trade of
+extra compute for less memory that every serious training setup at
+real depth eventually reaches for. Kansai's eager autograd holds every
+intermediate activation live (via each op's own `GradNode`/`backward_fn`
+closure) until `backward()` finally consumes it -- for a deep stack,
+that's one full set of activations PER LAYER, all simultaneously
+resident. Checkpointing collapses a wrapped segment to O(1): keep only
+its input and output, recompute everything in between from scratch the
+moment backward actually needs it.
+
+Needed three new primitives, none checkpoint-specific on their own:
+
+- **`Tensor::backward(grad_output)`** -- the general explicit-seed form.
+  `backward()` was scalar-only, implicit `ones()` seed; checkpointing's
+  own recomputation needs to backpropagate from whatever gradient
+  actually flowed in from downstream, not from 1. The old zero-arg
+  version is now just `backward(Tensor::ones_like(*this))` -- same
+  behavior, expressed as the one-argument case of the general one.
+- **`Tensor::_set_requires_grad`** -- exposed to Python (the C++ method
+  already existed, every op already calls it internally) so
+  checkpointing's recomputation can turn a freshly `detach()`-ed copy
+  back into a real autograd leaf without a full data round trip through
+  `tolist()`/`from_flat()` just to flip one flag.
+- **`core.attach_custom_grad(output, inputs, backward_fn)`** -- the
+  general "attach a `GradNode` whose backward is a PYTHON callable"
+  escape hatch. Every existing op attaches its own `GradNode` from C++
+  with a C++ closure; this is the first (and so far only) way
+  Python-level code can do the same. The closure re-acquires the GIL
+  before calling back into Python (`.backward()` never releases it
+  today, so this is defensive, not currently load-bearing).
+
+`kansai.checkpoint(fn, *inputs)` composes these: the first call runs
+under `no_grad()` (no graph at all, every intermediate eligible for
+collection the instant `fn` returns), then registers a single custom
+`GradNode` against the ORIGINAL `inputs` -- not detached copies, which
+would sever the graph's own topological walk right at the checkpoint
+boundary and silently lose whatever gradient chain existed upstream.
+When backward reaches that node, its closure re-detaches fresh leaf
+copies, re-runs `fn` on them (a real, small graph just for this one
+segment), and calls the new explicit-seed `backward()` to get real
+gradients for the recomputed leaves.
+
+A real scare along the way, resolved rather than papered over: an
+early version of `attach_custom_grad` reliably printed nanobind's
+"leaked instances" warning at interpreter shutdown -- exactly the
+shape of the reference-cycle bug this session had already found and
+fixed once. Investigated with the same rigor: `gc.collect()` fully
+reclaimed everything (unlike the true leak, where it never helped at
+all); running the SAME calls thousands of times inside a function
+(locals properly scoped, not left as module-level globals) with `gc`
+explicitly DISABLED produced completely flat memory, no growth
+whatsoever. The actual explanation: an ad-hoc top-level test SCRIPT
+leaves its own last-used variables bound as module globals until
+interpreter shutdown, and nanobind's leak check fires before Python's
+own final teardown clears them -- a script-structure artifact, not a
+cycle in the binding. Confirmed by moving the real test's own body
+into a `main()` function (scoped locals, freed the ordinary way on
+return): the warning disappeared entirely, with no other change.
+
+Verified: forward and backward through a checkpointed call match a
+non-checkpointed call on the identical computation to exact equality,
+for both a single checkpoint and a chain of 8 in a row (confirming the
+gradient hand-off survives multiple checkpoint boundaries, not just
+one in isolation); an input that doesn't require grad gets a correctly
+omitted gradient; 3,000 repeated iterations with `gc` disabled stay
+completely flat (the same rigorous bar the original leak investigation
+established); and, the actual point of the feature, checkpointing a
+real 40-layer stack measurably uses substantially less peak memory
+than running the identical stack without it (multiple x fewer MB of
+new resident memory, not just "technically less").
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

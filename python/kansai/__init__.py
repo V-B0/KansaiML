@@ -80,4 +80,76 @@ def no_grad():
         core.set_grad_enabled(previous)
 
 
-__all__ = ["Tensor", "zeros", "ones", "randn", "tensor", "from_flat", "where", "no_grad"]
+def checkpoint(fn, *inputs):
+    """Gradient (activation) checkpointing: trades extra compute for
+    less memory by NOT keeping `fn`'s intermediate activations around
+    for backward() -- recomputing them from scratch instead, the
+    moment they're actually needed. For a deep stack of layers (the
+    kind of workload `examples/tinyshakespeare/train_shakespeare_large.py`
+    exists to stress -- see that script's own docstring on why memory
+    at real depth is a real, live concern here, not a hypothetical
+    one), the dominant memory cost during training is exactly these
+    stored activations, one full set per layer, all held simultaneously
+    until backward() finally consumes them. Wrapping a layer's forward
+    call in `checkpoint()` collapses that to O(1) per checkpointed
+    segment: only `fn`'s OUTPUT and its (detached) inputs are kept,
+    at the cost of running `fn` a second time during backward().
+
+    `fn` must take Tensor arguments only and return a SINGLE Tensor
+    (matching what a single `nn.Module.forward()` call typically
+    returns) -- close over anything else (a fixed mask, a scalar
+    hyperparameter) as an ordinary Python closure rather than passing
+    it through `*inputs`, the same way `TransformerBlock.forward`
+    already closes over its own `mask` argument.
+
+    Mechanics: the FIRST call runs under `no_grad()` (see that
+    function's own docstring) -- no graph built at all, every
+    intermediate immediately eligible for collection the instant `fn`
+    returns, keeping only the final output. A single custom GradNode
+    (`core.attach_custom_grad`, the one general escape hatch letting
+    Python-level code attach a GradNode the same way every C++ op
+    already does internally) is attached to that output, registered
+    against the ORIGINAL (not detached) `inputs` -- critical for
+    correctness: registering detached copies instead would sever the
+    graph's own topological walk right at this checkpoint boundary,
+    silently losing whatever gradient chain existed further upstream
+    of `inputs` before this call. When backward() actually reaches
+    this node, its closure re-detaches fresh copies of `inputs`
+    (marking the ones that originally required grad via
+    `Tensor._set_requires_grad`, the one low-level setter that exists
+    specifically for this), re-runs `fn` on THOSE -- this time with
+    grad tracking on, building a real (but small, single-segment)
+    graph -- and calls `Tensor.backward(grad_output)` (the explicit-seed
+    form, needed here since the incoming gradient is whatever actually
+    flowed in from downstream, not an implicit all-ones scalar seed)
+    to get real gradients for the recomputed leaves, which are what
+    gets returned as this checkpoint's own contribution to `inputs`'
+    gradients.
+    """
+    detached_inputs = [inp.detach() for inp in inputs]
+    with no_grad():
+        output = fn(*detached_inputs)
+
+    needs_grad = [inp.requires_grad for inp in inputs]
+    if not any(needs_grad):
+        return output
+
+    def backward_fn(grad_output):
+        recompute_inputs = []
+        for inp, needed in zip(inputs, needs_grad):
+            r = inp.detach()
+            if needed:
+                r._set_requires_grad(True)
+            recompute_inputs.append(r)
+
+        recomputed_output = fn(*recompute_inputs)
+        recomputed_output.backward(grad_output)
+
+        return [r.grad if needed else core.zeros(list(r.shape))
+                for r, needed in zip(recompute_inputs, needs_grad)]
+
+    core.attach_custom_grad(output, list(inputs), backward_fn)
+    return output
+
+
+__all__ = ["Tensor", "zeros", "ones", "randn", "tensor", "from_flat", "where", "no_grad", "checkpoint"]

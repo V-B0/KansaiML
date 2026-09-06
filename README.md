@@ -62,6 +62,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — `kir.grad` conv2d | Closed the last of the two 2D/gap-scope holes — matmul was the other | ✅ done |
 | — SGD momentum | Heavy-ball + Nesterov, `buf` initialized to `grad` on the first step | ✅ done |
 | — `BatchNorm2d` | Per-channel over N,H,W jointly — transpose+reshape onto `BatchNorm1d`, zero new kernels | ✅ done |
+| — Gradient checkpointing | `kansai.checkpoint()` — recompute instead of store, multiple x less peak memory on a deep stack | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -310,7 +311,24 @@ the input (a real trap: both would make a genuinely broken
 implementation and a correct one produce identical, uninformatively
 near-zero results) — and, practically, a real `Conv2d → BatchNorm2d →
 ReLU → Linear` network reaches 100% accuracy on a synthetic
-classification task.
+classification task. `kansai.checkpoint(fn, *inputs)` (activation
+checkpointing — recompute instead of store) closes the memory-scaling
+story the leak fix opened: Kansai's eager autograd holds every
+intermediate activation live per layer until `backward()` consumes it,
+so a deep stack means one full activation set per layer, all
+simultaneously resident. Checkpointing collapses a wrapped segment to
+O(1) — keep only its input and output, recompute the rest from scratch
+when backward actually needs it. Built on three new primitives (the
+general explicit-seed `backward(grad_output)`, not just scalar-only
+implicit-ones; `Tensor._set_requires_grad`; `core.attach_custom_grad`,
+the first way Python-level code can attach a `GradNode` the way every
+C++ op already does internally). Checked to match a non-checkpointed
+call exactly (forward and backward, through both a single checkpoint
+and a chain of 8), correctly omit gradient for a non-grad-requiring
+input, stay completely flat over 3,000 iterations with `gc` disabled
+(the same bar the leak investigation itself established), and —
+the actual point — measurably use substantially less peak memory
+checkpointing a real 40-layer stack than running it without.
 
 ## Why
 

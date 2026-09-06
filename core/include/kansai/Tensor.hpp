@@ -61,7 +61,21 @@ public:
     // Reverse-mode autodiff entry point. Only valid on a scalar (numel==1)
     // tensor — walks the graph this tensor's grad_node chain reaches and
     // accumulates gradients into every leaf tensor that requires_grad.
+    // Scalar-only, implicit ones() seed -- the ordinary end-of-loss
+    // entry point. Equivalent to backward(Tensor::ones_like(*this)),
+    // and implemented as exactly that call.
     void backward();
+
+    // The general form: seeds the backward traversal with an arbitrary
+    // `grad_output` (matching this tensor's own shape) instead of an
+    // implicit all-ones scalar seed -- what gradient checkpointing
+    // needs (kansai.checkpoint, python/kansai/__init__.py) to
+    // backpropagate through a RECOMPUTED segment starting from
+    // whatever gradient actually flowed in from downstream, not from
+    // 1. Also the real, previously-missing general primitive every
+    // other framework exposes as `tensor.backward(gradient=...)` --
+    // not added only for checkpointing's own sake.
+    void backward(const Tensor& grad_output);
 
     // In-place update, bypassing autograd entirely. Used by optimizers.
     void add_(const Tensor& other, float alpha = 1.0f);
