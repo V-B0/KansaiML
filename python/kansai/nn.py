@@ -96,6 +96,69 @@ class Conv2d(Module):
         return x.conv2d(self.weight, self.bias, self.stride, self.padding)
 
 
+class Conv1d(Module):
+    """1D convolution over `(N, Cin, L)` sequence data (audio,
+    time-series, genomic sequences -- anywhere `Conv2d`'s image-shaped
+    `(N, C, H, W)` doesn't fit), for the same reason `AvgPool2d` above
+    is a pure composition rather than its own kernel: 1D convolution is
+    exactly 2D convolution with the height axis fixed at 1, so this
+    needs zero new kernels, zero new `GradNode` work, and zero new KIR
+    nodes -- `(N, Cin, L)` reshapes to `(N, Cin, 1, L)`, the weight is
+    stored pre-shaped `(Cout, Cin, 1, K)`, `Conv2d`'s own backward
+    (already correct, already tested) does the rest, and the result
+    reshapes back down to `(N, Cout, Lout)`.
+
+    The one genuine wrinkle: `Tensor::conv2d` takes a single scalar
+    `stride`/`padding` applied to BOTH spatial axes, but the dummy
+    height axis must stay exactly 1 (padding it, or striding across it,
+    would silently grow a second axis this class was never asked to
+    produce) while `padding`/`stride` apply to the LENGTH axis only,
+    per Conv1d's own actual semantics. Resolved by padding the length
+    axis manually (zero tensors concatenated on both sides) BEFORE
+    calling `conv2d` with `padding=0` on the already-padded input --
+    `Conv2d`'s own padding argument is never asked to touch the height
+    axis at all, side-stepping the mismatch instead of fighting it.
+
+    That manual `cat`, unlike every other op this class uses, does NOT
+    auto-coerce a freshly-built real `core.Tensor` constant against a
+    `TraceValue` the way binary ops (`add`/`sub`/`mul`/`div`, via
+    `TraceValue._coerce`) do -- `cat` is module-level and n-ary, no
+    single `self` to hang that coercion off of, so `core.cat`/`kir.cat`
+    each require ALL their arguments to already be the same kind of
+    object. `forward` below branches on `isinstance(x, core.Tensor)`
+    for exactly this one line, calling whichever `cat` (and explicitly
+    coercing the zero-pad constant via `TraceValue._coerce`, the same
+    private mechanism every other op already goes through internally)
+    matches the world `x` is actually in -- eager or traced.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
+                 stride: int = 1, padding: int = 0, seed: int = 0):
+        self.stride = stride
+        self.padding = padding
+        self.kernel_size = kernel_size
+        fan_in = in_channels * kernel_size
+        std = 1.0 / math.sqrt(fan_in)
+        self.weight = randn([out_channels, in_channels, 1, kernel_size],
+                             std=std, requires_grad=True, seed=seed)
+        self.bias = zeros([out_channels], requires_grad=True)
+
+    def forward(self, x):
+        N, Cin, L = x.shape
+        x4d = x.reshape([N, Cin, 1, L])
+        if self.padding > 0:
+            pad_vals = core.zeros([N, Cin, 1, self.padding])
+            if isinstance(x, core.Tensor):
+                x4d = core.cat([pad_vals, x4d, pad_vals], 3)
+            else:
+                from . import kir as _kir
+                pad = x4d._coerce(pad_vals)
+                x4d = _kir.cat([pad, x4d, pad], 3)
+        out4d = x4d.conv2d(self.weight, self.bias, self.stride, 0)
+        Nout, Cout, _, Lout = out4d.shape
+        return out4d.reshape([Nout, Cout, Lout])
+
+
 class AvgPool2d(Module):
     """Non-overlapping average pooling only (`stride` fixed equal to
     `kernel_size`, unlike Conv2d's independent stride) -- the common

@@ -63,6 +63,8 @@ benchmark, every bug, every dead end, in the order it happened.
 | — SGD momentum | Heavy-ball + Nesterov, `buf` initialized to `grad` on the first step | ✅ done |
 | — `BatchNorm2d` | Per-channel over N,H,W jointly — transpose+reshape onto `BatchNorm1d`, zero new kernels | ✅ done |
 | — Gradient checkpointing | `kansai.checkpoint()` — recompute instead of store, multiple x less peak memory on a deep stack | ✅ done |
+| — `LinearWarmup` | Composes with any scheduler by construction order — the standard warmup+decay pairing | ✅ done |
+| — `Conv1d` | Sequence data (audio, time-series) — reuses `Conv2d`'s kernel entirely via reshape | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -329,6 +331,19 @@ input, stay completely flat over 3,000 iterations with `gc` disabled
 (the same bar the leak investigation itself established), and —
 the actual point — measurably use substantially less peak memory
 checkpointing a real 40-layer stack than running it without.
+`LinearWarmup` closes the other missing standard piece — ramps `lr`
+linearly to its own target over `warmup_steps`, then hands off to any
+wrapped scheduler (`CosineAnnealingLR`, say), landing EXACTLY on the
+target at the boundary, not approximately. `Conv1d` (audio, time-series,
+genomic sequences) reuses `Conv2d`'s entire kernel/backward/KIR support
+via reshape (1D convolution is 2D with the height axis pinned at 1) —
+the one real wrinkle being that binary ops auto-coerce a fresh constant
+against a traced value but `cat` (used for manual length-axis padding)
+can't, the first op in this codebase needing an explicit eager/traced
+branch. Checked against a nested-loop reference, central differences,
+the full KIR path (both the padding and no-padding branches, including
+`run_metal`), and a practical spike-detection classifier reaching 100%
+accuracy.
 
 ## Why
 
@@ -438,12 +453,12 @@ Python (Tensor, nn.Module, optim)
 - `python/kansai/serialize.py` — `save`/`load` a `Module`'s parameters
   to/from disk, a pickle-free length-prefixed-JSON-header + flat-blob
   format
-- `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`, `Tanh`,
+- `python/kansai/{nn,optim}.py` — `Linear`, `Conv1d`, `Conv2d`, `ReLU`, `Tanh`,
   `Sigmoid`, `GELU`, `LeakyReLU`, `Softmax`, `LayerNorm`, `BatchNorm1d`, `BatchNorm2d`,
   `AvgPool2d`, `MaxPool2d`, `Dropout`, `MultiHeadAttention`,
   `TransformerBlock`, `Embedding`,
   `Sequential`, `SGD`, `Adam`, `AdamW`, `clip_grad_norm_`, `StepLR`,
-  `CosineAnnealingLR`
+  `CosineAnnealingLR`, `LinearWarmup`
 - `python/kansai/data.py` — `Dataset`, `DataLoader` (map-style,
   per-epoch reshuffle, no worker-process plumbing)
 - `tests/` — every claim above, checked: numerical gradient checks,

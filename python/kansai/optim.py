@@ -276,3 +276,41 @@ class CosineAnnealingLR:
         self.last_epoch += 1
         progress = min(self.last_epoch, self.T_max) / self.T_max
         self.optimizer.lr = self.eta_min + (self.base_lr - self.eta_min) * (1 + math.cos(math.pi * progress)) / 2
+
+
+class LinearWarmup:
+    """Linearly ramps `optimizer.lr` from 0 up to its own value AT
+    CONSTRUCTION TIME over `warmup_steps` calls to `step()`, then hands
+    off to `after_scheduler` (if given) for every subsequent call --
+    the "warmup then decay" pairing virtually every real transformer
+    training recipe uses. A cold, un-warmed-up learning rate applied
+    directly to a freshly-initialized attention-based model is a
+    well-known real source of early training instability (the
+    softmax-based attention weights and LayerNorm statistics haven't
+    settled into a reasonable regime yet at step 0); a short linear
+    ramp avoids it without needing a smaller lr for the WHOLE run.
+
+    Composes with StepLR/CosineAnnealingLR/etc. by construction ORDER,
+    not inheritance or a shared base class: construct the optimizer at
+    its target peak lr, construct the AFTER scheduler FIRST (so it
+    captures that peak as its own `base_lr`, e.g.
+    `CosineAnnealingLR(opt, T_max=...)`), THEN wrap `LinearWarmup`
+    around both. This class only ever touches `optimizer.lr` directly
+    during the warmup phase itself; once warmup ends it defers
+    completely to `after_scheduler`, which was already primed with the
+    correct peak lr before warmup ever started mutating it.
+    """
+
+    def __init__(self, optimizer, warmup_steps: int, after_scheduler=None):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.after_scheduler = after_scheduler
+        self.target_lr = optimizer.lr
+        self.last_epoch = 0
+
+    def step(self):
+        self.last_epoch += 1
+        if self.last_epoch <= self.warmup_steps:
+            self.optimizer.lr = self.target_lr * self.last_epoch / self.warmup_steps
+        elif self.after_scheduler is not None:
+            self.after_scheduler.step()

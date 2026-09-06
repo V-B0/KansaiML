@@ -2634,6 +2634,56 @@ real 40-layer stack measurably uses substantially less peak memory
 than running the identical stack without it (multiple x fewer MB of
 new resident memory, not just "technically less").
 
+## LinearWarmup and Conv1d
+
+Two more ecosystem gaps, continuing the same push.
+
+**`LinearWarmup`**: the "warmup then decay" pairing virtually every
+real transformer training recipe uses, previously missing entirely --
+`CosineAnnealingLR` existed, but nothing ramped `lr` up from 0 first.
+Composes with any existing scheduler by construction ORDER, not
+inheritance: construct the optimizer at its target peak `lr`,
+construct the AFTER scheduler first (so it captures that peak as its
+own `base_lr` before warmup ever touches `optimizer.lr`), then wrap
+`LinearWarmup` around both. Verified: the ramp matches the exact
+expected linear sequence, lands EXACTLY on the target `lr` at the
+warmup boundary (not approximately), and hands off to a wrapped
+`CosineAnnealingLR` correctly for every step past that, matching its
+own closed-form values.
+
+**`Conv1d`**: `(N, Cin, L)` sequence data (audio, time-series, genomic
+sequences), for the same reason `AvgPool2d` needed no new kernel --
+1D convolution is exactly 2D convolution with the height axis pinned
+at 1, so this reuses `Conv2d`'s own kernel, backward, and KIR support
+entirely via reshape. The one place this needed real, deliberate
+handling rather than falling out "for free": `Tensor::conv2d` takes a
+single scalar `stride`/`padding` for BOTH spatial axes, but the dummy
+height axis must stay exactly 1 while `padding` should apply to the
+length axis only. Resolved by manually zero-padding the length axis
+(via `cat`) before calling `conv2d` with `padding=0` on the
+already-padded input, rather than fighting `Conv2d`'s own argument.
+
+That manual `cat` surfaced a genuinely subtle wrinkle every OTHER pure
+composition in this codebase (`LayerNorm`, `AvgPool2d`, `BatchNorm2d`)
+had quietly avoided: binary ops (`add`/`sub`/`mul`/`div`) automatically
+coerce a freshly-built real `core.Tensor` constant against a
+`TraceValue` via `TraceValue._coerce` (LayerNorm's own `eps_t =
+core.from_flat(...)` relies on exactly this, invisibly), but `cat` is
+module-level and n-ary -- no single `self` to hang that coercion off
+of -- so `core.cat`/`kir.cat` each require every argument to already
+be the SAME kind of object. `Conv1d.forward` branches explicitly on
+`isinstance(x, core.Tensor)` for this one line, the first op in this
+codebase that needed to.
+
+Verified: forward against a direct nested-loop reference independent
+of `Conv2d`'s own implementation; backward against central differences
+with weight/bias confirmed to receive real gradients; the full KIR
+path -- all four interpreters plus `kir.grad`, including `run_metal` --
+for BOTH the `padding>0` branch (exercising the `cat`-under-tracing
+fix specifically) and the `padding=0` branch; and, practically, a
+small `Conv1d`-based sequence classifier (detecting a short "spike"
+pattern anywhere in a 1D signal) trains to 100% accuracy.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

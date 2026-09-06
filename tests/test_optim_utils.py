@@ -142,7 +142,33 @@ cos_sched.step()
 check_close("CosineAnnealingLR stays pinned at eta_min past T_max", adam.lr, eta_min, tol=1e-9)
 
 # ---------------------------------------------------------------------
-# 4. Practical end-to-end test: gradient clipping + CosineAnnealingLR
+# 4. LinearWarmup: linear ramp to the optimizer's own construction-time
+#    lr, exact peak at the warmup boundary, then a clean hand-off to
+#    an `after_scheduler` (CosineAnnealingLR here) for every step past
+#    that -- the standard warmup-then-decay pairing real transformer
+#    training recipes use.
+# ---------------------------------------------------------------------
+
+adam2 = optim.Adam([core.from_flat([1.0], [1], requires_grad=True)], lr=0.1)
+cos_after = optim.CosineAnnealingLR(adam2, T_max=10, eta_min=0.001)
+warmup = optim.LinearWarmup(adam2, warmup_steps=5, after_scheduler=cos_after)
+
+expected_warmup_lrs = [0.1 * s / 5 for s in range(1, 6)]
+actual_warmup_lrs = []
+for _ in range(5):
+    warmup.step()
+    actual_warmup_lrs.append(adam2.lr)
+check_close("LinearWarmup ramps linearly to the target lr", actual_warmup_lrs, expected_warmup_lrs, tol=1e-9)
+check_close("LinearWarmup reaches EXACTLY the target lr at the warmup boundary", [adam2.lr], [0.1], tol=1e-9)
+
+for epoch in range(1, 11):
+    warmup.step()
+    expected = eta_min + (0.1 - eta_min) * (1 + math.cos(math.pi * epoch / 10)) / 2
+    check_close(f"LinearWarmup hands off to CosineAnnealingLR correctly at post-warmup epoch {epoch}",
+                [adam2.lr], [expected], tol=1e-9)
+
+# ---------------------------------------------------------------------
+# 5. Practical end-to-end test: gradient clipping + CosineAnnealingLR
 #    together on a real training loop. A large initial lr (large
 #    enough that early-step gradients would genuinely blow up without
 #    clipping) confirms clipping actually engages -- not a silent
@@ -180,4 +206,4 @@ assert clipped_at_least_once, "gradient clipping never actually engaged -- test 
 assert final_loss < 0.05, "XOR did not converge with clipping + cosine schedule active"
 check_close("CosineAnnealingLR brought lr down to eta_min by the end of training", opt.lr, 0.001, tol=1e-6)
 
-print("\nOptimizer utilities (clip_grad_norm_, StepLR, CosineAnnealingLR) test passed.")
+print("\nOptimizer utilities (clip_grad_norm_, StepLR, CosineAnnealingLR, LinearWarmup) test passed.")
