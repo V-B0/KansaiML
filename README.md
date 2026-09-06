@@ -38,7 +38,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | 1 — Foundation | Tensor/autograd core, CPU backend, `nn`/`optim` | ✅ done |
 | 2 — KIR | Tracing, fusion, memory pooling, source-transform autograd | ✅ done |
 | 3 — GPU backend | Real Metal compute (tiled kernel + MPS, competitive at scale) | 🟡 in progress |
-| 4 — Distributed | `DeviceMesh`, `DTensor`, quantization, serialization | ⏳ deferred until a second real backend exists |
+| 4 — Distributed | `DeviceMesh` + `DTensor` data model | 🟡 started — no distributed autograd yet |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -52,7 +52,9 @@ shape a real Linear layer's forward pass actually produces (1.3x at
 128×4096 @ 4096×4096 — a shape that lost 3x to Accelerate before the
 zero-copy work); `Conv2d`'s backward is checked against numerical
 differentiation and its forward against an independent reference
-implementation.
+implementation; a batch sharded across `DeviceMesh(["cpu", "metal"])`
+runs each shard through that device's real interpreter and gathers back
+to exactly the unsharded result.
 
 ## Why
 
@@ -123,18 +125,23 @@ Python (Tensor, nn.Module, optim)
             │
      ┌──────┴──────┐
      ▼             ▼
-  CPU backend   Metal backend
-  (Accelerate)  (tiled kernel, MPS,
-                 batched dispatch)
+  CPU backend   Metal backend         DeviceMesh / DTensor
+  (Accelerate)  (tiled kernel, MPS,   -- shards a graph's input across
+                 batched dispatch)    both backends, dispatches each
+                                      shard to its real interpreter
 ```
 
 - `core/` — `Tensor`, `Storage`, the pooled allocator, and the
   tape-based eager autograd engine
 - `backend/cpu/` — raw kernels (Accelerate-backed `matmul` on macOS)
 - `backend/metal/` — real Metal compute: a hand-tiled kernel,
-  `MPSMatrixMultiplication`, and batched elementwise dispatch
+  `MPSMatrixMultiplication`, and batched elementwise dispatch, all
+  zero-copy over page-aligned tensor storage
 - `python/kansai/kir.py` — the IR: tracer, optimizer passes, and four
   interpreters (`run`, `run_fused`, `run_planned`, `run_metal`)
+- `python/kansai/distributed.py` — `DeviceMesh`, `DTensor`,
+  `Shard`/`Replicate` placements, and `dtensor_run` (Phase 4's data
+  model, forward-only)
 - `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`,
   `Sequential`, `SGD`
 - `tests/` — every claim above, checked: numerical gradient checks,

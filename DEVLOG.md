@@ -578,6 +578,75 @@ the "an actual layout optimizer once there's a layout-sensitive op"
 line in this README's own earlier Phase 2 section. Not attempted here;
 a natural next step whenever it's worth picking up.
 
+## Phase 4, started: DeviceMesh / DTensor
+
+Deferred for most of this project's history on purpose: DeviceMesh only
+means something once there's more than one real backend to shard
+across, and until Metal reached genuine parity with Accelerate, this
+would have been a data model with nothing real underneath it. It has
+something real underneath it now.
+
+What "device" actually means here needed pinning down before writing
+any code, because the obvious mental model (a mesh spans separate
+memory spaces, sharding moves bytes between them) is simply false on
+this hardware. Every `kansai.Tensor` already lives in one page-aligned,
+CPU-resident allocation, and Metal's own NoCopy path (the previous
+entry) computes directly on that same memory rather than moving
+anything anywhere. So `DeviceMesh(["cpu", "metal"])`'s two entries don't
+name physical locations -- they name which backend's *interpreter*
+processes a given shard's graph: `kir.run` for `"cpu"`,
+`kir.run_metal` for `"metal"`. Splitting and gathering
+(`python/kansai/distributed.py`'s `_split_tensor`/`_concat_tensors`) go
+through `tolist()`/`from_flat()` precisely because there's no native
+slice/concat kernel yet, not because there's a network to simulate --
+the same "prototype the semantics in Python first" approach `kir.py`
+itself took for the IR before any of this had a C++ implementation.
+
+`DTensor.from_tensor(tensor, mesh, placement)` splits (`Shard(dim)`) or
+replicates (`Replicate()`) a tensor across the mesh; `dtensor_run(graph,
+output_placement, *dtensor_args)` runs a `kir.trace`d graph once per
+mesh device, feeding each device its own shard and dispatching to that
+device's real backend -- fusing the graph first for the `"metal"` shard
+specifically, matching `run_metal`'s own existing contract, since
+nothing about DTensor changes what that interpreter requires. Verified
+against the same bar as everything else in this project: gather a batch
+sharded across `["cpu", "metal"]` through a Linear+ReLU forward (weights
+replicated, batch split -- the actual shape of data-parallel training)
+and it matches running the identical graph unsharded through `kir.run`
+exactly, and a fully `Replicate()`'d run produces bit-identical results
+on both the CPU shard and the Metal shard independently. The split/
+concat mechanics are checked separately too, including a genuinely
+uneven split (7 rows across 3 pieces -> 3, 2, 2, not just the
+evenly-divisible case that's easy to get right by accident) and a split
+along a non-leading dimension, to exercise the outer/inner stride
+bookkeeping rather than only the simplest case.
+
+Two limitations stated up front rather than discovered later:
+
+- **Forward-only**, same as fusion/pooling/`run_metal` before it. A real
+  DTensor needs auto-inserted collectives during backward -- all-reduce
+  for a `Replicate()`'d gradient, all-gather for a `Shard()`'d one --
+  which is exactly the "auto-comm insertion" line from this project's
+  own original Phase 4 roadmap, and genuinely separate, substantial
+  work from the data model itself.
+- **No real concurrency.** `dtensor_run` dispatches to each device in a
+  plain Python loop, one after another. Nothing in this codebase's
+  nanobind bindings releases the GIL, so even calling the CPU and Metal
+  paths from separate Python threads wouldn't overlap today -- true
+  concurrent dispatch would mean releasing the GIL specifically around
+  the blocking Metal calls (which already do their own synchronous
+  `waitUntilCompleted`), a real, separate piece of work, not something
+  this module gets for free by existing.
+
+Also stated as a real, current constraint rather than glossed over:
+`dtensor_run` traces its graph once, against one representative shard
+shape, so every argument's shards need to match that shape -- true
+whenever the sharded dimension divides evenly across the mesh, silently
+*not* handled otherwise (tracing a separate graph per differently-shaped
+shard is unattempted future work). The test suite's own batch size (8,
+split 4+4 across two devices) was chosen specifically to satisfy this,
+not by accident.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`
