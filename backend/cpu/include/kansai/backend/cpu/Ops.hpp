@@ -176,6 +176,27 @@ void batched_matmul_tn(const float* a, const int64_t* a_batch_shape, int64_t a_b
                         const int64_t* out_batch_shape, int64_t out_batch_rank,
                         int64_t reduce, int64_t rows, int64_t cols, float* out);
 
+// Selects, along `dim`, the slices at each position in `indices`
+// (repeats allowed, order preserved exactly as given) -- `out`'s shape
+// is `shape` with `dim`'s extent replaced by `num_indices`. The same
+// outer/inner/dim_size block-copy shape `slice` (below) already uses,
+// generalized from a contiguous [start,stop) range to an arbitrary list
+// of positions. `indices` are plain integers, not a Tensor: Kansai has
+// no integer dtype (see core/include/kansai/DType.hpp), and an index
+// into a lookup table isn't itself a differentiable quantity anyway --
+// the same reason slice's own start/stop are plain ints, not a
+// special case invented just for this.
+void index_select(const float* x, const int64_t* shape, int64_t ndim, int64_t dim,
+                   const int64_t* indices, int64_t num_indices, float* out);
+
+// The inverse of index_select -- but an ACCUMULATE (+=), not a plain
+// write like scatter_range's, because `indices` can repeat (the same
+// row looked up twice must receive the sum of both positions' own
+// gradients, exactly like Embedding's real gradient works in every
+// other framework).
+void index_select_bwd(const float* grad_out, const int64_t* shape, int64_t ndim, int64_t dim,
+                       const int64_t* indices, int64_t num_indices, float* grad_in);
+
 float reduce_sum(const float* x, int64_t n);
 
 // out += alpha * x, in place. Not autograd-tracked — used by optimizers.

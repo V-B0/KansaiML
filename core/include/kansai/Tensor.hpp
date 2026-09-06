@@ -160,6 +160,18 @@ public:
     // softmax and log separately.
     Tensor cross_entropy(const Tensor& targets) const;
 
+    // Selects, along `dim`, the slices at each position in `indices`
+    // (repeats allowed, order preserved) -- out's shape is self's shape
+    // with dim's extent replaced by indices.size(). `indices` are plain
+    // integers, not a Tensor -- Kansai has no integer dtype, and an
+    // index into a lookup table isn't a differentiable quantity anyway,
+    // the same reason slice()'s own start/stop are plain ints. This is
+    // what Embedding is built from: weight.index_select(0, token_ids)
+    // looks up each token's own row of the embedding table, with a real
+    // gradient that correctly accumulates when the same row is looked
+    // up more than once in a batch.
+    Tensor index_select(int64_t dim, const std::vector<int64_t>& indices) const;
+
     // self: (N, Cin, H, W), weight: (Cout, Cin, kH, kW), bias: (Cout,).
     // Forward is im2col + the same matmul kernel every other op already
     // uses (one call per batch item); backward reuses matmul_nt/matmul_tn

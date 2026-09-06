@@ -861,6 +861,40 @@ Tensor Tensor::cross_entropy(const Tensor& targets) const {
     return per_example.mean();
 }
 
+Tensor Tensor::index_select(int64_t dim, const std::vector<int64_t>& indices) const {
+    const Tensor& x = *this;
+    int64_t nd = x.ndim();
+    if (dim < 0 || dim >= nd)
+        throw std::runtime_error("index_select: dim out of range");
+    int64_t dim_size = x.shape()[dim];
+    for (int64_t idx : indices)
+        if (idx < 0 || idx >= dim_size)
+            throw std::runtime_error("index_select: index out of range for dim of size " +
+                                      std::to_string(dim_size));
+
+    auto out_shape = x.shape();
+    out_shape[dim] = static_cast<int64_t>(indices.size());
+    Tensor out = Tensor::zeros(out_shape, false);
+    cpu::index_select(x.data_ptr(), x.shape().data(), nd, dim, indices.data(),
+                       static_cast<int64_t>(indices.size()), out.data_ptr());
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "index_select";
+        node->inputs = {x};
+        auto x_shape = x.shape();
+        node->backward_fn = [x_shape, dim, indices, nd](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(x_shape, false);
+            cpu::index_select_bwd(grad_output.data_ptr(), x_shape.data(), nd, dim, indices.data(),
+                                   static_cast<int64_t>(indices.size()), grad_x.data_ptr());
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
 Tensor Tensor::reshape(std::vector<int64_t> new_shape) const {
     const Tensor& x = *this;
     int64_t n = numel_of(new_shape);

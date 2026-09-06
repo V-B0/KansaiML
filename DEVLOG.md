@@ -1738,6 +1738,94 @@ each sequence carries a class-specific "marker" vector planted at a
 RANDOM position among distractors, so the model has to find it
 regardless of where it lands -- reaching 100% accuracy.
 
+## index_select and Embedding
+
+Kansai had no way to pick tensor rows (or any-dim slices) out by an
+arbitrary list of positions -- every existing op picks a tensor apart
+by shape (`reshape`/`transpose`/`slice`/`cat`) or by value (`add`/
+`mul`/...), never by a caller-supplied, possibly-repeating list of
+indices. That's exactly what a token-embedding lookup table needs, so
+it's the concrete gap that had to close first: `Embedding.forward` IS
+`index_select` plus a `reshape`.
+
+`indices` is a plain `std::vector<int64_t>` / Python `list[int]`, not a
+`core.Tensor` -- a deliberate design choice, not an oversight. Two
+reasons converge on it: Kansai's `DType` enum is `float32`-only (there
+is no integer dtype to hold indices in even if this wanted to be a
+Tensor), and an index into a lookup table isn't a differentiable
+quantity in the first place -- it's discrete, wouldn't have a sensible
+gradient, and `slice`'s own `dim`/`start`/`stop` already established
+the precedent of plain-int-not-Tensor parameters for exactly this kind
+of non-differentiable shape/position argument.
+
+New kernels, one pair: `cpu::index_select` (an `outer`/`dim_size`/
+`inner` decomposition around `dim`, a `memcpy` per selected slice --
+the same three-way split `reduce_to_shape`/`broadcast_to_shape`
+already use for N-D axis-aware iteration) and `cpu::index_select_bwd`,
+its exact inverse -- except an ACCUMULATE (`+=`), not a plain
+overwrite, because `indices` can repeat. That accumulation is the one
+real subtlety here: selecting row 2 twice must give row 2 twice the
+gradient, not the same as selecting it once, or a token appearing
+twice in one training batch would silently only get credit for one of
+its two occurrences. Not composable from `slice`/`cat` at all -- both
+assume disjoint, contiguous ranges, and a scatter-add over a
+repeating index list isn't expressible that way -- so, like `gelu`/
+`leaky_relu`'s backward, it gets its own dedicated `GradOps`-exposed
+op (`index_select_backward`) rather than being built from existing
+pieces.
+
+KIR integration follows the same `attrs`-based pattern every non-
+Tensor-parameterized op needs: `TraceValue.index_select` validates
+`dim`/`indices` up front (the same bounds check the eager path makes,
+so a bad index fails at trace time, not silently downstream) and emits
+an `index_select` node carrying `dim`/`indices` as attrs; `run`/
+`run_fused`/`run_metal`/`run_planned` each got a dispatch case (three
+near-identical, one with `run_planned`'s own separate `elif`-chain
+convention, same as every other attrs-based op before it); and
+`_vjp_index_select` builds a backward-graph node out of the new
+`index_select_backward` op, itself needing its own interpreter
+dispatch in `run`/`run_fused`/`run_metal` (not `run_planned`, which
+never sees `kir.grad`-produced graphs). Checked at the full usual bar,
+INCLUDING through the traced backward graph, not just eager: forward
+values (row selection with repeats, column selection), eager backward
+against central differences with the repeated-index accumulation
+explicitly asserted (not just "central diff matches" -- the literal
+expected per-row gradient), all four interpreters, `kir.grad` matching
+eager exactly, and `kir.grad`'s output run through `run_metal` too
+(confirming the accumulation survives Metal dispatch, not only the
+CPU path) -- plus out-of-range rejection.
+
+`nn.Embedding(vocab_size, embed_dim, seed)` is then almost nothing on
+top: a `(vocab_size, embed_dim)` weight (same `1/sqrt(fan_in)` init
+scale `Linear`/`Conv2d` already use), and `forward(token_ids)` that
+flattens a plain (possibly nested) Python list of ints via a small
+`_flatten_ids` helper (mirroring `kansai.__init__`'s own `_flatten`,
+just producing `int`s instead of `float`s and keeping the nesting
+shape around), calls `weight.index_select(0, flat_ids)`, and
+`reshape`s the result back to the input's own nesting shape with
+`embed_dim` appended -- a flat `(seq_len,)` id list gives `(seq_len,
+embed_dim)`, a `(batch, seq_len)` nested list gives `(batch, seq_len,
+embed_dim)`. Zero new kernels, zero new `GradNode` logic -- the same
+"reuse composition" payoff `LayerNorm`/`AvgPool2d`/`softmax` each got
+individually.
+
+Verified: forward values against a manual per-row lookup for both a
+flat and a `(batch, seq_len)`-nested id list; backward gradient
+ACCUMULATION when the same token id repeats within one batch (id 3
+used twice among four positions correctly gets gradient `2.0` in every
+component, not `1.0`, with every unused row's gradient confirmed
+exactly zero) plus the same check against central differences taken
+directly on the weight tensor (token ids themselves can't be
+perturbed, being non-differentiable, so the numerical check has to go
+through the weight instead); and, practically, a small "does this
+sequence contain the marker token" binary classifier (`Embedding` →
+mean-pool over the sequence → `Linear` → `cross_entropy`) trained with
+`Adam` on synthetic sequences -- a marker token planted at a random
+position in half the sequences, pure distractor tokens filling the
+rest, forcing the model to actually learn individual token identity
+through the embedding table rather than any positional or count-based
+shortcut -- reaching 100% test accuracy.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

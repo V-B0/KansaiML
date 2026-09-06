@@ -439,6 +439,41 @@ void batched_matmul_tn(const float* a, const int64_t* a_batch_shape, int64_t a_b
     }
 }
 
+void index_select(const float* x, const int64_t* shape, int64_t ndim, int64_t dim,
+                   const int64_t* indices, int64_t num_indices, float* out) {
+    int64_t outer = 1;
+    for (int64_t i = 0; i < dim; ++i) outer *= shape[i];
+    int64_t inner = 1;
+    for (int64_t i = dim + 1; i < ndim; ++i) inner *= shape[i];
+    int64_t dim_size = shape[dim];
+
+    for (int64_t o = 0; o < outer; ++o) {
+        for (int64_t n = 0; n < num_indices; ++n) {
+            const float* src = x + o * dim_size * inner + indices[n] * inner;
+            float* dst = out + o * num_indices * inner + n * inner;
+            std::memcpy(dst, src, static_cast<size_t>(inner) * sizeof(float));
+        }
+    }
+}
+
+void index_select_bwd(const float* grad_out, const int64_t* shape, int64_t ndim, int64_t dim,
+                       const int64_t* indices, int64_t num_indices, float* grad_in) {
+    int64_t outer = 1;
+    for (int64_t i = 0; i < dim; ++i) outer *= shape[i];
+    int64_t inner = 1;
+    for (int64_t i = dim + 1; i < ndim; ++i) inner *= shape[i];
+    int64_t dim_size = shape[dim];
+
+    std::fill(grad_in, grad_in + outer * dim_size * inner, 0.0f);
+    for (int64_t o = 0; o < outer; ++o) {
+        for (int64_t n = 0; n < num_indices; ++n) {
+            const float* src = grad_out + o * num_indices * inner + n * inner;
+            float* dst = grad_in + o * dim_size * inner + indices[n] * inner;
+            for (int64_t j = 0; j < inner; ++j) dst[j] += src[j];
+        }
+    }
+}
+
 float reduce_sum(const float* x, int64_t n) {
     float acc = 0.0f;
     for (int64_t i = 0; i < n; ++i) acc += x[i];

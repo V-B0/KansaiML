@@ -441,6 +441,57 @@ class BatchNorm1d(Module):
         return normalized.mul(self.weight).add(self.bias)
 
 
+def _flatten_ids(nested):
+    """Same walk as kansai.__init__._flatten, but for a nested list of
+    token ids rather than floats -- Embedding.forward needs both the
+    flat id list (to hand to index_select) and the original nesting's
+    shape (to reshape the looked-up rows back into), and int() here
+    (not float()) keeps an accidentally-float id like 3.0 from silently
+    truncating somewhere downstream instead of erroring."""
+    shape = []
+    node = nested
+    while isinstance(node, list):
+        shape.append(len(node))
+        node = node[0] if node else None
+
+    flat = []
+
+    def _walk(x):
+        if isinstance(x, list):
+            for item in x:
+                _walk(item)
+        else:
+            flat.append(int(x))
+
+    _walk(nested)
+    return flat, shape
+
+
+class Embedding(Module):
+    """A lookup table: `weight` is (vocab_size, embed_dim), one row per
+    token. `forward` takes `token_ids` as a plain (possibly nested)
+    Python list of ints -- e.g. a single id, a (seq_len,) list, or a
+    (batch, seq_len) nested list -- NOT a core.Tensor, since Kansai has
+    no integer dtype and an index into a lookup table isn't a
+    differentiable quantity anyway (see Tensor::index_select's own doc
+    comment). The output shape is the input nesting's shape with
+    embed_dim appended, e.g. (batch, seq_len) ids -> (batch, seq_len,
+    embed_dim). Backward correctly ACCUMULATES weight's gradient when
+    the same token id appears more than once across the batch --
+    index_select_backward's scatter-add, not a plain overwrite."""
+
+    def __init__(self, vocab_size: int, embed_dim: int, seed: int = 0):
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        std = 1.0 / math.sqrt(embed_dim)
+        self.weight = randn([vocab_size, embed_dim], std=std, requires_grad=True, seed=seed)
+
+    def forward(self, token_ids):
+        flat_ids, shape = _flatten_ids(token_ids)
+        out = self.weight.index_select(0, flat_ids)
+        return out.reshape(shape + [self.embed_dim])
+
+
 class Sequential(Module):
     def __init__(self, *layers):
         self.layers = list(layers)

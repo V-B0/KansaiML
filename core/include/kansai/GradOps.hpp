@@ -59,4 +59,13 @@ Tensor broadcast_to_shape(const Tensor& grad, std::vector<int64_t> target_shape)
 Tensor gelu_backward(const Tensor& input, const Tensor& grad_output);
 Tensor leaky_relu_backward(const Tensor& input, const Tensor& grad_output, float negative_slope);
 
+// index_select's own vjp, exposed as a first-class op for the same
+// reason relu_backward/gelu_backward are -- but unlike those, not
+// composable from other existing KIR ops at all (a scatter-ADD over a
+// possibly-repeating index list isn't expressible via slice/cat, which
+// assume disjoint ranges). Same kernel (cpu::index_select_bwd)
+// Tensor::index_select's own eager backward_fn already uses directly.
+Tensor index_select_backward(const Tensor& grad_output, int64_t dim, std::vector<int64_t> indices,
+                              std::vector<int64_t> input_shape);
+
 } // namespace kan

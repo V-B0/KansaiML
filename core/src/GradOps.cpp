@@ -71,4 +71,12 @@ Tensor leaky_relu_backward(const Tensor& input, const Tensor& grad_output, float
     return out;
 }
 
+Tensor index_select_backward(const Tensor& grad_output, int64_t dim, std::vector<int64_t> indices,
+                              std::vector<int64_t> input_shape) {
+    Tensor grad_input = Tensor::zeros(input_shape, false);
+    cpu::index_select_bwd(grad_output.data_ptr(), input_shape.data(), static_cast<int64_t>(input_shape.size()), dim,
+                           indices.data(), static_cast<int64_t>(indices.size()), grad_input.data_ptr());
+    return grad_input;
+}
+
 } // namespace kan

@@ -47,6 +47,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — Pooling/regularization | `AvgPool2d`, `MaxPool2d` (real argmax gradient), `Dropout` | ✅ done |
 | — Batched matmul | Any rank ≥ 2, NumPy-style batch-dim broadcasting | ✅ done |
 | — MultiHeadAttention | Real scaled dot-product attention, cross-attention, masking | ✅ done |
+| — Indexing/`Embedding` | `index_select` (repeat-accumulating backward), token-lookup `nn.Embedding` | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -150,7 +151,18 @@ mask for causal/decoder-style use) matches a from-scratch single-head
 Python reference exactly, a causal mask is checked to zero every
 future-position weight while each row still sums to 1, and a small
 attention-based sequence classifier reaches 100% accuracy on a
-synthetic "find the marker at a random position" task.
+synthetic "find the marker at a random position" task. `index_select`
+(indices are a plain `list[int]`, not a `Tensor` — Kansai has no
+integer dtype, and an index isn't a differentiable quantity) is
+checked to ACCUMULATE its gradient correctly when an index repeats
+(selecting a row twice gives it exactly double the gradient, verified
+component-by-component, not just "some gradient flows"), through both
+eager backward and the full traced `kir.grad` path, including run
+through `run_metal`; `nn.Embedding`, built as pure `index_select` +
+`reshape` with zero new kernels, is checked the same way for repeated
+*token ids* within a batch, and a small "does this sequence contain
+the marker token" classifier (`Embedding` → mean-pool → `Linear` →
+`cross_entropy`) reaches 100% test accuracy.
 
 ## Why
 
@@ -249,7 +261,7 @@ Python (Tensor, nn.Module, optim)
   format
 - `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`, `Tanh`,
   `Sigmoid`, `GELU`, `LeakyReLU`, `Softmax`, `LayerNorm`, `BatchNorm1d`,
-  `AvgPool2d`, `MaxPool2d`, `Dropout`, `MultiHeadAttention`,
+  `AvgPool2d`, `MaxPool2d`, `Dropout`, `MultiHeadAttention`, `Embedding`,
   `Sequential`, `SGD`, `Adam`
 - `tests/` — every claim above, checked: numerical gradient checks,
   cross-checks between independent implementations, and benchmarks that

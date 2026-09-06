@@ -303,6 +303,19 @@ class TraceValue:
         per_example = lse.sub(picked)
         return per_example.mean()
 
+    def index_select(self, dim, indices):
+        nd = len(self.shape)
+        if not (0 <= dim < nd):
+            raise ValueError(f"index_select: dim out of range for shape {self.shape}")
+        dim_size = self.shape[dim]
+        for idx in indices:
+            if not (0 <= idx < dim_size):
+                raise ValueError(f"index_select: index {idx} out of range for dim of size {dim_size}")
+        out_shape = list(self.shape)
+        out_shape[dim] = len(indices)
+        nid = self.graph.add("index_select", [self.node_id], out_shape, self.dtype, dim=dim, indices=list(indices))
+        return TraceValue(self.graph, nid, out_shape, self.dtype)
+
     def reshape(self, shape):
         n = 1
         for d in self.shape:
@@ -446,6 +459,10 @@ def run(graph: Graph, *args) -> "core.Tensor":
             values[node.id] = core.leaky_relu_backward(values[node.inputs[0]], values[node.inputs[1]],
                                                         node.attrs["negative_slope"])
             continue
+        if node.op == "index_select_backward":
+            values[node.id] = core.index_select_backward(values[node.inputs[0]], node.attrs["dim"],
+                                                           node.attrs["indices"], node.attrs["input_shape"])
+            continue
         if node.op == "conv2d":
             x, w, b = (values[i] for i in node.inputs)
             values[node.id] = x.conv2d(w, b, node.attrs["stride"], node.attrs["padding"])
@@ -476,6 +493,10 @@ def run(graph: Graph, *args) -> "core.Tensor":
         if node.op == "max_dim":
             (x,) = (values[i] for i in node.inputs)
             values[node.id] = x.max(node.attrs["dim"], True)
+            continue
+        if node.op == "index_select":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.index_select(node.attrs["dim"], node.attrs["indices"])
             continue
         fn = _OP_TABLE[node.op]
         values[node.id] = fn(*(values[i] for i in node.inputs))
@@ -728,6 +749,10 @@ def run_fused(graph: Graph, *args) -> "core.Tensor":
             values[node.id] = core.leaky_relu_backward(values[node.inputs[0]], values[node.inputs[1]],
                                                         node.attrs["negative_slope"])
             continue
+        if node.op == "index_select_backward":
+            values[node.id] = core.index_select_backward(values[node.inputs[0]], node.attrs["dim"],
+                                                           node.attrs["indices"], node.attrs["input_shape"])
+            continue
         if node.op == "fused_bias_relu":
             x, bias = (values[i] for i in node.inputs)
             values[node.id] = core.fused_bias_relu(x, bias)
@@ -766,6 +791,10 @@ def run_fused(graph: Graph, *args) -> "core.Tensor":
         if node.op == "max_dim":
             (x,) = (values[i] for i in node.inputs)
             values[node.id] = x.max(node.attrs["dim"], True)
+            continue
+        if node.op == "index_select":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.index_select(node.attrs["dim"], node.attrs["indices"])
             continue
         fn = _OP_TABLE[node.op]
         values[node.id] = fn(*(values[i] for i in node.inputs))
@@ -977,6 +1006,9 @@ def run_planned(graph: Graph, plan: MemoryPlan, pool, *args) -> "core.Tensor":
             elif node.op == "max_dim":
                 (mdx,) = (values[i] for i in node.inputs)
                 values[node.id] = mdx.max(node.attrs["dim"], True)
+            elif node.op == "index_select":
+                (isx,) = (values[i] for i in node.inputs)
+                values[node.id] = isx.index_select(node.attrs["dim"], node.attrs["indices"])
             else:
                 fn = _OP_TABLE[node.op]
                 values[node.id] = fn(*(values[i] for i in node.inputs))
@@ -1276,6 +1308,21 @@ def _vjp_max_dim(bwd, node, primal_id, g_out, by_id):
     return [zero_id]
 
 
+def _vjp_index_select(bwd, node, primal_id, g_out, by_id):
+    """Unlike slice/cat's own vjps, not composable from other existing
+    KIR ops: a scatter-ADD over a possibly-repeating index list isn't
+    expressible via slice/cat, which assume disjoint ranges. Reuses the
+    dedicated "index_select_backward" op instead, the same shape
+    gelu_backward/leaky_relu_backward already take for a vjp that isn't
+    cheaply composable."""
+    x_id = node.inputs[0]
+    x_shape = by_id[x_id].shape
+    dim, indices = node.attrs["dim"], node.attrs["indices"]
+    grad_x = bwd.add("index_select_backward", [g_out], x_shape, node.dtype,
+                      dim=dim, indices=indices, input_shape=x_shape)
+    return [grad_x]
+
+
 _VJP_RULES = {
     "add": _vjp_add,
     "sub": _vjp_sub,
@@ -1298,6 +1345,7 @@ _VJP_RULES = {
     "leaky_relu": _vjp_leaky_relu,
     "sum_dim": _vjp_sum_dim,
     "max_dim": _vjp_max_dim,
+    "index_select": _vjp_index_select,
 }
 
 
@@ -1532,6 +1580,11 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
             values[node.id] = core.leaky_relu_backward(values[node.inputs[0]], values[node.inputs[1]],
                                                         node.attrs["negative_slope"])
             continue
+        if node.op == "index_select_backward":
+            flush_chain()
+            values[node.id] = core.index_select_backward(values[node.inputs[0]], node.attrs["dim"],
+                                                           node.attrs["indices"], node.attrs["input_shape"])
+            continue
 
         kind = _metal_elementwise_kind(node, by_id)
         if kind is not None:
@@ -1636,6 +1689,10 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
         if node.op == "max_dim":
             (x,) = (values[i] for i in node.inputs)
             values[node.id] = x.max(node.attrs["dim"], True)
+            continue
+        if node.op == "index_select":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.index_select(node.attrs["dim"], node.attrs["indices"])
             continue
         fn = _OP_TABLE[node.op]
         values[node.id] = fn(*(values[i] for i in node.inputs))

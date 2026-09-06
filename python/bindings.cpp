@@ -91,6 +91,8 @@ NB_MODULE(_core, m) {
         .def("softmax", &Tensor::softmax, nb::arg("dim"), nb::call_guard<nb::gil_scoped_release>())
         .def("cross_entropy", &Tensor::cross_entropy, nb::arg("targets"),
              nb::call_guard<nb::gil_scoped_release>())
+        .def("index_select", &Tensor::index_select, nb::arg("dim"), nb::arg("indices"),
+             nb::call_guard<nb::gil_scoped_release>())
         .def("__add__", &Tensor::add)
         .def("__sub__", &Tensor::sub)
         .def("__mul__", &Tensor::mul)
@@ -128,6 +130,8 @@ NB_MODULE(_core, m) {
           nb::call_guard<nb::gil_scoped_release>());
     m.def("leaky_relu_backward", &leaky_relu_backward, nb::arg("input"), nb::arg("grad_output"),
           nb::arg("negative_slope"), nb::call_guard<nb::gil_scoped_release>());
+    m.def("index_select_backward", &index_select_backward, nb::arg("grad_output"), nb::arg("dim"),
+          nb::arg("indices"), nb::arg("input_shape"), nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<StoragePool>(m, "StoragePool")
         .def(nb::init<>())
