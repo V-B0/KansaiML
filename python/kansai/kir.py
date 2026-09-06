@@ -79,6 +79,16 @@ class Graph:
 # Tracing
 # ---------------------------------------------------------------------
 
+def _squeeze(shape: list, dim: int) -> list:
+    """Drops dimension `dim` (assumed already size 1, a reduction's own
+    keepdim=True shape) -- the Python-side shape math for the reshape()
+    that sum(dim)/mean(dim)/max(dim) apply afterward when keepdim is
+    False."""
+    out = list(shape)
+    del out[dim]
+    return out
+
+
 def _broadcast_shape(a_shape: list, b_shape: list, op_name: str) -> list:
     """NumPy-style right-aligned broadcasting, the Python-side twin of
     core/src/Tensor.cpp's own broadcast_shapes -- pads the shorter shape
@@ -171,13 +181,42 @@ class TraceValue:
         nid = self.graph.add("relu", [self.node_id], list(self.shape), self.dtype)
         return TraceValue(self.graph, nid, list(self.shape), self.dtype)
 
-    def sum(self):
-        nid = self.graph.add("sum", [self.node_id], [1], self.dtype)
-        return TraceValue(self.graph, nid, [1], self.dtype)
+    def sum(self, dim=None, keepdim=False):
+        if dim is None:
+            nid = self.graph.add("sum", [self.node_id], [1], self.dtype)
+            return TraceValue(self.graph, nid, [1], self.dtype)
+        out_shape = list(self.shape)
+        out_shape[dim] = 1
+        nid = self.graph.add("sum_dim", [self.node_id], out_shape, self.dtype, dim=dim)
+        result = TraceValue(self.graph, nid, out_shape, self.dtype)
+        return result if keepdim else result.reshape(_squeeze(out_shape, dim))
 
-    def mean(self):
-        nid = self.graph.add("mean", [self.node_id], [1], self.dtype)
-        return TraceValue(self.graph, nid, [1], self.dtype)
+    def mean(self, dim=None, keepdim=False):
+        if dim is None:
+            nid = self.graph.add("mean", [self.node_id], [1], self.dtype)
+            return TraceValue(self.graph, nid, [1], self.dtype)
+        # Composed from sum(dim) + an existing broadcast-mul, same as
+        # Tensor::mean(dim) at the eager level -- no dedicated "mean_dim"
+        # op, so no separate vjp rule or interpreter dispatch case either.
+        summed = self.sum(dim, keepdim=True)
+        dim_size = self.shape[dim]
+        scale_id = self.graph.add("constant", [], [1], self.dtype, value=core.from_flat([1.0 / dim_size], [1]))
+        scale = TraceValue(self.graph, scale_id, [1], self.dtype)
+        result = summed.mul(scale)
+        return result if keepdim else result.reshape(_squeeze(list(summed.shape), dim))
+
+    def max(self, dim, keepdim=False):
+        # Forward-only, deliberately: see Tensor::max's own declaration
+        # in Tensor.hpp for why softmax's numerical-stability
+        # max-subtraction doesn't need (or want) a gradient through the
+        # max itself. _vjp_max_dim (below) returns an exact zero for
+        # this node's input rather than raising if grad() ever reaches
+        # it, matching that same "detached from the graph" semantics.
+        out_shape = list(self.shape)
+        out_shape[dim] = 1
+        nid = self.graph.add("max_dim", [self.node_id], out_shape, self.dtype, dim=dim)
+        result = TraceValue(self.graph, nid, out_shape, self.dtype)
+        return result if keepdim else result.reshape(_squeeze(out_shape, dim))
 
     def sqrt(self):
         nid = self.graph.add("sqrt", [self.node_id], list(self.shape), self.dtype)
@@ -194,6 +233,55 @@ class TraceValue:
         # dispatch case; mul's and reciprocal's own already cover it.
         other = self._coerce(other)
         return self.mul(other.reciprocal())
+
+    def exp(self):
+        nid = self.graph.add("exp", [self.node_id], list(self.shape), self.dtype)
+        return TraceValue(self.graph, nid, list(self.shape), self.dtype)
+
+    def log(self):
+        nid = self.graph.add("log", [self.node_id], list(self.shape), self.dtype)
+        return TraceValue(self.graph, nid, list(self.shape), self.dtype)
+
+    def tanh(self):
+        nid = self.graph.add("tanh", [self.node_id], list(self.shape), self.dtype)
+        return TraceValue(self.graph, nid, list(self.shape), self.dtype)
+
+    def sigmoid(self):
+        nid = self.graph.add("sigmoid", [self.node_id], list(self.shape), self.dtype)
+        return TraceValue(self.graph, nid, list(self.shape), self.dtype)
+
+    def gelu(self):
+        nid = self.graph.add("gelu", [self.node_id], list(self.shape), self.dtype)
+        return TraceValue(self.graph, nid, list(self.shape), self.dtype)
+
+    def leaky_relu(self, negative_slope=0.01):
+        nid = self.graph.add("leaky_relu", [self.node_id], list(self.shape), self.dtype,
+                              negative_slope=negative_slope)
+        return TraceValue(self.graph, nid, list(self.shape), self.dtype)
+
+    def softmax(self, dim):
+        # Composed entirely from existing ops (max(dim), sub, exp,
+        # sum(dim), div) -- no dedicated "softmax" op, vjp rule, or
+        # interpreter dispatch case, same reason div/mean(dim) above
+        # don't need one either.
+        m = self.max(dim, keepdim=True)
+        shifted = self.sub(m)
+        exp_shifted = shifted.exp()
+        denom = exp_shifted.sum(dim, keepdim=True)
+        return exp_shifted.div(denom)
+
+    def cross_entropy(self, targets):
+        # logsumexp(self, dim=1) - sum(self * targets, dim=1), then
+        # averaged over the batch -- see Tensor::cross_entropy's own
+        # declaration in Tensor.hpp for why this log-sum-exp form, not
+        # softmax(...).log(), is the numerically stable one.
+        targets = self._coerce(targets)
+        m = self.max(1, keepdim=True)
+        shifted = self.sub(m)
+        lse = shifted.exp().sum(1, keepdim=True).log().add(m)
+        picked = self.mul(targets).sum(1, keepdim=True)
+        per_example = lse.sub(picked)
+        return per_example.mean()
 
     def reshape(self, shape):
         n = 1
@@ -292,6 +380,11 @@ _OP_TABLE = {
     "mean": lambda a: a.mean(),
     "sqrt": lambda a: a.sqrt(),
     "reciprocal": lambda a: a.reciprocal(),
+    "exp": lambda a: a.exp(),
+    "log": lambda a: a.log(),
+    "tanh": lambda a: a.tanh(),
+    "sigmoid": lambda a: a.sigmoid(),
+    "gelu": lambda a: a.gelu(),
     # vjp ops grad() builds backward graphs out of (see the Memory
     # planning section below is where fusion/DCE live; grad() and its
     # vjp rules are further down, in the Autograd section) -- forward-
@@ -300,6 +393,7 @@ _OP_TABLE = {
     "matmul_tn": lambda a, b: core.matmul_tn(a, b),
     "relu_backward": lambda x, g: core.relu_backward(x, g),
     "sum_axis0": lambda g: core.sum_axis0(g),
+    "gelu_backward": lambda x, g: core.gelu_backward(x, g),
 }
 
 
@@ -325,6 +419,13 @@ def run(graph: Graph, *args) -> "core.Tensor":
         if node.op == "reduce_to_shape":
             values[node.id] = core.reduce_to_shape(values[node.inputs[0]], node.shape)
             continue
+        if node.op == "broadcast_to_shape":
+            values[node.id] = core.broadcast_to_shape(values[node.inputs[0]], node.shape)
+            continue
+        if node.op == "leaky_relu_backward":
+            values[node.id] = core.leaky_relu_backward(values[node.inputs[0]], values[node.inputs[1]],
+                                                        node.attrs["negative_slope"])
+            continue
         if node.op == "conv2d":
             x, w, b = (values[i] for i in node.inputs)
             values[node.id] = x.conv2d(w, b, node.attrs["stride"], node.attrs["padding"])
@@ -343,6 +444,18 @@ def run(graph: Graph, *args) -> "core.Tensor":
             continue
         if node.op == "cat":
             values[node.id] = core.cat([values[i] for i in node.inputs], node.attrs["dim"])
+            continue
+        if node.op == "leaky_relu":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.leaky_relu(node.attrs["negative_slope"])
+            continue
+        if node.op == "sum_dim":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.sum(node.attrs["dim"], True)
+            continue
+        if node.op == "max_dim":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.max(node.attrs["dim"], True)
             continue
         fn = _OP_TABLE[node.op]
         values[node.id] = fn(*(values[i] for i in node.inputs))
@@ -588,6 +701,13 @@ def run_fused(graph: Graph, *args) -> "core.Tensor":
         if node.op == "reduce_to_shape":
             values[node.id] = core.reduce_to_shape(values[node.inputs[0]], node.shape)
             continue
+        if node.op == "broadcast_to_shape":
+            values[node.id] = core.broadcast_to_shape(values[node.inputs[0]], node.shape)
+            continue
+        if node.op == "leaky_relu_backward":
+            values[node.id] = core.leaky_relu_backward(values[node.inputs[0]], values[node.inputs[1]],
+                                                        node.attrs["negative_slope"])
+            continue
         if node.op == "fused_bias_relu":
             x, bias = (values[i] for i in node.inputs)
             values[node.id] = core.fused_bias_relu(x, bias)
@@ -614,6 +734,18 @@ def run_fused(graph: Graph, *args) -> "core.Tensor":
             continue
         if node.op == "cat":
             values[node.id] = core.cat([values[i] for i in node.inputs], node.attrs["dim"])
+            continue
+        if node.op == "leaky_relu":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.leaky_relu(node.attrs["negative_slope"])
+            continue
+        if node.op == "sum_dim":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.sum(node.attrs["dim"], True)
+            continue
+        if node.op == "max_dim":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.max(node.attrs["dim"], True)
             continue
         fn = _OP_TABLE[node.op]
         values[node.id] = fn(*(values[i] for i in node.inputs))
@@ -816,6 +948,15 @@ def run_planned(graph: Graph, plan: MemoryPlan, pool, *args) -> "core.Tensor":
                 values[node.id] = sx.slice(node.attrs["dim"], node.attrs["start"], node.attrs["stop"])
             elif node.op == "cat":
                 values[node.id] = core.cat([values[i] for i in node.inputs], node.attrs["dim"])
+            elif node.op == "leaky_relu":
+                (lx,) = (values[i] for i in node.inputs)
+                values[node.id] = lx.leaky_relu(node.attrs["negative_slope"])
+            elif node.op == "sum_dim":
+                (sdx,) = (values[i] for i in node.inputs)
+                values[node.id] = sdx.sum(node.attrs["dim"], True)
+            elif node.op == "max_dim":
+                (mdx,) = (values[i] for i in node.inputs)
+                values[node.id] = mdx.max(node.attrs["dim"], True)
             else:
                 fn = _OP_TABLE[node.op]
                 values[node.id] = fn(*(values[i] for i in node.inputs))
@@ -1025,6 +1166,96 @@ def _vjp_reciprocal(bwd, node, primal_id, g_out, by_id):
     return [grad_x]
 
 
+def _vjp_exp(bwd, node, primal_id, g_out, by_id):
+    """d/dx exp(x) = exp(x) = out -- a straight multiply by this node's
+    own re-embedded output, same as Tensor::exp's eager backward_fn."""
+    out_shape = node.shape
+    out_primal = primal_id[node.id]
+    grad_x = bwd.add("mul", [g_out, out_primal], out_shape, node.dtype)
+    return [grad_x]
+
+
+def _vjp_log(bwd, node, primal_id, g_out, by_id):
+    """d/dx log(x) = 1/x -- composed from "reciprocal" + "mul" on the
+    re-embedded INPUT (not this node's own output, unlike exp/sqrt/
+    tanh/sigmoid above), same as Tensor::log's eager backward_fn."""
+    x_id = node.inputs[0]
+    out_shape = node.shape
+    recip_x = bwd.add("reciprocal", [primal_id[x_id]], out_shape, node.dtype)
+    grad_x = bwd.add("mul", [g_out, recip_x], out_shape, node.dtype)
+    return [grad_x]
+
+
+def _vjp_tanh(bwd, node, primal_id, g_out, by_id):
+    """d/dx tanh(x) = 1 - tanh(x)^2 = 1 - out^2."""
+    out_shape = node.shape
+    out_primal = primal_id[node.id]
+    out_sq = bwd.add("mul", [out_primal, out_primal], out_shape, node.dtype)
+    one_id = bwd.add("constant", [], [1], node.dtype, value=core.from_flat([1.0], [1]))
+    one_minus_sq = bwd.add("sub", [one_id, out_sq], out_shape, node.dtype)
+    grad_x = bwd.add("mul", [g_out, one_minus_sq], out_shape, node.dtype)
+    return [grad_x]
+
+
+def _vjp_sigmoid(bwd, node, primal_id, g_out, by_id):
+    """d/dx sigmoid(x) = sigmoid(x)*(1-sigmoid(x)) = out*(1-out)."""
+    out_shape = node.shape
+    out_primal = primal_id[node.id]
+    one_id = bwd.add("constant", [], [1], node.dtype, value=core.from_flat([1.0], [1]))
+    one_minus_out = bwd.add("sub", [one_id, out_primal], out_shape, node.dtype)
+    tmp = bwd.add("mul", [out_primal, one_minus_out], out_shape, node.dtype)
+    grad_x = bwd.add("mul", [g_out, tmp], out_shape, node.dtype)
+    return [grad_x]
+
+
+def _vjp_gelu(bwd, node, primal_id, g_out, by_id):
+    """Unlike exp/tanh/sigmoid above, gelu's derivative isn't cheaply
+    composable from existing ops (it needs erf and a Gaussian PDF term),
+    so this reuses the dedicated gelu_backward op instead -- the same
+    "input, not output" shape relu_backward already has, exposed for
+    the identical reason: the derivative needs the ORIGINAL input."""
+    x_id = node.inputs[0]
+    grad_x = bwd.add("gelu_backward", [primal_id[x_id], g_out], node.shape, node.dtype)
+    return [grad_x]
+
+
+def _vjp_leaky_relu(bwd, node, primal_id, g_out, by_id):
+    x_id = node.inputs[0]
+    negative_slope = node.attrs["negative_slope"]
+    grad_x = bwd.add("leaky_relu_backward", [primal_id[x_id], g_out], node.shape, node.dtype,
+                      negative_slope=negative_slope)
+    return [grad_x]
+
+
+def _vjp_sum_dim(bwd, node, primal_id, g_out, by_id):
+    """The inverse of how sum(dim) reduced: broadcast the (already
+    keepdim=True-shaped, since grad() differentiates the UNfused graph
+    before any squeeze-reshape) cotangent back out to x's original
+    shape via "broadcast_to_shape" -- the general N-D form of what
+    Tensor::sum(dim)'s own eager backward_fn does directly via
+    cpu::broadcast_to_shape."""
+    x_id = node.inputs[0]
+    x_shape = by_id[x_id].shape
+    grad_x = bwd.add("broadcast_to_shape", [g_out], x_shape, node.dtype)
+    return [grad_x]
+
+
+def _vjp_max_dim(bwd, node, primal_id, g_out, by_id):
+    """Deliberately returns an exact zero, never a real gradient -- see
+    Tensor::max(dim)'s own declaration in Tensor.hpp (and max_along_dim
+    in backend/cpu) for why max(dim) is a stop-gradient by design, not
+    an oversight: softmax's numerical-stability max-subtraction is
+    mathematically constant-shift-invariant, so max(x)'s own gradient is
+    provably irrelevant to softmax's true gradient. Kept as an explicit
+    vjp rule (rather than leaving "max_dim" out of _VJP_RULES entirely)
+    so a graph that happens to need this node's gradient gets a defined,
+    correct answer instead of a KeyError."""
+    x_id = node.inputs[0]
+    x_shape = by_id[x_id].shape
+    zero_id = bwd.add("constant", [], x_shape, node.dtype, value=core.zeros(x_shape))
+    return [zero_id]
+
+
 _VJP_RULES = {
     "add": _vjp_add,
     "sub": _vjp_sub,
@@ -1039,6 +1270,14 @@ _VJP_RULES = {
     "cat": _vjp_cat,
     "sqrt": _vjp_sqrt,
     "reciprocal": _vjp_reciprocal,
+    "exp": _vjp_exp,
+    "log": _vjp_log,
+    "tanh": _vjp_tanh,
+    "sigmoid": _vjp_sigmoid,
+    "gelu": _vjp_gelu,
+    "leaky_relu": _vjp_leaky_relu,
+    "sum_dim": _vjp_sum_dim,
+    "max_dim": _vjp_max_dim,
 }
 
 
@@ -1264,6 +1503,15 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
             flush_chain()
             values[node.id] = core.reduce_to_shape(values[node.inputs[0]], node.shape)
             continue
+        if node.op == "broadcast_to_shape":
+            flush_chain()
+            values[node.id] = core.broadcast_to_shape(values[node.inputs[0]], node.shape)
+            continue
+        if node.op == "leaky_relu_backward":
+            flush_chain()
+            values[node.id] = core.leaky_relu_backward(values[node.inputs[0]], values[node.inputs[1]],
+                                                        node.attrs["negative_slope"])
+            continue
 
         kind = _metal_elementwise_kind(node, by_id)
         if kind is not None:
@@ -1350,6 +1598,18 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
             continue
         if node.op == "cat":
             values[node.id] = core.cat([values[i] for i in node.inputs], node.attrs["dim"])
+            continue
+        if node.op == "leaky_relu":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.leaky_relu(node.attrs["negative_slope"])
+            continue
+        if node.op == "sum_dim":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.sum(node.attrs["dim"], True)
+            continue
+        if node.op == "max_dim":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.max(node.attrs["dim"], True)
             continue
         fn = _OP_TABLE[node.op]
         values[node.id] = fn(*(values[i] for i in node.inputs))

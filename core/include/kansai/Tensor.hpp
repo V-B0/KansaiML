@@ -90,6 +90,58 @@ public:
     // shows up as a bottleneck.
     Tensor div(const Tensor& other) const;
 
+    // exp/log, standard elementwise, natural base.
+    Tensor exp() const;
+    Tensor log() const;
+
+    // tanh/sigmoid/gelu/leaky_relu: the rest of this project's
+    // activation vocabulary beyond relu. gelu is the EXACT formulation
+    // (via std::erf), not the tanh-based approximation some frameworks
+    // default to -- see backend/cpu's own comment for why there was
+    // nothing to gain from approximating when the exact form is a
+    // direct standard-library call.
+    Tensor tanh() const;
+    Tensor sigmoid() const;
+    Tensor gelu() const;
+    Tensor leaky_relu(float negative_slope = 0.01f) const;
+
+    // Reduces along one axis instead of every axis the way sum()/
+    // mean() above do -- keepdim=false (the default) squeezes that
+    // axis away afterward via reshape() rather than leaving it as a
+    // literal size-1 dimension. mean(dim) is composed entirely from
+    // sum(dim) + an existing broadcast-mul, no dedicated kernel or
+    // backward of its own; max(dim) is forward-only, DELIBERATELY --
+    // see backend/cpu's own comment on max_along_dim for exactly why a
+    // gradient through it isn't needed (or provided).
+    Tensor sum(int64_t dim, bool keepdim = false) const;
+    Tensor mean(int64_t dim, bool keepdim = false) const;
+    Tensor max(int64_t dim, bool keepdim = false) const;
+
+    // Numerically stable: subtracts max(dim) before exponentiating
+    // (mathematically a no-op -- softmax(x) == softmax(x - c) for any
+    // constant c -- but the only thing standing between this and
+    // overflowing exp() on realistic logit magnitudes). Composed
+    // entirely from existing ops (max(dim) [forward-only, see above],
+    // sub, exp, sum(dim), div), so it needs no dedicated kernel or vjp
+    // rule of its own -- every op it's built from already has one.
+    Tensor softmax(int64_t dim) const;
+
+    // self: (batch, classes) raw logits (NOT pre-softmaxed). targets:
+    // (batch, classes) ONE-HOT, not a class-index vector -- Kansai has
+    // no integer gather/indexing op yet, so a one-hot target is what
+    // makes this expressible from existing ops at all; converting a
+    // class-index label vector to one-hot is the caller's job (a plain
+    // Python loop, not a kernel this needs). Computed via the numerically
+    // stable log-sum-exp identity (logsumexp(logits) - sum(logits *
+    // targets, dim=1)), never softmax(logits).log() -- log(softmax(x))
+    // is the textbook numerically UNSTABLE way to compute this (softmax
+    // can legitimately underflow to exactly 0.0 before log ever sees
+    // it, producing -inf and then NaN once multiplied by 0 for a
+    // masked-out class), which is exactly why every real framework's
+    // cross-entropy uses this log-sum-exp form instead of composing
+    // softmax and log separately.
+    Tensor cross_entropy(const Tensor& targets) const;
+
     // self: (N, Cin, H, W), weight: (Cout, Cin, kH, kW), bias: (Cout,).
     // Forward is im2col + the same matmul kernel every other op already
     // uses (one call per batch item); backward reuses matmul_nt/matmul_tn

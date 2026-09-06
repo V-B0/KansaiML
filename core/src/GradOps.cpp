@@ -52,4 +52,23 @@ Tensor reduce_to_shape(const Tensor& grad, std::vector<int64_t> target_shape) {
     return out;
 }
 
+Tensor broadcast_to_shape(const Tensor& grad, std::vector<int64_t> target_shape) {
+    Tensor out = Tensor::zeros(target_shape, false);
+    cpu::broadcast_to_shape(grad.data_ptr(), grad.shape().data(), grad.ndim(),
+                             target_shape.data(), static_cast<int64_t>(target_shape.size()), out.data_ptr());
+    return out;
+}
+
+Tensor gelu_backward(const Tensor& input, const Tensor& grad_output) {
+    Tensor out = Tensor::zeros(input.shape(), false);
+    cpu::gelu_bwd(input.data_ptr(), grad_output.data_ptr(), out.data_ptr(), input.numel());
+    return out;
+}
+
+Tensor leaky_relu_backward(const Tensor& input, const Tensor& grad_output, float negative_slope) {
+    Tensor out = Tensor::zeros(input.shape(), false);
+    cpu::leaky_relu_bwd(input.data_ptr(), grad_output.data_ptr(), out.data_ptr(), input.numel(), negative_slope);
+    return out;
+}
+
 } // namespace kan

@@ -71,6 +71,41 @@ class ReLU(Module):
         return x.relu()
 
 
+class Tanh(Module):
+    def forward(self, x):
+        return x.tanh()
+
+
+class Sigmoid(Module):
+    def forward(self, x):
+        return x.sigmoid()
+
+
+class GELU(Module):
+    """The exact formulation (via erf), not the tanh-based approximation
+    some frameworks default to -- see Tensor::gelu's own declaration in
+    core/include/kansai/Tensor.hpp for why."""
+
+    def forward(self, x):
+        return x.gelu()
+
+
+class LeakyReLU(Module):
+    def __init__(self, negative_slope: float = 0.01):
+        self.negative_slope = negative_slope
+
+    def forward(self, x):
+        return x.leaky_relu(self.negative_slope)
+
+
+class Softmax(Module):
+    def __init__(self, dim: int):
+        self.dim = dim
+
+    def forward(self, x):
+        return x.softmax(self.dim)
+
+
 class Sequential(Module):
     def __init__(self, *layers):
         self.layers = list(layers)

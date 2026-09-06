@@ -71,6 +71,64 @@ void sqrt_bwd(const float* out, const float* grad_out, float* grad_in, int64_t n
 void reciprocal_fwd(const float* x, float* out, int64_t n);
 void reciprocal_bwd(const float* out, const float* grad_out, float* grad_in, int64_t n);
 
+// exp/log: forward only. Each backward composes from existing kernels
+// at the Tensor level instead of its own dedicated bwd kernel -- d/dx
+// exp(x) = exp(x) = out, so exp's own vjp is exactly cpu::mul(grad_out,
+// out); d/dx log(x) = 1/x, so log's is cpu::mul(grad_out,
+// reciprocal_fwd(x)) -- both already exist, so there's nothing a new
+// kernel would add.
+void exp_fwd(const float* x, float* out, int64_t n);
+void log_fwd(const float* x, float* out, int64_t n);
+
+// tanh/sigmoid, each reusing their own output the same way sqrt/
+// reciprocal do: d/dx tanh(x) = 1 - tanh(x)^2 = 1 - out^2; d/dx
+// sigmoid(x) = sigmoid(x)*(1-sigmoid(x)) = out*(1-out).
+void tanh_fwd(const float* x, float* out, int64_t n);
+void tanh_bwd(const float* out, const float* grad_out, float* grad_in, int64_t n);
+void sigmoid_fwd(const float* x, float* out, int64_t n);
+void sigmoid_bwd(const float* out, const float* grad_out, float* grad_in, int64_t n);
+
+// GELU: the exact formulation (x * Phi(x), Phi = the standard normal
+// CDF), not the tanh-based approximation some frameworks default to --
+// C++11's std::erf makes the exact form a direct one-line
+// implementation, so there was nothing to gain from approximating.
+// Backward needs the ORIGINAL input (not just the output, unlike
+// sqrt/tanh/sigmoid above): d/dx gelu(x) = Phi(x) + x*phi(x), where
+// phi is the standard normal PDF -- neither term is recoverable from
+// gelu(x) alone.
+void gelu_fwd(const float* x, float* out, int64_t n);
+void gelu_bwd(const float* x, const float* grad_out, float* grad_in, int64_t n);
+
+// LeakyReLU: like relu_fwd/relu_bwd, needs the original input (not the
+// output) to know which side of zero each element was on.
+void leaky_relu_fwd(const float* x, float* out, int64_t n, float negative_slope);
+void leaky_relu_bwd(const float* x, const float* grad_out, float* grad_in, int64_t n, float negative_slope);
+
+// Reduces `x` (shape, rank ndim) along axis `dim` by MAX, producing an
+// output shaped like `shape` with dim's extent collapsed to 1
+// (keepdim=true shape always -- squeezing it away, if wanted, is a
+// reshape at the Tensor level, same as sum(dim)/mean(dim) below).
+// Forward-only, DELIBERATELY no gradient: max's own vjp is an argmax-
+// scatter (1 at the winning position, 0 elsewhere), which nothing here
+// needs -- softmax's numerical-stability max-subtraction is
+// mathematically constant-shift-invariant (softmax(x) == softmax(x -
+// c) for ANY constant c, gradient included), so max(x)'s OWN gradient
+// is provably irrelevant to softmax's true gradient and every other
+// framework detaches it from the graph for exactly this reason, not
+// merely for convenience.
+void max_along_dim(const float* x, const int64_t* shape, int64_t ndim, int64_t dim, float* out);
+
+// The exact inverse of reduce_to_shape (both share the same
+// broadcast_strides helper internally): copies `x` (shape x_shape,
+// rank x_rank) up to `target_shape` (rank target_rank >= x_rank),
+// reading the same source element via a stride-0 read for every axis
+// x doesn't have or holds as size 1 -- what sum(dim,keepdim)'s own
+// backward needs (broadcasting a reduced-shape cotangent back out to
+// the pre-reduction shape), a straight copy rather than reduce_to_
+// shape's accumulate, since going from small to big never overlaps.
+void broadcast_to_shape(const float* x, const int64_t* x_shape, int64_t x_rank,
+                         const int64_t* target_shape, int64_t target_rank, float* out);
+
 // a: (M,K) row-major, b: (K,N) row-major, out: (M,N) row-major
 void matmul(const float* a, const float* b, float* out, int64_t M, int64_t K, int64_t N);
 

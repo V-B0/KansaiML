@@ -53,8 +53,21 @@ NB_MODULE(_core, m) {
         .def("mul", &Tensor::mul, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
         .def("matmul", &Tensor::matmul, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
         .def("relu", &Tensor::relu, nb::call_guard<nb::gil_scoped_release>())
-        .def("sum", &Tensor::sum, nb::call_guard<nb::gil_scoped_release>())
-        .def("mean", &Tensor::mean, nb::call_guard<nb::gil_scoped_release>())
+        // sum/mean are each overloaded in C++ (full reduction vs
+        // along-one-axis), so &Tensor::sum/&Tensor::mean alone is
+        // ambiguous to the compiler -- an explicit member-function-
+        // pointer cast picks one; registering both under the same
+        // Python name lets nanobind resolve by argument count at call
+        // time (t.sum() vs t.sum(1)/t.sum(1, True)), same as any other
+        // overloaded nanobind binding.
+        .def("sum", static_cast<Tensor (Tensor::*)() const>(&Tensor::sum), nb::call_guard<nb::gil_scoped_release>())
+        .def("sum", static_cast<Tensor (Tensor::*)(int64_t, bool) const>(&Tensor::sum),
+             nb::arg("dim"), nb::arg("keepdim") = false, nb::call_guard<nb::gil_scoped_release>())
+        .def("mean", static_cast<Tensor (Tensor::*)() const>(&Tensor::mean), nb::call_guard<nb::gil_scoped_release>())
+        .def("mean", static_cast<Tensor (Tensor::*)(int64_t, bool) const>(&Tensor::mean),
+             nb::arg("dim"), nb::arg("keepdim") = false, nb::call_guard<nb::gil_scoped_release>())
+        .def("max", &Tensor::max, nb::arg("dim"), nb::arg("keepdim") = false,
+             nb::call_guard<nb::gil_scoped_release>())
         .def("conv2d", &Tensor::conv2d, nb::arg("weight"), nb::arg("bias"), nb::arg("stride"), nb::arg("padding"),
              nb::call_guard<nb::gil_scoped_release>())
         .def("reshape", &Tensor::reshape, nb::arg("shape"), nb::call_guard<nb::gil_scoped_release>())
@@ -65,6 +78,16 @@ NB_MODULE(_core, m) {
         .def("sqrt", &Tensor::sqrt, nb::call_guard<nb::gil_scoped_release>())
         .def("reciprocal", &Tensor::reciprocal, nb::call_guard<nb::gil_scoped_release>())
         .def("div", &Tensor::div, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
+        .def("exp", &Tensor::exp, nb::call_guard<nb::gil_scoped_release>())
+        .def("log", &Tensor::log, nb::call_guard<nb::gil_scoped_release>())
+        .def("tanh", &Tensor::tanh, nb::call_guard<nb::gil_scoped_release>())
+        .def("sigmoid", &Tensor::sigmoid, nb::call_guard<nb::gil_scoped_release>())
+        .def("gelu", &Tensor::gelu, nb::call_guard<nb::gil_scoped_release>())
+        .def("leaky_relu", &Tensor::leaky_relu, nb::arg("negative_slope") = 0.01f,
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("softmax", &Tensor::softmax, nb::arg("dim"), nb::call_guard<nb::gil_scoped_release>())
+        .def("cross_entropy", &Tensor::cross_entropy, nb::arg("targets"),
+             nb::call_guard<nb::gil_scoped_release>())
         .def("__add__", &Tensor::add)
         .def("__sub__", &Tensor::sub)
         .def("__mul__", &Tensor::mul)
@@ -96,6 +119,12 @@ NB_MODULE(_core, m) {
     m.def("matmul_tn", &matmul_tn, nb::arg("a"), nb::arg("b"), nb::call_guard<nb::gil_scoped_release>());
     m.def("reduce_to_shape", &reduce_to_shape, nb::arg("grad"), nb::arg("target_shape"),
           nb::call_guard<nb::gil_scoped_release>());
+    m.def("broadcast_to_shape", &broadcast_to_shape, nb::arg("grad"), nb::arg("target_shape"),
+          nb::call_guard<nb::gil_scoped_release>());
+    m.def("gelu_backward", &gelu_backward, nb::arg("input"), nb::arg("grad_output"),
+          nb::call_guard<nb::gil_scoped_release>());
+    m.def("leaky_relu_backward", &leaky_relu_backward, nb::arg("input"), nb::arg("grad_output"),
+          nb::arg("negative_slope"), nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<StoragePool>(m, "StoragePool")
         .def(nb::init<>())

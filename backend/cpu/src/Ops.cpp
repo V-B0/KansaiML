@@ -196,6 +196,107 @@ void reciprocal_bwd(const float* out, const float* grad_out, float* grad_in, int
     for (int64_t i = 0; i < n; ++i) grad_in[i] = -grad_out[i] * out[i] * out[i];
 }
 
+void exp_fwd(const float* x, float* out, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) out[i] = std::exp(x[i]);
+}
+
+void log_fwd(const float* x, float* out, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) out[i] = std::log(x[i]);
+}
+
+void tanh_fwd(const float* x, float* out, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) out[i] = std::tanh(x[i]);
+}
+
+void tanh_bwd(const float* out, const float* grad_out, float* grad_in, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) grad_in[i] = grad_out[i] * (1.0f - out[i] * out[i]);
+}
+
+void sigmoid_fwd(const float* x, float* out, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) out[i] = 1.0f / (1.0f + std::exp(-x[i]));
+}
+
+void sigmoid_bwd(const float* out, const float* grad_out, float* grad_in, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) grad_in[i] = grad_out[i] * out[i] * (1.0f - out[i]);
+}
+
+namespace {
+constexpr float kInvSqrt2 = 0.7071067811865476f;       // 1/sqrt(2)
+constexpr float kInvSqrt2Pi = 0.3989422804014327f;      // 1/sqrt(2*pi)
+} // namespace
+
+void gelu_fwd(const float* x, float* out, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        float xi = x[i];
+        float cdf = 0.5f * (1.0f + std::erf(xi * kInvSqrt2));
+        out[i] = xi * cdf;
+    }
+}
+
+void gelu_bwd(const float* x, const float* grad_out, float* grad_in, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        float xi = x[i];
+        float cdf = 0.5f * (1.0f + std::erf(xi * kInvSqrt2));
+        float pdf = kInvSqrt2Pi * std::exp(-0.5f * xi * xi);
+        grad_in[i] = grad_out[i] * (cdf + xi * pdf);
+    }
+}
+
+void leaky_relu_fwd(const float* x, float* out, int64_t n, float negative_slope) {
+    for (int64_t i = 0; i < n; ++i) out[i] = x[i] > 0.0f ? x[i] : negative_slope * x[i];
+}
+
+void leaky_relu_bwd(const float* x, const float* grad_out, float* grad_in, int64_t n, float negative_slope) {
+    for (int64_t i = 0; i < n; ++i) grad_in[i] = x[i] > 0.0f ? grad_out[i] : negative_slope * grad_out[i];
+}
+
+void max_along_dim(const float* x, const int64_t* shape, int64_t ndim, int64_t dim, float* out) {
+    int64_t outer = 1;
+    for (int64_t i = 0; i < dim; ++i) outer *= shape[i];
+    int64_t inner = 1;
+    for (int64_t i = dim + 1; i < ndim; ++i) inner *= shape[i];
+    int64_t dim_size = shape[dim];
+
+    for (int64_t o = 0; o < outer; ++o) {
+        for (int64_t in = 0; in < inner; ++in) {
+            float best = x[o * dim_size * inner + 0 * inner + in];
+            for (int64_t d = 1; d < dim_size; ++d) {
+                float v = x[o * dim_size * inner + d * inner + in];
+                if (v > best) best = v;
+            }
+            out[o * inner + in] = best;
+        }
+    }
+}
+
+void broadcast_to_shape(const float* x, const int64_t* x_shape, int64_t x_rank,
+                         const int64_t* target_shape, int64_t target_rank, float* out) {
+    std::vector<int64_t> x_strides(static_cast<size_t>(target_rank));
+    broadcast_strides(x_shape, x_rank, target_rank, x_strides.data());
+
+    std::vector<int64_t> target_strides(static_cast<size_t>(target_rank));
+    if (target_rank > 0) {
+        target_strides[static_cast<size_t>(target_rank - 1)] = 1;
+        for (int64_t i = target_rank - 2; i >= 0; --i)
+            target_strides[static_cast<size_t>(i)] = target_strides[static_cast<size_t>(i + 1)] * target_shape[i + 1];
+    }
+
+    int64_t n = 1;
+    for (int64_t i = 0; i < target_rank; ++i) n *= target_shape[i];
+
+    std::vector<int64_t> coord(static_cast<size_t>(target_rank));
+    for (int64_t idx = 0; idx < n; ++idx) {
+        int64_t rem = idx;
+        for (int64_t d = 0; d < target_rank; ++d) {
+            coord[d] = rem / target_strides[d];
+            rem %= target_strides[d];
+        }
+        int64_t xidx = 0;
+        for (int64_t d = 0; d < target_rank; ++d) xidx += coord[d] * x_strides[d];
+        out[idx] = x[xidx];
+    }
+}
+
 void matmul(const float* a, const float* b, float* out, int64_t M, int64_t K, int64_t N) {
 #ifdef KANSAI_USE_ACCELERATE
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,

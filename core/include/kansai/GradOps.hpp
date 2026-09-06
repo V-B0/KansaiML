@@ -45,4 +45,18 @@ Tensor matmul_tn(const Tensor& a, const Tensor& b);
 // axis 0" special case of exactly this; this is its general N-D form.
 Tensor reduce_to_shape(const Tensor& grad, std::vector<int64_t> target_shape);
 
+// The exact inverse of reduce_to_shape -- broadcasts `grad` up to
+// `target_shape` rather than summing it down. sum(dim)'s own vjp (both
+// the eager backward_fn in Tensor::sum(dim) and kir.grad's _vjp_sum_dim)
+// needs exactly this: the reduced-shape cotangent spread back out to
+// every position along the axis that got summed over.
+Tensor broadcast_to_shape(const Tensor& grad, std::vector<int64_t> target_shape);
+
+// gelu/leaky_relu's own vjps, exposed as first-class ops for the same
+// reason relu_backward is: `input` is the ORIGINAL (pre-activation)
+// tensor, not the activation's own output -- neither derivative is
+// recoverable from the output alone the way sqrt/tanh/sigmoid's are.
+Tensor gelu_backward(const Tensor& input, const Tensor& grad_output);
+Tensor leaky_relu_backward(const Tensor& input, const Tensor& grad_output, float negative_slope);
+
 } // namespace kan

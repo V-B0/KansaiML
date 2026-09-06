@@ -1269,6 +1269,90 @@ with SGD, converging to the same near-zero loss bar with Adam instead,
 confirming this is a genuine drop-in optimizer on a real model, not
 just a formula that matches in isolation.
 
+## More activations, softmax, cross_entropy
+
+`relu` was this project's only activation until now. Added: `tanh`,
+`sigmoid`, `gelu` (each an ordinary new elementwise op, backend kernel +
+`Tensor` method + `GradNode` backward + KIR integration, same recipe
+`sqrt`/`reciprocal` already established), `leaky_relu` (the first
+activation that takes a real parameter -- `negative_slope` -- so it
+needed the attrs-based interpreter dispatch `reshape`/`transpose`/
+`conv2d` already established, not the simpler no-attrs `_OP_TABLE`-only
+path `tanh`/`sigmoid`/`gelu` get away with), and `sum(dim)`/`mean(dim)`/
+`max(dim)` -- reduction along ONE axis, the real new capability this
+section actually needed, since `sum()`/`mean()` before this only ever
+reduced to a full scalar.
+
+`gelu` is the *exact* formulation (`x * Phi(x)`, `Phi` the standard
+normal CDF, via C++11's `std::erf`), not the tanh-based approximation
+some frameworks default to -- there was nothing to gain from
+approximating when the exact form is a one-line standard-library call.
+Its backward needs the ORIGINAL input, not just the output (unlike
+`tanh`/`sigmoid`, whose derivatives are cheaply expressible in terms of
+their own output alone), and isn't cheaply composable from other
+existing ops either, so it gets a dedicated `gelu_backward` op -- the
+same shape `relu_backward` already has, for the identical reason.
+`leaky_relu_backward` follows the same pattern.
+
+`sum(dim, keepdim)`'s forward turned out to need no new kernel at all:
+it's exactly `reduce_to_shape` (built for general broadcasting's own
+backward, previous section) called with a target shape equal to the
+input's own shape but with `dim`'s extent set to 1 -- summing "down to
+a shape with one axis collapsed" is precisely what that kernel already
+does. Its backward *does* need something new -- `broadcast_to_shape`,
+the direct inverse, spreading a reduced-shape cotangent back out along
+the axis that got summed over, sharing the same `broadcast_strides`
+helper `reduce_to_shape` itself uses internally. `mean(dim)` needed
+nothing new at all: it's `sum(dim)` scaled by a shape-`[1]` broadcast
+constant (the same scalar-broadcast idiom Adam's own hyperparameters
+use), so its gradient falls out of `sum(dim)`'s and the broadcasting
+`mul`'s own chain rules automatically.
+
+`max(dim)` is forward-only, **on purpose, not by omission** -- this is
+the one design choice in this section worth dwelling on. Max's own true
+gradient is an argmax-scatter (1 at the winning position, 0 elsewhere),
+but nothing here needs it: softmax's numerical-stability max-
+subtraction trick is mathematically constant-shift-invariant --
+`softmax(x) == softmax(x - c)` for *any* constant `c`, gradient
+included -- so `max(x)`'s own gradient is providably irrelevant to
+softmax's true gradient, and every real framework detaches it from the
+graph for exactly this reason, not merely as a convenience. Enforced at
+both levels: the eager `Tensor::max(dim)` never attaches a `GradNode`
+regardless of the input's `requires_grad`, and `kir.grad`'s own
+`_vjp_max_dim` explicitly returns a zero rather than raising or being
+left out of `_VJP_RULES` entirely -- a graph that happens to ask for
+this node's gradient gets a defined, correct (zero) answer instead of a
+`KeyError`.
+
+**`softmax(dim)`** and **`cross_entropy(logits, targets)`** are pure
+compositions -- `max(dim)` → `sub` → `exp` → `sum(dim)` → `div` for
+softmax, adding `log` for cross-entropy's log-sum-exp -- with no
+dedicated kernel, `GradNode`, KIR op, or vjp rule of their own at all;
+every op they're built from already has one. `cross_entropy` takes
+ONE-HOT targets, not a class-index vector -- Kansai has no integer
+gather/indexing op yet, so one-hot is what makes this expressible from
+existing ops at all (converting a class-index label vector to one-hot
+is the caller's own job, a plain Python loop, not something this
+needed a kernel for). Computed via the log-sum-exp identity
+(`logsumexp(logits) - sum(logits * targets)`), **never**
+`softmax(logits).log()` -- the textbook-unstable way to compute this,
+since softmax can legitimately underflow to exactly `0.0` in float32
+before `log` ever sees it, producing `-inf` and then `NaN` once
+multiplied by zero for a masked-out class. Verified directly: softmax
+on logits as large as `[1000, 1001, 1002]` stays finite and still sums
+to 1 (a naive `exp()` on those values would overflow float32 outright).
+
+Verified at the same three levels the rest of this project's ops are
+held to, plus one more specific to this section: `cross_entropy`
+checked against an independent from-scratch Python re-implementation of
+log-sum-exp (not Kansai's own `softmax().log()` composed a second time,
+which could share a bug with the real implementation), and a genuine
+practical test -- a 3-class classifier (three separated 2D Gaussian
+blobs), trained with `Linear → ReLU → Linear → cross_entropy` and
+`Adam`, reaching 100% classification accuracy. The first classification
+task (as opposed to regression, XOR included) this project has ever
+trained end to end.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

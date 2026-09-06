@@ -511,6 +511,234 @@ Tensor Tensor::div(const Tensor& other) const {
     return this->mul(other.reciprocal());
 }
 
+Tensor Tensor::exp() const {
+    const Tensor& x = *this;
+    Tensor out = Tensor::zeros(x.shape(), false);
+    cpu::exp_fwd(x.data_ptr(), out.data_ptr(), x.numel());
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "exp";
+        node->inputs = {x};
+        node->backward_fn = [out](const Tensor& grad_output) -> std::vector<Tensor> {
+            // d/dx exp(x) = exp(x) = out -- exp's own vjp is exactly a
+            // multiply by its own forward output, no dedicated bwd
+            // kernel needed.
+            Tensor grad_x = Tensor::zeros(out.shape(), false);
+            cpu::mul(grad_output.data_ptr(), out.data_ptr(), grad_x.data_ptr(), out.numel());
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
+Tensor Tensor::log() const {
+    const Tensor& x = *this;
+    Tensor out = Tensor::zeros(x.shape(), false);
+    cpu::log_fwd(x.data_ptr(), out.data_ptr(), x.numel());
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "log";
+        node->inputs = {x};
+        node->backward_fn = [x](const Tensor& grad_output) -> std::vector<Tensor> {
+            // d/dx log(x) = 1/x -- composed from the existing
+            // reciprocal kernel + mul rather than its own bwd kernel.
+            Tensor recip_x = Tensor::zeros(x.shape(), false);
+            cpu::reciprocal_fwd(x.data_ptr(), recip_x.data_ptr(), x.numel());
+            Tensor grad_x = Tensor::zeros(x.shape(), false);
+            cpu::mul(grad_output.data_ptr(), recip_x.data_ptr(), grad_x.data_ptr(), x.numel());
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
+Tensor Tensor::tanh() const {
+    const Tensor& x = *this;
+    Tensor out = Tensor::zeros(x.shape(), false);
+    cpu::tanh_fwd(x.data_ptr(), out.data_ptr(), x.numel());
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "tanh";
+        node->inputs = {x};
+        node->backward_fn = [out](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(out.shape(), false);
+            cpu::tanh_bwd(out.data_ptr(), grad_output.data_ptr(), grad_x.data_ptr(), out.numel());
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
+Tensor Tensor::sigmoid() const {
+    const Tensor& x = *this;
+    Tensor out = Tensor::zeros(x.shape(), false);
+    cpu::sigmoid_fwd(x.data_ptr(), out.data_ptr(), x.numel());
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "sigmoid";
+        node->inputs = {x};
+        node->backward_fn = [out](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(out.shape(), false);
+            cpu::sigmoid_bwd(out.data_ptr(), grad_output.data_ptr(), grad_x.data_ptr(), out.numel());
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
+Tensor Tensor::gelu() const {
+    const Tensor& x = *this;
+    Tensor out = Tensor::zeros(x.shape(), false);
+    cpu::gelu_fwd(x.data_ptr(), out.data_ptr(), x.numel());
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "gelu";
+        node->inputs = {x};
+        node->backward_fn = [x](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(x.shape(), false);
+            cpu::gelu_bwd(x.data_ptr(), grad_output.data_ptr(), grad_x.data_ptr(), x.numel());
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
+Tensor Tensor::leaky_relu(float negative_slope) const {
+    const Tensor& x = *this;
+    Tensor out = Tensor::zeros(x.shape(), false);
+    cpu::leaky_relu_fwd(x.data_ptr(), out.data_ptr(), x.numel(), negative_slope);
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "leaky_relu";
+        node->inputs = {x};
+        node->backward_fn = [x, negative_slope](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(x.shape(), false);
+            cpu::leaky_relu_bwd(x.data_ptr(), grad_output.data_ptr(), grad_x.data_ptr(), x.numel(), negative_slope);
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
+Tensor Tensor::sum(int64_t dim, bool keepdim) const {
+    const Tensor& x = *this;
+    int64_t nd = x.ndim();
+    if (dim < 0 || dim >= nd)
+        throw std::runtime_error("sum(dim): dim out of range");
+
+    auto reduced_shape = x.shape();
+    reduced_shape[dim] = 1;
+
+    Tensor out = Tensor::zeros(reduced_shape, false);
+    cpu::reduce_to_shape(x.data_ptr(), x.shape().data(), nd, reduced_shape.data(), nd, out.data_ptr());
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "sum_dim";
+        node->inputs = {x};
+        auto x_shape = x.shape();
+        node->backward_fn = [x_shape, reduced_shape, nd](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(x_shape, false);
+            cpu::broadcast_to_shape(grad_output.data_ptr(), reduced_shape.data(), nd,
+                                     x_shape.data(), nd, grad_x.data_ptr());
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+
+    if (keepdim) return out;
+    auto squeezed = x.shape();
+    squeezed.erase(squeezed.begin() + dim);
+    return out.reshape(squeezed);
+}
+
+Tensor Tensor::mean(int64_t dim, bool keepdim) const {
+    const Tensor& x = *this;
+    int64_t nd = x.ndim();
+    if (dim < 0 || dim >= nd)
+        throw std::runtime_error("mean(dim): dim out of range");
+    int64_t dim_size = x.shape()[dim];
+
+    // Composed from sum(dim) [above] + an existing broadcast-mul by a
+    // shape-[1] scalar -- no dedicated kernel or backward of its own;
+    // both already-autograd-aware ops carry the gradient correctly.
+    Tensor summed = x.sum(dim, true);
+    Tensor scale = Tensor::from_flat(std::vector<float>{1.0f / static_cast<float>(dim_size)},
+                                      std::vector<int64_t>{1}, false);
+    Tensor result = summed.mul(scale);
+
+    if (keepdim) return result;
+    auto squeezed = x.shape();
+    squeezed.erase(squeezed.begin() + dim);
+    return result.reshape(squeezed);
+}
+
+Tensor Tensor::max(int64_t dim, bool keepdim) const {
+    const Tensor& x = *this;
+    int64_t nd = x.ndim();
+    if (dim < 0 || dim >= nd)
+        throw std::runtime_error("max(dim): dim out of range");
+
+    auto reduced_shape = x.shape();
+    reduced_shape[dim] = 1;
+    Tensor out = Tensor::zeros(reduced_shape, false);
+    cpu::max_along_dim(x.data_ptr(), x.shape().data(), nd, dim, out.data_ptr());
+    // Deliberately no GradNode attached here, regardless of
+    // x.requires_grad() -- see this method's own declaration in
+    // Tensor.hpp for why a gradient through max(dim) isn't needed (or
+    // provided).
+
+    if (keepdim) return out;
+    auto squeezed = x.shape();
+    squeezed.erase(squeezed.begin() + dim);
+    return out.reshape(squeezed);
+}
+
+Tensor Tensor::softmax(int64_t dim) const {
+    const Tensor& x = *this;
+    Tensor m = x.max(dim, true);
+    Tensor shifted = x.sub(m);
+    Tensor exp_shifted = shifted.exp();
+    Tensor denom = exp_shifted.sum(dim, true);
+    return exp_shifted.div(denom);
+}
+
+Tensor Tensor::cross_entropy(const Tensor& targets) const {
+    const Tensor& logits = *this;
+    if (logits.ndim() != 2 || logits.shape() != targets.shape())
+        throw std::runtime_error("cross_entropy: logits and targets must both be (batch, classes) and the same shape");
+
+    // logsumexp(logits, dim=1) - sum(logits * targets, dim=1), never
+    // softmax(logits).log() -- see this method's own declaration in
+    // Tensor.hpp for why the log-sum-exp form is the numerically stable
+    // one and the naive composition isn't.
+    Tensor m = logits.max(1, true);
+    Tensor shifted = logits.sub(m);
+    Tensor lse = shifted.exp().sum(1, true).log().add(m);
+    Tensor picked = logits.mul(targets).sum(1, true);
+    Tensor per_example = lse.sub(picked);
+    return per_example.mean();
+}
+
 Tensor Tensor::reshape(std::vector<int64_t> new_shape) const {
     const Tensor& x = *this;
     int64_t n = numel_of(new_shape);

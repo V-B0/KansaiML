@@ -40,6 +40,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | 3 — GPU backend | Real Metal compute (tiled kernel + MPS, full op + Conv2d coverage) | ✅ done |
 | 4 — Distributed | `DeviceMesh`/`DTensor`, distributed gradients, concurrent dispatch, int8 quantization, serialization | ✅ done |
 | — Core ops | `reshape`/`transpose`/`slice`/`cat`, general broadcasting, `sqrt`/`reciprocal`/`div`, `Adam` | ✅ done |
+| — Activations/losses | `tanh`/`sigmoid`/`gelu`/`leaky_relu`, `sum`/`mean`/`max(dim)`, `softmax`, `cross_entropy` | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -101,7 +102,14 @@ shape entirely), caught by the test suite failing on first run; `Adam`
 dedicated kernel) matches a from-scratch independent Python
 re-implementation to float32 precision across five steps of a known
 gradient sequence, and trains the same XOR model `test_xor.py` trains
-with SGD to the same near-zero loss.
+with SGD to the same near-zero loss; `softmax` stays finite and still
+sums to 1 on logits as large as `[1000, 1001, 1002]` (a naive `exp()`
+on those would overflow float32 outright), `cross_entropy` matches an
+independent from-scratch log-sum-exp implementation (not Kansai's own
+`softmax().log()` composed a second time), and a 3-class classifier
+trained end to end with `Linear → ReLU → Linear → cross_entropy` +
+`Adam` reaches 100% accuracy — the first classification task (XOR is
+regression-shaped) this project has ever trained.
 
 ## Why
 
@@ -198,8 +206,8 @@ Python (Tensor, nn.Module, optim)
 - `python/kansai/serialize.py` — `save`/`load` a `Module`'s parameters
   to/from disk, a pickle-free length-prefixed-JSON-header + flat-blob
   format
-- `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`,
-  `Sequential`, `SGD`, `Adam`
+- `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`, `Tanh`,
+  `Sigmoid`, `GELU`, `LeakyReLU`, `Softmax`, `Sequential`, `SGD`, `Adam`
 - `tests/` — every claim above, checked: numerical gradient checks,
   cross-checks between independent implementations, and benchmarks that
   assert real speedups rather than just printing numbers
