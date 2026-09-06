@@ -617,9 +617,19 @@ Tensor Tensor::sqrt() const {
         auto node = std::make_shared<GradNode>();
         node->name = "sqrt";
         node->inputs = {x};
-        node->backward_fn = [out](const Tensor& grad_output) -> std::vector<Tensor> {
-            Tensor grad_x = Tensor::zeros(out.shape(), false);
-            cpu::sqrt_bwd(out.data_ptr(), grad_output.data_ptr(), grad_x.data_ptr(), out.numel());
+        // Captures a plain std::vector snapshot of out's VALUES, not
+        // `out` itself -- see this file's own note by Tensor::exp's
+        // fix for why: capturing `out` here would make this closure
+        // (owned by out's own GradNode, which out.impl_ owns) hold a
+        // reference back to out.impl_, a genuine shared_ptr cycle
+        // nothing ever breaks. Semantically identical (out's values
+        // never change after construction) at the cost of one extra
+        // copy, the same trade sqrt_bwd's siblings below all make now.
+        auto out_shape = out.shape();
+        auto out_vals = out.to_vector();
+        node->backward_fn = [out_shape, out_vals](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(out_shape, false);
+            cpu::sqrt_bwd(out_vals.data(), grad_output.data_ptr(), grad_x.data_ptr(), grad_x.numel());
             return {grad_x};
         };
         out.set_grad_node(node);
@@ -637,9 +647,16 @@ Tensor Tensor::reciprocal() const {
         auto node = std::make_shared<GradNode>();
         node->name = "reciprocal";
         node->inputs = {x};
-        node->backward_fn = [out](const Tensor& grad_output) -> std::vector<Tensor> {
-            Tensor grad_x = Tensor::zeros(out.shape(), false);
-            cpu::reciprocal_bwd(out.data_ptr(), grad_output.data_ptr(), grad_x.data_ptr(), out.numel());
+        // See sqrt()'s own fix above for why this is out.to_vector(),
+        // not out itself: capturing `out` (which out's OWN GradNode
+        // ends up owned by) creates a shared_ptr cycle refcounting
+        // never breaks -- a real, permanent per-call leak this
+        // project's own memory-scaling investigation caught.
+        auto out_shape = out.shape();
+        auto out_vals = out.to_vector();
+        node->backward_fn = [out_shape, out_vals](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(out_shape, false);
+            cpu::reciprocal_bwd(out_vals.data(), grad_output.data_ptr(), grad_x.data_ptr(), grad_x.numel());
             return {grad_x};
         };
         out.set_grad_node(node);
@@ -661,12 +678,27 @@ Tensor Tensor::exp() const {
         auto node = std::make_shared<GradNode>();
         node->name = "exp";
         node->inputs = {x};
-        node->backward_fn = [out](const Tensor& grad_output) -> std::vector<Tensor> {
-            // d/dx exp(x) = exp(x) = out -- exp's own vjp is exactly a
-            // multiply by its own forward output, no dedicated bwd
-            // kernel needed.
-            Tensor grad_x = Tensor::zeros(out.shape(), false);
-            cpu::mul(grad_output.data_ptr(), out.data_ptr(), grad_x.data_ptr(), out.numel());
+        // d/dx exp(x) = exp(x) = out -- exp's own vjp is exactly a
+        // multiply by its own forward output, no dedicated bwd kernel
+        // needed. Captures out.to_vector() (a plain data copy), NOT
+        // `out` itself: `out`'s own GradNode -- this very closure --
+        // is owned by out.impl_, so capturing `out` here would put a
+        // second reference to out.impl_ INSIDE the closure that
+        // out.impl_ itself owns: a genuine shared_ptr cycle (TensorData
+        // -> GradNode -> captured Tensor -> the same TensorData)
+        // nothing in this project ever breaks -- every differentiable
+        // exp() call leaked its entire output permanently until this
+        // fix (found via this project's own memory-scaling
+        // investigation: softmax, used in every attention layer,
+        // composes exp() internally, and Adam/AdamW's sqrt() call --
+        // same bug, fixed alongside this one -- meant every training
+        // step using either optimizer had been leaking this whole
+        // project).
+        auto out_shape = out.shape();
+        auto out_vals = out.to_vector();
+        node->backward_fn = [out_shape, out_vals](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(out_shape, false);
+            cpu::mul(grad_output.data_ptr(), out_vals.data(), grad_x.data_ptr(), grad_x.numel());
             return {grad_x};
         };
         out.set_grad_node(node);
@@ -708,9 +740,13 @@ Tensor Tensor::tanh() const {
         auto node = std::make_shared<GradNode>();
         node->name = "tanh";
         node->inputs = {x};
-        node->backward_fn = [out](const Tensor& grad_output) -> std::vector<Tensor> {
-            Tensor grad_x = Tensor::zeros(out.shape(), false);
-            cpu::tanh_bwd(out.data_ptr(), grad_output.data_ptr(), grad_x.data_ptr(), out.numel());
+        // See exp()'s own fix above for the shared_ptr cycle this
+        // avoids by capturing out.to_vector() rather than out itself.
+        auto out_shape = out.shape();
+        auto out_vals = out.to_vector();
+        node->backward_fn = [out_shape, out_vals](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(out_shape, false);
+            cpu::tanh_bwd(out_vals.data(), grad_output.data_ptr(), grad_x.data_ptr(), grad_x.numel());
             return {grad_x};
         };
         out.set_grad_node(node);
@@ -728,9 +764,13 @@ Tensor Tensor::sigmoid() const {
         auto node = std::make_shared<GradNode>();
         node->name = "sigmoid";
         node->inputs = {x};
-        node->backward_fn = [out](const Tensor& grad_output) -> std::vector<Tensor> {
-            Tensor grad_x = Tensor::zeros(out.shape(), false);
-            cpu::sigmoid_bwd(out.data_ptr(), grad_output.data_ptr(), grad_x.data_ptr(), out.numel());
+        // See exp()'s own fix above for the shared_ptr cycle this
+        // avoids by capturing out.to_vector() rather than out itself.
+        auto out_shape = out.shape();
+        auto out_vals = out.to_vector();
+        node->backward_fn = [out_shape, out_vals](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(out_shape, false);
+            cpu::sigmoid_bwd(out_vals.data(), grad_output.data_ptr(), grad_x.data_ptr(), grad_x.numel());
             return {grad_x};
         };
         out.set_grad_node(node);

@@ -56,6 +56,8 @@ benchmark, every bug, every dead end, in the order it happened.
 | — `Dataset`/`DataLoader` | Map-style, per-epoch reshuffle, replaces every hand-rolled batching loop | ✅ done |
 | — `kir.grad` batched matmul | Closed the 2D-only gap — `MultiHeadAttention` now differentiable via `kir.grad`, not just eager | ✅ done |
 | — `TransformerBlock` | Pre-LN attention + FFN, both residuals proven structurally, causal masking verified | ✅ done |
+| — Memory leak fix | Permanent `shared_ptr` cycle in exp/sqrt/reciprocal/tanh/sigmoid, found training a real transformer | ✅ fixed |
+| — tinyshakespeare capstone | Real transformer on real text, 2,000 steps, perplexity 10.5→8.28 | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -224,6 +226,39 @@ stacking two blocks into a tiny causal model trained to predict the
 first token's identity at every later position — a task no per-position
 network can solve without attention — reaches 100% accuracy.
 
+None of the tests above run long enough to catch what training a real
+transformer on real text for real did: a genuine, permanent C++-side
+memory leak. `exp()`/`sqrt()`/`reciprocal()`/`tanh()`/`sigmoid()` each
+captured their own OUTPUT tensor inside their own backward closure — a
+textbook `shared_ptr` cycle (`TensorData → GradNode → captured Tensor
+→ same TensorData`) invisible to Python's garbage collector, since
+it's a pure C++ cycle, not a Python one. `softmax` composes `exp()`
+internally and `Adam`/`AdamW` call `sqrt()` every step, so this had
+been silently leaking during every training loop in this project's
+history — just too slowly, in runs too short, for anything to notice
+until a multi-thousand-step run actually got killed by it. Fixed by
+capturing a disconnected value snapshot instead of the tensor itself;
+verified with a dedicated regression test (4,000 iterations per op,
+`ru_maxrss` growth asserted bounded) and, practically, the training
+run below — which reliably crashed before this fix — now runs 2,000
+steps to completion without incident. See
+[`DEVLOG.md`](DEVLOG.md#a-real-permanent-memory-leak-found-by-actually-training-something)
+for the full bisection.
+
+**[`examples/tinyshakespeare/`](examples/tinyshakespeare/)** is the
+real capstone: a small decoder-only, character-level transformer
+(277,601 parameters — `Embedding` + learned positions → 3
+`TransformerBlock`s → `LayerNorm` → `Linear`) trained with `AdamW` +
+`clip_grad_norm_` + `CosineAnnealingLR` on the actual ~1.1MB "tiny
+Shakespeare" corpus, not MNIST, not a synthetic task. One real
+run: 2,000 steps in 562s on Apple Silicon CPU, training loss 3.12 →
+2.01, held-out validation perplexity 10.5 → 8.28 (random-uniform
+baseline: 65). Sampled generations are legibly English-adjacent — real
+word shapes, plausible capitalization, character names in roughly the
+right places — without being coherent, exactly what a 277K-parameter
+character model trained for a couple thousand steps should honestly
+produce.
+
 ## Why
 
 - **Compilation isn't optional.** Kansai is always building a graph
@@ -346,6 +381,9 @@ Python (Tensor, nn.Module, optim)
 - `examples/mnist/` — the real end-to-end MNIST benchmark above,
   kept separate from `tests/` (needs network access, takes tens of
   seconds) rather than part of the fast/deterministic suite
+- `examples/tinyshakespeare/` — the transformer capstone above, same
+  reason kept separate from `tests/` (network access, minutes not
+  seconds)
 
 ## Documentation
 

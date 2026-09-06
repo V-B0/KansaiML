@@ -5,3 +5,4 @@ __pycache__/
 *.dylib
 .DS_Store
 examples/mnist/data/
+examples/tinyshakespeare/data/

@@ -2237,6 +2237,106 @@ task a per-position-only network provably cannot solve (position 0's
 identity isn't locally visible anywhere else without looking back
 through attention) -- reaching 100% per-position accuracy.
 
+## A real, permanent memory leak (found by actually training something)
+
+Every previous benchmark in this project (MNIST, XOR, the marker-token
+classifier) trains for at most a few hundred steps. Training the tiny
+Shakespeare transformer below for real -- thousands of steps, not
+hundreds -- surfaced something none of those ever ran long enough to
+catch: a genuine, permanent, unbounded memory leak. The first full run
+got SIGKILLed partway through; `ps`/`ru_maxrss` sampling during a
+shorter reproduction showed resident memory climbing tens of MB per
+training step with no ceiling, eventually exceeding the machine's
+available memory.
+
+Bisected by isolating pieces of the model one at a time (`Embedding`
+alone, `LayerNorm` alone, the FFN alone -- all flat; `MultiHeadAttention`
+alone -- leaked) and then isolating THAT down to its individual
+composed ops (batched matmul, transpose, softmax -- only `softmax`
+leaked) and finally softmax's own composition (`max` -> `sub` -> `exp`
+-> `sum(dim)` -> `div` -- only `exp` leaked), confirmed with `gc`
+disabled entirely to rule out Python-level cyclic-garbage deferral as
+the explanation (the growth was identical either way, and identical
+whether `gc.collect()` was called every step or never -- the tell that
+this wasn't reclaimable Python garbage at all).
+
+The actual bug, once isolated to `exp()`: `Tensor::exp` (and, the same
+copy-pasted pattern, `sqrt`/`reciprocal`/`tanh`/`sigmoid`) attached a
+`GradNode` whose `backward_fn` closure captured `out` -- the SAME
+`Tensor` that `GradNode` was about to be attached to via
+`out.set_grad_node(node)` immediately after. That closure capturing
+`out` by value creates a genuine `std::shared_ptr` CYCLE: `out.impl_`
+(the `TensorData`) owns the `GradNode`; the `GradNode`'s own
+`backward_fn` closure owns a copy of `out`, which owns the SAME
+`TensorData` again. `shared_ptr` reference counting cannot break a
+cycle -- nothing in this project ever did -- and, critically, this is
+a pure C++-side cycle, invisible to Python's own cyclic garbage
+collector too (it only walks `PyObject` reference graphs, never the
+`shared_ptr` graph opaque to it inside a native extension), which is
+exactly why `gc.collect()` never helped: there was nothing for it to
+collect. Every differentiable call to any of these five ops leaked its
+entire output, permanently, for the life of the process. `softmax`
+composes `exp()` internally (used in every attention layer's own
+softmax), and `Adam`/`AdamW` call `sqrt()` on every single optimizer
+step -- meaning this had been leaking during literally every training
+loop in this project's history, the whole time, just too slowly and
+in runs too short for any existing test to notice.
+
+The fix: each of the five now captures `out.to_vector()` -- a plain,
+already-existing helper that copies the output's values into an
+ordinary `std::vector<float>` with no link back to any `TensorData` or
+`GradNode` at all -- instead of capturing `out` itself. Semantically
+identical (none of these outputs are ever mutated after construction,
+so a snapshot taken at construction time is exactly as valid as
+reading `out.data_ptr()` later) at the cost of one small copy per
+differentiable call, an unambiguously correct trade against a leak
+that was, left unfixed, going to make training anything beyond a toy
+size impossible on this framework.
+
+Verified: the full existing test suite (unrelated to this bug at all,
+since eager forward/backward VALUES were never wrong -- only the
+graph's own memory was ever leaked) still passes exactly; a new
+dedicated regression test (`tests/test_memory_leak.py`) drives each of
+the five ops, plus `softmax`, for 4,000 iterations each and asserts
+`ru_maxrss` growth stays under a generous 40MB threshold -- at the
+bug's own measured rate, that many iterations would have added
+hundreds of MB, not tens; and, practically, the actual tiny-Shakespeare
+training run below, which reliably got SIGKILLed before this fix, now
+runs 2,000 steps to completion without incident.
+
+## tinyshakespeare: the real end-to-end capstone
+
+`examples/tinyshakespeare/` is the actual claim every piece landed this
+session -- `Embedding`, comparison ops/`where`, `AdamW`,
+`clip_grad_norm_`, `CosineAnnealingLR`, `Dataset`/`DataLoader`, the
+`kir.grad` batched-matmul fix, `TransformerBlock`, and now the memory
+leak fix above -- has to back up TOGETHER, on real text, not MNIST,
+not a synthetic marker-token task. `download_shakespeare.py` fetches
+and caches the actual ~1.1MB "tiny Shakespeare" corpus;
+`train_shakespeare.py` trains a small decoder-only, character-level
+transformer (`Embedding` for tokens + a second `Embedding` for learned
+positions, summed -> N `TransformerBlock`s under one shared causal
+mask -> `LayerNorm` -> `Linear` back to vocabulary logits) via
+`AdamW` + `clip_grad_norm_` + `CosineAnnealingLR`, on real
+`Dataset`/`DataLoader`-batched training windows.
+
+Deliberately small (277,601 parameters: 3 layers, `d_model=96`, 4
+heads, `d_ff=256`, `block_size=48`) -- the point is finding out where a
+from-scratch framework genuinely breaks at a real, if modest, scale,
+honestly, not producing a publishable language model. It found exactly
+one real break (the memory leak above), fixed it, and otherwise
+trained cleanly: 2,000 steps in 562s (0.281s/step) on Apple Silicon
+CPU, training loss falling from 3.12 to 2.01, held-out validation loss
+(on the corpus's own final ~50K held-out characters, never seen in a
+training window) falling from 2.35 to 2.10 (perplexity 10.5 -> 8.28)
+against a random-uniform baseline of `ln(65) = 4.17`. Sampled
+generations at this size are legibly English-adjacent -- real word
+shapes, plausible capitalization and line breaks, character names in
+roughly the right places -- without being coherent, exactly what a
+277K-parameter character-level model trained for a couple thousand
+steps should honestly produce, reported as observed rather than
+cherry-picked or smoothed over.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`
