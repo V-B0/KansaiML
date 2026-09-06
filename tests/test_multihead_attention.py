@@ -11,13 +11,18 @@ from-scratch single-head (num_heads=1) attention implementation in
 plain Python (not Kansai's own ops called a different way, which could
 share a bug with the implementation under test); backward against
 central differences, including that every projection weight
-(w_q/w_k/w_v/w_o) receives a gradient; an additive causal mask
-confirmed to zero out attention to every future position while each
-row's weights still sum to 1 (not just "the loss looks reasonable");
-and a practical end-to-end check -- a small attention-based sequence
-classifier (MultiHeadAttention -> mean-pool -> Linear -> cross_entropy)
-trained to convergence on a synthetic "find the class marker among
-distractors, at a random position" task.
+(w_q/w_k/w_v/w_o) receives a gradient; kir.grad through a full traced
+forward pass -- previously a documented gap (kir.grad's matmul vjp was
+2D-only, and every matmul in this class is genuinely batched), closed
+once batched_matmul_nt/_tn landed (see test_batched_matmul.py) --
+matching the exact same eager gradient just verified above, including
+through run_metal; an additive causal mask confirmed to zero out
+attention to every future position while each row's weights still sum
+to 1 (not just "the loss looks reasonable"); and a practical end-to-end
+check -- a small attention-based sequence classifier (MultiHeadAttention
+-> mean-pool -> Linear -> cross_entropy) trained to convergence on a
+synthetic "find the class marker among distractors, at a random
+position" task.
 """
 
 import math
@@ -28,7 +33,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
 import kansai
-from kansai import nn, optim
+from kansai import kir, nn, optim
 from kansai import _core as core
 
 TOL = 1e-4
@@ -134,6 +139,34 @@ check_close("MultiHeadAttention backward (input) vs central diff", xg.grad.tolis
 for name in ("w_q", "w_k", "w_v", "w_o"):
     assert getattr(mha2, name).grad is not None, f"{name} should receive a gradient"
 print("MultiHeadAttention projection weight gradients (w_q/w_k/w_v/w_o) all populated: OK")
+
+# ---------------------------------------------------------------------
+# 3b. kir.grad through a full MultiHeadAttention forward -- previously
+#     a documented gap (kir.grad's matmul vjp was 2D-only, and every
+#     matmul in this class is genuinely batched over (batch, heads)),
+#     closed once batched_matmul_nt/_tn landed (see
+#     test_batched_matmul.py). Traces mha2's own forward, differentiates
+#     the traced graph via kir.grad, and checks it against the exact
+#     same eager gradient (xg.grad) just verified above against central
+#     differences -- not a fresh central-diff check of its own, since
+#     the point here is specifically that the TRACED path agrees with
+#     the already-verified eager one, through every batched matmul,
+#     transpose, reshape, and softmax composed inside this class.
+# ---------------------------------------------------------------------
+
+x_trace = core.from_flat(xvals, [1, 3, 4])
+graph = kir.trace(lambda t: mha2(t, t, t).sum(), x_trace)
+eager_val = mha2(x_trace, x_trace, x_trace).sum().tolist()
+check_close("MultiHeadAttention kir.run() matches eager forward", kir.run(graph, x_trace).tolist(), eager_val)
+
+bwd = kir.grad(graph, graph.inputs)
+grad_x_kir = kir.run(bwd, x_trace)
+check_close("MultiHeadAttention kir.grad() matches eager backward exactly",
+            grad_x_kir.tolist(), xg.grad.tolist(), tol=1e-4)
+if core.metal_available():
+    grad_x_metal = kir.run_metal(kir.elementwise_fusion(bwd), x_trace)
+    check_close("MultiHeadAttention kir.grad() via run_metal matches eager backward",
+                grad_x_metal.tolist(), xg.grad.tolist(), tol=1e-4)
 
 # ---------------------------------------------------------------------
 # 4. Additive causal mask: zeros attention to every future position,

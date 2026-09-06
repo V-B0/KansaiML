@@ -302,12 +302,17 @@ class MultiHeadAttention(Module):
     masking possible AT ALL right now, not a stylistic preference over
     an equally-easy alternative.
 
-    Eager-only in practice, not by an enforced restriction: nothing
-    here calls anything that would refuse to trace, but `kir.grad`'s
-    matmul vjp rule is 2D-only (previous section's own stated gap), so
-    a graph built from this and differentiated via `kir.grad` would hit
-    that same limitation. Eager `.backward()` is unaffected and is what
-    every test/training loop below actually verifies.
+    Fully traceable AND differentiable via `kir.grad` now (not just
+    eager `.backward()`): `kir.grad`'s matmul vjp rule used to be
+    2D-only, which would have hit every batched matmul in this class
+    (Q/K/V are 4D throughout), but that gap has since closed -- see
+    kir.py's own `_vjp_matmul`, which now picks between the original
+    2D-only path and a batched `batched_matmul_nt`/`_tn` +
+    `reduce_to_shape` path using the same 2D-shape check
+    `TraceValue.matmul`'s own forward pass uses. Verified directly:
+    tracing a full `MultiHeadAttention.forward` call and differentiating
+    it through `kir.grad` produces the identical gradient eager
+    `.backward()` does.
     """
 
     def __init__(self, d_model: int, num_heads: int, seed: int = 0):

@@ -54,6 +54,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — Packaging/CI | `pip install`-able (`scikit-build-core`), GitHub Actions on Apple Silicon | ✅ done |
 | — Training utilities | `clip_grad_norm_`, `StepLR`, `CosineAnnealingLR` | ✅ done |
 | — `Dataset`/`DataLoader` | Map-style, per-epoch reshuffle, replaces every hand-rolled batching loop | ✅ done |
+| — `kir.grad` batched matmul | Closed the 2D-only gap — `MultiHeadAttention` now differentiable via `kir.grad`, not just eager | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -201,6 +202,16 @@ shuffled, and reshuffle rather than repeat across successive epochs;
 practically, retraining `test_embedding.py`'s own marker-token
 classifier through a real `Dataset`/`DataLoader` instead of its
 original hand-rolled batching reaches the identical 100% test accuracy.
+`kir.grad`'s own matmul vjp was 2D-only — a real, previously documented
+gap that blocked differentiating a *traced* `MultiHeadAttention` forward
+(every matmul inside it is genuinely batched), even though eager
+`.backward()` was always fine. Closed with two new `batched_matmul_nt`/
+`_tn` ops mirroring `Tensor::matmul`'s own eager batched backward, with
+zero change to the original 2D-only path (checked directly as a
+regression) — and, the actual payoff: tracing a full
+`MultiHeadAttention.forward` and differentiating it via `kir.grad` now
+matches eager `.backward()` to exact zero difference, including through
+`run_metal`.
 
 ## Why
 

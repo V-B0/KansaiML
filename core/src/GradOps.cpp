@@ -45,6 +45,50 @@ Tensor matmul_tn(const Tensor& a, const Tensor& b) {
     return out;
 }
 
+Tensor batched_matmul_nt(const Tensor& a, const Tensor& b) {
+    if (a.ndim() < 2 || b.ndim() < 2)
+        throw std::runtime_error("batched_matmul_nt: both operands must be at least 2D");
+    int64_t rows = a.shape()[a.ndim() - 2], reduce_a = a.shape()[a.ndim() - 1];
+    int64_t cols = b.shape()[b.ndim() - 2], reduce_b = b.shape()[b.ndim() - 1];
+    if (reduce_a != reduce_b)
+        throw std::runtime_error("batched_matmul_nt: inner dimensions don't match");
+
+    std::vector<int64_t> a_batch(a.shape().begin(), a.shape().end() - 2);
+    std::vector<int64_t> b_batch(b.shape().begin(), b.shape().end() - 2);
+    std::vector<int64_t> out_batch = broadcast_shapes(a_batch, b_batch, "batched_matmul_nt");
+
+    std::vector<int64_t> out_shape = out_batch;
+    out_shape.push_back(rows);
+    out_shape.push_back(cols);
+    Tensor out = Tensor::zeros(out_shape, false);
+    cpu::batched_matmul_nt(a.data_ptr(), a_batch.data(), static_cast<int64_t>(a_batch.size()), b.data_ptr(),
+                            b_batch.data(), static_cast<int64_t>(b_batch.size()), out_batch.data(),
+                            static_cast<int64_t>(out_batch.size()), rows, reduce_a, cols, out.data_ptr());
+    return out;
+}
+
+Tensor batched_matmul_tn(const Tensor& a, const Tensor& b) {
+    if (a.ndim() < 2 || b.ndim() < 2)
+        throw std::runtime_error("batched_matmul_tn: both operands must be at least 2D");
+    int64_t reduce_a = a.shape()[a.ndim() - 2], rows = a.shape()[a.ndim() - 1];
+    int64_t reduce_b = b.shape()[b.ndim() - 2], cols = b.shape()[b.ndim() - 1];
+    if (reduce_a != reduce_b)
+        throw std::runtime_error("batched_matmul_tn: inner dimensions don't match");
+
+    std::vector<int64_t> a_batch(a.shape().begin(), a.shape().end() - 2);
+    std::vector<int64_t> b_batch(b.shape().begin(), b.shape().end() - 2);
+    std::vector<int64_t> out_batch = broadcast_shapes(a_batch, b_batch, "batched_matmul_tn");
+
+    std::vector<int64_t> out_shape = out_batch;
+    out_shape.push_back(rows);
+    out_shape.push_back(cols);
+    Tensor out = Tensor::zeros(out_shape, false);
+    cpu::batched_matmul_tn(a.data_ptr(), a_batch.data(), static_cast<int64_t>(a_batch.size()), b.data_ptr(),
+                            b_batch.data(), static_cast<int64_t>(b_batch.size()), out_batch.data(),
+                            static_cast<int64_t>(out_batch.size()), reduce_a, rows, cols, out.data_ptr());
+    return out;
+}
+
 Tensor reduce_to_shape(const Tensor& grad, std::vector<int64_t> target_shape) {
     Tensor out = Tensor::zeros(target_shape, false);
     cpu::reduce_to_shape(grad.data_ptr(), grad.shape().data(), grad.ndim(),

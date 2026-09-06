@@ -35,6 +35,22 @@ Tensor broadcast_scalar(const Tensor& grad_output, std::vector<int64_t> shape, f
 Tensor matmul_nt(const Tensor& a, const Tensor& b);
 Tensor matmul_tn(const Tensor& a, const Tensor& b);
 
+// The batched counterparts of matmul_nt/matmul_tn above -- what
+// kir.grad's batched-matmul vjp needs, the same reason the plain 2D
+// ones exist: a graph-visible op computing what Tensor::matmul's own
+// eager batched backward (core/src/Tensor.cpp) already computes via
+// cpu::batched_matmul_nt/_tn directly. `a`/`b` here can have DIFFERENT
+// batch shapes (broadcast against each other internally via
+// broadcast_shapes, same NumPy-style rule the forward op uses) -- the
+// output lands at the FULL broadcast batch shape, mirroring how the
+// eager backward computes grad_a_full/grad_b_full before reducing
+// down to each operand's own (possibly smaller) shape via a separate
+// reduce_to_shape call; that reduction is NOT done here, so
+// _vjp_matmul (kir.py) still needs its own reduce_to_shape node after
+// this, exactly like general add/sub/mul broadcasting's own vjps do.
+Tensor batched_matmul_nt(const Tensor& a, const Tensor& b);
+Tensor batched_matmul_tn(const Tensor& a, const Tensor& b);
+
 // Sums `grad` down to `target_shape` -- the general broadcasting vjp
 // add/sub/mul's own eager backward_fn closures (core/src/Tensor.cpp)
 // already use directly via cpu::reduce_to_shape; this is that same

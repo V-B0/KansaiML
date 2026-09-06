@@ -13,16 +13,18 @@ static int64_t numel_of(const std::vector<int64_t>& shape) {
     return n;
 }
 
-// NumPy-style right-aligned broadcasting: pads the shorter shape with
-// implicit leading 1s, then each aligned pair of dims must either match
-// or one of them must be 1 -- the standard rule, used here (rather than
-// the fixed "(batch, features) + (features,)" bias case add() already
-// special-cased before this existed) for any OTHER shape mismatch
-// add/sub/mul now accept. Throws on an incompatible pair rather than
-// silently picking one side, the same "fail loud" stance every other
-// shape check in this file already takes.
-static std::vector<int64_t> broadcast_shapes(const std::vector<int64_t>& a, const std::vector<int64_t>& b,
-                                              const char* op_name) {
+// Declared in Tensor.hpp (shared with GradOps.cpp -- see that
+// declaration's own comment for why this moved out of being `static`
+// here). NumPy-style right-aligned broadcasting: pads the shorter
+// shape with implicit leading 1s, then each aligned pair of dims must
+// either match or one of them must be 1 -- the standard rule, used
+// here (rather than the fixed "(batch, features) + (features,)" bias
+// case add() already special-cased before this existed) for any OTHER
+// shape mismatch add/sub/mul now accept. Throws on an incompatible
+// pair rather than silently picking one side, the same "fail loud"
+// stance every other shape check in this file already takes.
+std::vector<int64_t> broadcast_shapes(const std::vector<int64_t>& a, const std::vector<int64_t>& b,
+                                       const char* op_name) {
     int64_t ra = static_cast<int64_t>(a.size()), rb = static_cast<int64_t>(b.size());
     int64_t out_rank = ra > rb ? ra : rb;
     std::vector<int64_t> out(static_cast<size_t>(out_rank));

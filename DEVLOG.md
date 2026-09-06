@@ -2118,6 +2118,73 @@ original hand-rolled batching, to the identical 100% test-accuracy
 bar -- a genuine drop-in replacement for a real `Embedding`-based
 model, not just correct in isolation.
 
+## Closing kir.grad's batched matmul gap
+
+A real, previously and repeatedly documented gap (`MultiHeadAttention`'s
+own docstring, `test_batched_matmul.py`'s own module docstring,
+`TraceValue.matmul`'s own comment): `kir.grad`'s `_vjp_matmul` was
+2D-only, emitting `matmul_nt`/`matmul_tn` nodes that themselves only
+ever handled 2D operands. Every matmul inside `MultiHeadAttention` is
+genuinely batched over `(batch, heads)`, so tracing an attention
+forward and differentiating it via `kir.grad` -- as opposed to eager
+`.backward()`, which was always fine -- hit that wall directly. Closed
+now, cleanly, with no change to the existing 2D case at all.
+
+Two new GradOps-exposed ops, `batched_matmul_nt`/`batched_matmul_tn`,
+sit alongside the existing 2D-only `matmul_nt`/`matmul_tn` rather than
+replacing them: thin wrappers around the SAME `cpu::batched_matmul_nt`/
+`_tn` kernels `Tensor::matmul`'s own eager batched backward already
+calls directly (`core/src/Tensor.cpp`) -- this is that exact
+computation, exposed as a first-class KIR-visible op the same reason
+the plain 2D `matmul_nt`/`matmul_tn` were originally exposed that way,
+just generalized to accept two operands with DIFFERENT batch shapes
+(broadcasting them together internally, the same NumPy-style rule the
+forward op itself uses) rather than assuming they already match.
+
+One small, deliberate refactor made this possible without duplicating
+logic: `broadcast_shapes` (the NumPy-style right-aligned broadcasting
+rule `add`/`sub`/`mul`/`matmul`'s own batch-dim broadcasting all share)
+was `static` inside `Tensor.cpp`, invisible outside that one
+translation unit. Moved to a plain free-function declaration in
+`Tensor.hpp` instead -- zero behavior change, just visibility -- so
+`GradOps.cpp`'s two new functions could call the IDENTICAL
+implementation rather than re-deriving the same rule a second time
+and risking the two drifting apart later.
+
+`kir.py`'s `_vjp_matmul` now picks between two paths using the exact
+same 2D-shape check `TraceValue.matmul`'s own forward pass already
+uses to pick its own two paths: rank-2-on-both-sides keeps the
+ORIGINAL, completely unchanged `matmul_nt`/`matmul_tn` vjp (a real
+regression guard, not just an assumption -- checked directly, see
+below); anything batched computes `grad_a`/`grad_b` at the full
+broadcast batch shape via the two new ops, then reduces each down to
+its own operand's actual shape via `reduce_to_shape` -- the identical
+"compute at the broadcast shape, then reduce" pattern `_vjp_add`/
+`_vjp_mul`'s own general-broadcasting vjps already established for
+elementwise ops, now extended to matmul's batch dims specifically.
+Both new ops needed zero interpreter-specific dispatch code in `run`/
+`run_fused`/`run_metal` -- attrs-free binary ops already fall through
+every interpreter's shared `_OP_TABLE`, the same reason `gt`/`lt`/`eq`
+needed none either.
+
+Verified directly against eager `.backward()`, not assumed correct
+from the construction alone: a matching-batch case (`(2,3,4)@(2,4,3)`),
+a broadcast case (a shared `(5,3)` weight matmul'd against a
+`(2,4,5)`-batched input -- the case that actually exercises
+`reduce_to_shape` on the smaller operand's gradient, not just the
+easy matching-rank path), both matching eager's own gradient to exact
+zero difference, including through `run_metal`; and a plain-2D
+regression confirming the ORIGINAL case still routes through the
+untouched `matmul_nt`/`matmul_tn` path, not accidentally rerouted
+through the new batched ops. Then, the actual payoff: tracing a full
+`MultiHeadAttention.forward` call (every batched matmul, transpose,
+reshape, and composed `softmax` inside it) and differentiating the
+traced graph via `kir.grad` now produces the IDENTICAL gradient eager
+`.backward()` does, to exact zero difference -- the concrete use case
+this whole gap was blocking, now genuinely closed rather than merely
+worked around. `Conv2d`'s own analogous `kir.grad` gap is a real,
+separate, unattempted piece of work -- not touched here.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

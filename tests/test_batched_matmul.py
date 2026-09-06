@@ -21,10 +21,13 @@ broadcasting's own backward already uses); the full KIR forward path
 (a real bug caught and fixed during this work: run_metal's own matmul
 dispatch called the 2D-only Metal kernel unconditionally, which would
 have crashed on anything batched -- fixed to fall back to the CPU eager
-path, the same way reshape/transpose/etc. already do); and the
-documented, pre-existing gap this doesn't close: kir.grad's own matmul
-vjp rule stays 2D-only (the same gap conv2d already has), confirmed to
-fail with a clear error rather than silently computing something wrong.
+path, the same way reshape/transpose/etc. already do); and -- since
+closed, a real, previously-documented gap -- kir.grad's own batched
+matmul backward (batched_matmul_nt/_tn + reduce_to_shape, GradOps.hpp/
+kir.py's _vjp_matmul), matching eager .backward() exactly for both the
+matching-batch and broadcast-shared-weight cases, including through
+run_metal, plus a regression check confirming the original plain-2D
+case still goes through the untouched matmul_nt/matmul_tn path.
 """
 
 import os
@@ -170,9 +173,11 @@ check_close("broadcast matmul backward (batched input) vs central diff", xg.grad
             central_diff_grad(lambda t: t.matmul(kansai.from_flat(wvals, [5, 3])).sum(), xvals, [2, 4, 5]), GRAD_TOL)
 
 # ---------------------------------------------------------------------
-# 5. Full KIR forward path (trace -> run/run_fused/run_metal), and the
-#    documented, pre-existing kir.grad gap (2D-only, same as conv2d)
-#    confirmed to fail cleanly rather than silently.
+# 5. Full KIR forward path (trace -> run/run_fused/run_metal), and
+#    kir.grad's own batched matmul backward -- matching-batch and the
+#    broadcast (shared-weight) case, both against eager .backward(),
+#    plus a plain-2D regression confirming the original matmul_nt/
+#    matmul_tn path is untouched.
 # ---------------------------------------------------------------------
 
 graph = kir.trace(lambda a, b: a.matmul(b).sum(), q, k)
@@ -183,12 +188,45 @@ if core.metal_available():
     check_close("batched matmul kir.run_metal()",
                 kir.run_metal(kir.elementwise_fusion(graph), q, k).tolist(), eager_out)
 
-try:
-    bwd = kir.grad(graph, graph.inputs)
-    kir.run(bwd, q, k)
-    raise AssertionError("expected kir.grad to fail on a batched matmul node (documented 2D-only gap)")
-except RuntimeError as e:
-    print(f"kir.grad correctly fails on batched matmul (documented 2D-only gap, same as conv2d): {e}")
+# 5a. Matching-batch case: kir.grad against the eager backward computed
+#     in section 4 above (ag/bg, shape [2,3,4]/[2,4,3]).
+graph_bwd_match = kir.trace(lambda a, b: a.matmul(b).sum(), core.from_flat(avals, [2, 3, 4]),
+                             core.from_flat(bvals, [2, 4, 3]))
+bwd_match = kir.grad(graph_bwd_match, graph_bwd_match.inputs)
+ga_kir, gb_kir = kir.run(bwd_match, core.from_flat(avals, [2, 3, 4]), core.from_flat(bvals, [2, 4, 3]))
+check_close("batched matmul kir.grad() (matching batch, operand a)", ga_kir.tolist(), ag.grad.tolist(), GRAD_TOL)
+check_close("batched matmul kir.grad() (matching batch, operand b)", gb_kir.tolist(), bg.grad.tolist(), GRAD_TOL)
+if core.metal_available():
+    ga_metal, gb_metal = kir.run_metal(kir.elementwise_fusion(bwd_match), core.from_flat(avals, [2, 3, 4]),
+                                        core.from_flat(bvals, [2, 4, 3]))
+    check_close("batched matmul kir.grad() via run_metal (operand a)", ga_metal.tolist(), ag.grad.tolist(), GRAD_TOL)
+    check_close("batched matmul kir.grad() via run_metal (operand b)", gb_metal.tolist(), bg.grad.tolist(), GRAD_TOL)
+
+# 5b. Broadcast (shared 2D weight across a 3D batch) case: kir.grad
+#     against the eager backward computed in section 4 above (wg/xg,
+#     shape [5,3]/[2,4,5]) -- the case that exercises reduce_to_shape
+#     on the SMALLER operand's gradient, not just the matching-batch
+#     path.
+graph_bwd_bcast = kir.trace(lambda x, w: x.matmul(w).sum(), core.from_flat(xvals, [2, 4, 5]),
+                             core.from_flat(wvals, [5, 3]))
+bwd_bcast = kir.grad(graph_bwd_bcast, graph_bwd_bcast.inputs)
+gx_kir, gw_kir = kir.run(bwd_bcast, core.from_flat(xvals, [2, 4, 5]), core.from_flat(wvals, [5, 3]))
+check_close("batched matmul kir.grad() (broadcast, batched operand x)", gx_kir.tolist(), xg.grad.tolist(), GRAD_TOL)
+check_close("batched matmul kir.grad() (broadcast, shared-weight operand w, reduced)",
+            gw_kir.tolist(), wg.grad.tolist(), GRAD_TOL)
+assert list(gw_kir.shape) == [5, 3], "grad w must be reduced back down to its own [5,3] shape, not left at [2,4,5,3]"
+
+# 5c. Plain 2D regression: kir.grad on an ordinary 2D matmul must still
+#     go through the original, unchanged matmul_nt/matmul_tn path (not
+#     accidentally rerouted through the new batched ops).
+a2g = kansai.from_flat(a2.tolist(), [4, 5], requires_grad=True)
+b2g = kansai.from_flat(b2.tolist(), [5, 3], requires_grad=True)
+a2g.matmul(b2g).sum().backward()
+graph_2d = kir.trace(lambda a, b: a.matmul(b).sum(), a2, b2)
+bwd_2d = kir.grad(graph_2d, graph_2d.inputs)
+ga2_kir, gb2_kir = kir.run(bwd_2d, a2, b2)
+check_close("plain 2D matmul kir.grad() regression (operand a)", ga2_kir.tolist(), a2g.grad.tolist(), GRAD_TOL)
+check_close("plain 2D matmul kir.grad() regression (operand b)", gb2_kir.tolist(), b2g.grad.tolist(), GRAD_TOL)
 
 # ---------------------------------------------------------------------
 # 6. Incompatible shapes are rejected, not silently misinterpreted.

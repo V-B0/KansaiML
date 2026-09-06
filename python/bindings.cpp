@@ -125,6 +125,10 @@ NB_MODULE(_core, m) {
           nb::call_guard<nb::gil_scoped_release>());
     m.def("matmul_nt", &matmul_nt, nb::arg("a"), nb::arg("b"), nb::call_guard<nb::gil_scoped_release>());
     m.def("matmul_tn", &matmul_tn, nb::arg("a"), nb::arg("b"), nb::call_guard<nb::gil_scoped_release>());
+    m.def("batched_matmul_nt", &batched_matmul_nt, nb::arg("a"), nb::arg("b"),
+          nb::call_guard<nb::gil_scoped_release>());
+    m.def("batched_matmul_tn", &batched_matmul_tn, nb::arg("a"), nb::arg("b"),
+          nb::call_guard<nb::gil_scoped_release>());
     m.def("reduce_to_shape", &reduce_to_shape, nb::arg("grad"), nb::arg("target_shape"),
           nb::call_guard<nb::gil_scoped_release>());
     m.def("broadcast_to_shape", &broadcast_to_shape, nb::arg("grad"), nb::arg("target_shape"),

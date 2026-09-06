@@ -169,15 +169,14 @@ class TraceValue:
     def matmul(self, other):
         # Mirrors Tensor::matmul's own two paths (core/src/Tensor.cpp):
         # forward shape computation is exactly what's needed here, so
-        # this stays in sync with it -- but see this project's own
-        # devlog for a real, stated gap this does NOT close:
-        # kir.grad's _vjp_matmul is still 2D-only (it emits "matmul_nt"/
-        # "matmul_tn" nodes, and core.matmul_nt/matmul_tn are themselves
-        # 2D-only), the same pre-existing gap conv2d already has with
-        # kir.grad. Forward tracing/run()/run_metal() all get batched
-        # matmul for real (they just call Tensor::matmul, which now
-        # handles it); kir.grad through a batched matmul node does not,
-        # yet.
+        # this stays in sync with it. kir.grad's own _vjp_matmul
+        # (below) picks between the 2D-only matmul_nt/matmul_tn path
+        # and a batched_matmul_nt/_tn + reduce_to_shape path using the
+        # identical 2D-shape check this method uses, so both paths of
+        # this forward op get a real, working backward through
+        # kir.grad now -- not just eager .backward() (conv2d still has
+        # the analogous gap; a real, separate, unattempted piece of
+        # work, not fixed here).
         other = self._coerce(other)
         if len(self.shape) == 2 and len(other.shape) == 2:
             if self.shape[1] != other.shape[0]:
@@ -439,6 +438,8 @@ _OP_TABLE = {
     # only, same as everything else this table dispatches.
     "matmul_nt": lambda a, b: core.matmul_nt(a, b),
     "matmul_tn": lambda a, b: core.matmul_tn(a, b),
+    "batched_matmul_nt": lambda a, b: core.batched_matmul_nt(a, b),
+    "batched_matmul_tn": lambda a, b: core.batched_matmul_tn(a, b),
     "relu_backward": lambda x, g: core.relu_backward(x, g),
     "sum_axis0": lambda g: core.sum_axis0(g),
     "gelu_backward": lambda x, g: core.gelu_backward(x, g),
@@ -1110,8 +1111,36 @@ def _vjp_mul(bwd, node, primal_id, g_out, by_id):
 
 def _vjp_matmul(bwd, node, primal_id, g_out, by_id):
     a_id, b_id = node.inputs
-    grad_a = bwd.add("matmul_nt", [g_out, primal_id[b_id]], by_id[a_id].shape, node.dtype)
-    grad_b = bwd.add("matmul_tn", [primal_id[a_id], g_out], by_id[b_id].shape, node.dtype)
+    a_shape, b_shape = list(by_id[a_id].shape), list(by_id[b_id].shape)
+
+    if len(a_shape) == 2 and len(b_shape) == 2:
+        # The original 2D-only path, completely unchanged: no batch
+        # dims to broadcast or reduce, so matmul_nt/matmul_tn alone
+        # are exactly the right vjp, the same as before batched matmul
+        # (forward OR backward) existed at all.
+        grad_a = bwd.add("matmul_nt", [g_out, primal_id[b_id]], a_shape, node.dtype)
+        grad_b = bwd.add("matmul_tn", [primal_id[a_id], g_out], b_shape, node.dtype)
+        return [grad_a, grad_b]
+
+    # Batched path (at least one operand rank > 2): compute grad_a/
+    # grad_b at the FULL broadcast batch shape first via
+    # batched_matmul_nt/_tn (a graph-visible twin of what
+    # Tensor::matmul's own eager batched backward already computes,
+    # core/src/Tensor.cpp), then reduce each down to its own operand's
+    # actual -- possibly smaller -- shape. The identical "compute at
+    # the broadcast shape, then reduce_to_shape" pattern _vjp_add/
+    # _vjp_mul's own general-broadcasting vjps already established
+    # above, just with batched_matmul_nt/_tn standing in for mul as
+    # the "compute at full shape" step, and using the same
+    # _broadcast_shape helper TraceValue.matmul's own forward pass
+    # (above) uses for its batch dims.
+    out_batch = _broadcast_shape(a_shape[:-2], b_shape[:-2], "matmul")
+    full_a_shape = out_batch + [a_shape[-2], a_shape[-1]]
+    full_b_shape = out_batch + [b_shape[-2], b_shape[-1]]
+    grad_a_full = bwd.add("batched_matmul_nt", [g_out, primal_id[b_id]], full_a_shape, node.dtype)
+    grad_b_full = bwd.add("batched_matmul_tn", [primal_id[a_id], g_out], full_b_shape, node.dtype)
+    grad_a = _reduce_if_needed(bwd, grad_a_full, full_a_shape, a_shape, node.dtype)
+    grad_b = _reduce_if_needed(bwd, grad_b_full, full_b_shape, b_shape, node.dtype)
     return [grad_a, grad_b]
 
 

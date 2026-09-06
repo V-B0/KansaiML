@@ -248,6 +248,18 @@ private:
 // this requires from the caller.
 void set_active_pool(StoragePool* pool);
 
+// NumPy-style right-aligned broadcasting: pads the shorter shape with
+// implicit leading 1s, then each aligned pair of dims must either match
+// or one of them must be 1 -- the standard rule add/sub/mul/matmul's
+// own batch-dim broadcasting in Tensor.cpp all use. A free function
+// (not Tensor-scoped `static`, which is where this originally lived)
+// specifically so GradOps.cpp can share the identical implementation
+// for its own batched matmul_nt/matmul_tn vjp ops rather than
+// re-deriving the same broadcasting rule a second time. Throws on an
+// incompatible pair rather than silently picking one side.
+std::vector<int64_t> broadcast_shapes(const std::vector<int64_t>& a, const std::vector<int64_t>& b,
+                                       const char* op_name);
+
 // A single recorded op: which parent tensors produced this one, and the
 // closure that turns an upstream gradient into gradients for each parent.
 // This — plus Tensor::backward()'s graph walk — *is* Kansai's autograd
