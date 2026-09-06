@@ -71,6 +71,8 @@ NB_MODULE(_core, m) {
              nb::call_guard<nb::gil_scoped_release>())
         .def("conv2d", &Tensor::conv2d, nb::arg("weight"), nb::arg("bias"), nb::arg("stride"), nb::arg("padding"),
              nb::call_guard<nb::gil_scoped_release>())
+        .def("max_pool2d", &Tensor::max_pool2d, nb::arg("kernel_size"), nb::arg("stride"),
+             nb::call_guard<nb::gil_scoped_release>())
         .def("reshape", &Tensor::reshape, nb::arg("shape"), nb::call_guard<nb::gil_scoped_release>())
         .def("transpose", &Tensor::transpose, nb::arg("dim0"), nb::arg("dim1"),
              nb::call_guard<nb::gil_scoped_release>())

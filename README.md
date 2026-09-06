@@ -44,6 +44,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — Normalization | `LayerNorm`, `BatchNorm1d`, `Module.train()`/`eval()` | ✅ done |
 | — Real benchmark | MNIST end to end: **97.58% test accuracy**, 31.7s | ✅ done |
 | — `detach()` | Cut a value from the autograd graph — a real view, O(1) | ✅ done |
+| — Pooling/regularization | `AvgPool2d`, `MaxPool2d` (real argmax gradient), `Dropout` | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -124,7 +125,15 @@ held-out test images, not a synthetic proxy), `Linear(784→256) →
 BatchNorm1d → ReLU → Linear(256→64) → ReLU → Linear(64→10)` trained with
 `Adam` reaches **97.58% test accuracy in 31.7s** (15 epochs, measured
 one real run, zero hyperparameter search) — see
-[`examples/mnist/`](examples/mnist/) to reproduce it.
+[`examples/mnist/`](examples/mnist/) to reproduce it; `MaxPool2d`'s
+gradient is checked to land on exactly the winning position in each
+window (4 of 16 entries nonzero for a 4×4 input pooled 2×2, not spread
+across it — reusing the existing, deliberately non-differentiable
+`max(dim)` here would have silently zeroed this layer's entire
+gradient, a real trap caught before it shipped), and a real
+`Conv2d → ReLU → MaxPool2d → Linear → cross_entropy` CNN reaches 100%
+accuracy on a synthetic image task, proving that gradient composes
+correctly through a real `Conv2d` backward, not just in isolation.
 
 ## Why
 
@@ -223,7 +232,7 @@ Python (Tensor, nn.Module, optim)
   format
 - `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`, `Tanh`,
   `Sigmoid`, `GELU`, `LeakyReLU`, `Softmax`, `LayerNorm`, `BatchNorm1d`,
-  `Sequential`, `SGD`, `Adam`
+  `AvgPool2d`, `MaxPool2d`, `Dropout`, `Sequential`, `SGD`, `Adam`
 - `tests/` — every claim above, checked: numerical gradient checks,
   cross-checks between independent implementations, and benchmarks that
   assert real speedups rather than just printing numbers

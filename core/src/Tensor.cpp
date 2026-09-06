@@ -457,6 +457,41 @@ Tensor Tensor::conv2d(const Tensor& weight, const Tensor& bias, int64_t stride, 
     return out;
 }
 
+Tensor Tensor::max_pool2d(int64_t kernel_size, int64_t stride) const {
+    const Tensor& x = *this;
+    if (x.ndim() != 4)
+        throw std::runtime_error("max_pool2d: input must be 4D (N, C, H, W)");
+
+    int64_t N = x.shape()[0], C = x.shape()[1], H = x.shape()[2], W = x.shape()[3];
+    int64_t Hout = (H - kernel_size) / stride + 1;
+    int64_t Wout = (W - kernel_size) / stride + 1;
+    if (Hout <= 0 || Wout <= 0)
+        throw std::runtime_error("max_pool2d: kernel_size/stride produce a non-positive output size");
+
+    Tensor out = Tensor::zeros({N, C, Hout, Wout}, false);
+    // Shared (not copied) into the backward_fn closure below -- cheap
+    // (a refcount bump, not an N*C*Hout*Wout-sized copy) and correct,
+    // since nothing else ever mutates this buffer after forward fills it.
+    auto argmax = std::make_shared<std::vector<int64_t>>(static_cast<size_t>(N * C * Hout * Wout));
+    cpu::maxpool2d_fwd(x.data_ptr(), out.data_ptr(), argmax->data(), N, C, H, W, kernel_size, stride, Hout, Wout);
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "max_pool2d";
+        node->inputs = {x};
+        auto x_shape = x.shape();
+        node->backward_fn = [x_shape, argmax, N, C, H, W, Hout, Wout](
+                                 const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(x_shape, false);
+            cpu::maxpool2d_bwd(grad_output.data_ptr(), argmax->data(), grad_x.data_ptr(), N, C, H, W, Hout, Wout);
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
 Tensor Tensor::mean() const {
     const Tensor& x = *this;
     Tensor out = Tensor::zeros({1}, false);

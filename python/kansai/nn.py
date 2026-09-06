@@ -1,4 +1,5 @@
 import math
+import random as _random
 
 from . import _core as core
 from ._core import randn, zeros
@@ -95,6 +96,60 @@ class Conv2d(Module):
         return x.conv2d(self.weight, self.bias, self.stride, self.padding)
 
 
+class AvgPool2d(Module):
+    """Non-overlapping average pooling only (`stride` fixed equal to
+    `kernel_size`, unlike Conv2d's independent stride) -- the common
+    case, and the one a pure reshape-based composition can express
+    exactly. `(N, C, H, W)` -> reshape to `(N, C, H/k, k, W/k, k)` (a
+    real row-major reshape, not a relayout: decomposing `H` into
+    `(H/k, k)` this way lands `kh` exactly inside one pooling window,
+    verified against a hand-computed 4x4 example before relying on it)
+    -> `mean(dim)` over the two `k`-sized axes, one at a time (mean
+    over a 2D window separates into two sequential 1D means exactly --
+    not an approximation). Composed entirely from already-existing,
+    already-traceable ops (`reshape`, `mean(dim)`), so -- unlike
+    `MaxPool2d` below -- this needed no new kernel, `GradNode`, or KIR
+    work at all: it traces, fuses, and differentiates through `kir.grad`
+    for free, the same payoff `LayerNorm` already got from being a pure
+    composition. Requires `H` and `W` to divide evenly by
+    `kernel_size` -- true for the deliberately-scoped case this covers,
+    not handled otherwise (padding to make it true is the caller's own
+    job, e.g. via a `Conv2d` upstream sized to land on an exact
+    multiple).
+    """
+
+    def __init__(self, kernel_size: int):
+        self.kernel_size = kernel_size
+
+    def forward(self, x):
+        if len(x.shape) != 4:
+            raise ValueError(f"AvgPool2d: expected a 4D (N, C, H, W) input, got shape {list(x.shape)}")
+        n, c, h, w = x.shape
+        k = self.kernel_size
+        if h % k != 0 or w % k != 0:
+            raise ValueError(f"AvgPool2d: kernel_size={k} must divide both H={h} and W={w} evenly")
+        ho, wo = h // k, w // k
+        return x.reshape([n, c, ho, k, wo, k]).mean(5).mean(3)
+
+
+class MaxPool2d(Module):
+    """Unlike AvgPool2d above, this is a real, dedicated C++ op
+    (Tensor.max_pool2d), not a composition -- see its own declaration in
+    core/include/kansai/Tensor.hpp for why reusing the existing (and
+    deliberately non-differentiable) max(dim) here would have been a
+    correctness trap, not a shortcut. Independent kernel_size/stride
+    (unlike AvgPool2d, which only covers the exact-tiling
+    stride==kernel_size case) -- stride defaults to kernel_size,
+    matching every real MaxPool2d's own default."""
+
+    def __init__(self, kernel_size: int, stride: int = None):
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+
+    def forward(self, x):
+        return x.max_pool2d(self.kernel_size, self.stride)
+
+
 class ReLU(Module):
     def forward(self, x):
         return x.relu()
@@ -133,6 +188,58 @@ class Softmax(Module):
 
     def forward(self, x):
         return x.softmax(self.dim)
+
+
+class Dropout(Module):
+    """Inverted dropout: zeros each element independently with
+    probability `p` during training, scaling the survivors by
+    `1/(1-p)` so the expected value stays the same either way (the
+    modern convention -- eval mode is then a plain identity, not a
+    separate `* (1-p)` rescale). Identity in eval mode (see
+    Module.train()/eval()) or when `p == 0`, matching the mathematical
+    definition exactly, not approximately.
+
+    The mask is a real Tensor with requires_grad=False, so dropout's own
+    backward needs no dedicated kernel or GradNode at all: `x.mul(mask)`
+    is already correctly differentiable (mul's existing backward routes
+    the gradient through the same mask that zeroed the forward pass,
+    exactly dropout's own true gradient), the same "composed from an
+    already-differentiable op" payoff softmax/LayerNorm/AvgPool2d above
+    already got.
+
+    Mask generation goes through Python's stdlib `random` (not a kernel)
+    -- fine at the sizes this project's own tests and MNIST benchmark
+    run at, a real, un-optimized cost (one Python-level random draw per
+    element, every forward call in training mode) at a size large enough
+    for that to matter; a C++ RNG-based kernel is real, unattempted
+    future work.
+
+    KIR-traceable, with a real caveat worth stating plainly: tracing
+    calls this during the ONE trace, generating ONE fixed mask that gets
+    baked into the graph as a constant -- correct for a single traced
+    run, but a graph cached and re-run multiple times (`kir.run_fused`/
+    `kir.run_metal` on the same fused graph object, say) would reuse
+    that SAME mask every call, not draw a fresh one -- silently defeating
+    dropout's own point across repeated calls to one cached graph. Not a
+    concern for ordinary eager use (a fresh Python-level forward() call
+    each time, each with a fresh mask), which is how this project's own
+    training loops actually call it.
+    """
+
+    def __init__(self, p: float = 0.5):
+        assert 0.0 <= p < 1.0, f"Dropout: p must be in [0, 1), got {p}"
+        self.p = p
+
+    def forward(self, x):
+        if not self.training or self.p == 0.0:
+            return x
+        n = 1
+        for d in x.shape:
+            n *= d
+        keep_prob = 1.0 - self.p
+        mask_vals = [1.0 / keep_prob if _random.random() > self.p else 0.0 for _ in range(n)]
+        mask = core.from_flat(mask_vals, list(x.shape))
+        return x.mul(mask)
 
 
 class LayerNorm(Module):

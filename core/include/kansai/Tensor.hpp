@@ -170,6 +170,17 @@ public:
     // on day one).
     Tensor conv2d(const Tensor& weight, const Tensor& bias, int64_t stride, int64_t padding) const;
 
+    // self: (N, C, H, W). 2D max pooling with a real, argmax-routed
+    // gradient -- deliberately its OWN implementation, not built on
+    // max(dim) above: max(dim) is intentionally non-differentiable (see
+    // its own declaration for why that's correct for softmax's
+    // max-subtraction specifically), and reusing it here would silently
+    // give this a zero gradient everywhere, a real correctness trap for
+    // a layer meant to backprop through. No padding parameter (unlike
+    // conv2d) -- `(H - kernel_size) / stride + 1` must already be a
+    // positive integer.
+    Tensor max_pool2d(int64_t kernel_size, int64_t stride) const;
+
     // General tensor manipulation -- unlike every op above, these don't
     // change values, only which position each element sits at. All
     // three copy (this codebase has no non-owning "view" that shares

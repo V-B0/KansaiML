@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #ifdef KANSAI_USE_ACCELERATE
@@ -423,6 +424,54 @@ void sum_over_batch_and_spatial(const float* dy, float* db, int64_t N, int64_t C
             float s = 0.0f;
             for (int64_t i = 0; i < HW; ++i) s += row[i];
             db[c] += s;
+        }
+    }
+}
+
+void maxpool2d_fwd(const float* x, float* out, int64_t* argmax,
+                    int64_t N, int64_t C, int64_t H, int64_t W,
+                    int64_t kernel_size, int64_t stride,
+                    int64_t Hout, int64_t Wout) {
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < C; ++c) {
+            const float* xin = x + (n * C + c) * H * W;
+            float* oout = out + (n * C + c) * Hout * Wout;
+            int64_t* aout = argmax + (n * C + c) * Hout * Wout;
+            for (int64_t oh = 0; oh < Hout; ++oh) {
+                for (int64_t ow = 0; ow < Wout; ++ow) {
+                    float best = -std::numeric_limits<float>::infinity();
+                    int64_t best_idx = -1;
+                    for (int64_t kh = 0; kh < kernel_size; ++kh) {
+                        int64_t ih = oh * stride + kh;
+                        for (int64_t kw = 0; kw < kernel_size; ++kw) {
+                            int64_t iw = ow * stride + kw;
+                            float v = xin[ih * W + iw];
+                            if (v > best) {
+                                best = v;
+                                best_idx = ih * W + iw;
+                            }
+                        }
+                    }
+                    oout[oh * Wout + ow] = best;
+                    aout[oh * Wout + ow] = best_idx;
+                }
+            }
+        }
+    }
+}
+
+void maxpool2d_bwd(const float* grad_out, const int64_t* argmax, float* grad_in,
+                    int64_t N, int64_t C, int64_t H, int64_t W,
+                    int64_t Hout, int64_t Wout) {
+    std::fill(grad_in, grad_in + N * C * H * W, 0.0f);
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < C; ++c) {
+            const float* gout = grad_out + (n * C + c) * Hout * Wout;
+            const int64_t* aout = argmax + (n * C + c) * Hout * Wout;
+            float* gin = grad_in + (n * C + c) * H * W;
+            for (int64_t i = 0; i < Hout * Wout; ++i) {
+                gin[aout[i]] += gout[i];
+            }
         }
     }
 }

@@ -1530,6 +1530,85 @@ p.mul(q).detach().mul(q).sum()` correctly gives `q` a gradient (through
 its own undetached path) while `p` gets none at all (its only path to
 `loss` runs through the detached tensor).
 
+## AvgPool2d, MaxPool2d, Dropout
+
+Conv2d existed with nothing to reduce its own spatial output beyond
+`stride`, and nothing in this codebase could regularize a layer's
+activations at all -- three real gaps for anything CNN-shaped, closed
+together since two of the three turned out to need no new C++ at all.
+
+**`AvgPool2d`** is a pure composition, the same payoff `LayerNorm` and
+`softmax`/`cross_entropy` already got from being one: `(N, C, H, W)`
+reshaped to `(N, C, H/k, k, W/k, k)` -- a real row-major reshape, not a
+relayout, verified against a hand-computed 4×4 example specifically to
+confirm decomposing `H` this way lands `kh` exactly inside one pooling
+window before relying on it -- then `mean(dim)` over the two `k`-sized
+axes, one at a time (mean over a 2D window separates into two
+sequential 1D means exactly, not an approximation). No new kernel,
+`GradNode`, or KIR work; it traces, fuses, and differentiates through
+`kir.grad` for free. Scoped to the exact-tiling case
+(`stride == kernel_size`, `H`/`W` divisible by it) on purpose -- the
+common case, and the one the reshape trick can express at all.
+
+**`MaxPool2d`** could not take the same shortcut, and almost did by
+mistake -- this section's one real design trap, caught before it
+shipped rather than after. `max(dim)` already existed (built for
+softmax's numerical-stability trick, see its own section above) and is
+*deliberately* non-differentiable: softmax's max-subtraction is
+provably gradient-irrelevant, so `max(dim)` never attaches a
+`GradNode`, by design. `MaxPool2d` needs the OPPOSITE: a real,
+argmax-routed gradient -- the whole reason a pooling layer's max is
+usually worth taking at all is that it stays part of a trainable
+network. Reusing `max(dim)` here would have silently given every model
+using `MaxPool2d` a zero gradient at that layer, a correctness bug that
+would only show up as "this network doesn't learn," not a crash. Built
+instead as its own dedicated kernel pair (`maxpool2d_fwd`/`_bwd`):
+forward records, per output position, the flat index of the winning
+input element (ties broken toward the first-encountered max, the
+standard convention); backward scatters the incoming gradient to
+exactly that recorded position and nowhere else in the window --
+checked directly, not just inferred from a passing central-difference
+check: of a 4×4 input pooled 2×2, exactly 4 of 16 gradient entries come
+back nonzero, one per window. Eager-only -- no `TraceValue.max_pool2d`
+exists, so `kir.trace()` on a graph using it fails immediately with a
+clear `AttributeError` rather than silently doing something wrong;
+extending KIR support is real, unattempted future work, not something
+this section needed to unblock the eager training path (backend/cpu's
+`stride` support is already general, independent of `kernel_size`, so
+overlapping windows work too, not just the exact-tiling case).
+
+**`Dropout`** needed no new kernel or `GradNode` either: inverted
+dropout (survivors scaled by `1/(1-p)`, so eval mode -- see
+`Module.train()`/`eval()` -- is a plain identity, not a separate
+rescale) is exactly `x.mul(mask)` for a random `{0, 1/(1-p)}` mask built
+as an ordinary `requires_grad=False` `Tensor` -- `mul`'s own already-
+correct backward routes the gradient through that same mask for free,
+which *is* dropout's true gradient. Mask generation goes through
+stdlib `random`, not a kernel -- fine at this project's own scale, a
+real, stated cost (one Python-level draw per element, every training-
+mode forward call) at a size large enough for that to matter, a real
+C++ RNG-based kernel being unattempted future work. `kir.trace()`-able,
+with a real caveat stated plainly rather than glossed over: tracing
+bakes ONE fixed mask into the graph as a constant, correct for a single
+traced run but not for a cached graph re-run multiple times (each call
+would reuse that same mask, silently defeating dropout's own point) --
+not a concern for this project's own eager training loops, which call
+`forward()` fresh (and so draw a fresh mask) every time.
+
+Verified: forward values for both pooling layers against hand-computed
+references (including `MaxPool2d` with overlapping windows,
+`stride < kernel_size`, not just the exact-tiling case `AvgPool2d` is
+scoped to); backward for all three against central differences;
+`AvgPool2d`'s full KIR path; `MaxPool2d`'s and `BatchNorm1d`-style
+eager-only limitation confirmed to fail cleanly, not silently;
+`Dropout`'s zero-fraction and survivor-scaling checked statistically
+over 2000 elements (close to, not exactly, the expected ratios -- a
+statistical check, correctly not held to exact-match tolerance); and,
+practically, a real small CNN (`Conv2d → ReLU → MaxPool2d → Linear →
+cross_entropy`) trained on a synthetic 3-class image task, reaching
+100% accuracy -- proving `MaxPool2d`'s gradient composes correctly
+through a real `Conv2d` backward, not just in isolation.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

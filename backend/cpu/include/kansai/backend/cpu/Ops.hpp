@@ -184,6 +184,28 @@ void add_bias_nchw(const float* x, const float* bias, float* out,
 void sum_over_batch_and_spatial(const float* dy, float* db,
                                  int64_t N, int64_t C, int64_t HW);
 
+// 2D max pooling, non-overlapping or overlapping (stride independent of
+// kernel size, unlike AvgPool2d's composition-based version, which only
+// covers the exact-tiling stride==kernel_size case). Deliberately its
+// OWN kernel pair, not built on max_along_dim above: max_along_dim is
+// intentionally non-differentiable (see its own comment for why that's
+// correct for softmax's max-subtraction specifically), and reusing it
+// here would silently give MaxPool2d a zero gradient everywhere -- a
+// real, dangerous correctness trap for a layer that's actually meant to
+// backprop through, not a shortcut worth taking. `argmax` records, for
+// every output position, the flat (h*W+w) index within that (N,C)
+// plane of the input element that won each window -- backward needs it
+// to route the gradient to exactly that position (ties broken toward
+// the first-encountered max, the same convention every real MaxPool
+// implementation uses).
+void maxpool2d_fwd(const float* x, float* out, int64_t* argmax,
+                    int64_t N, int64_t C, int64_t H, int64_t W,
+                    int64_t kernel_size, int64_t stride,
+                    int64_t Hout, int64_t Wout);
+void maxpool2d_bwd(const float* grad_out, const int64_t* argmax, float* grad_in,
+                    int64_t N, int64_t C, int64_t H, int64_t W,
+                    int64_t Hout, int64_t Wout);
+
 // General shape ops -- unlike the fixed-rank kernels above (matmul's
 // M/K/N, conv2d's im2col/col2im), these work on any rank via an
 // explicit shape array, not a name per dimension. Still "no autograd
