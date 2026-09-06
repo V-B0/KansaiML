@@ -108,6 +108,17 @@ void Tensor::add_(const Tensor& other, float alpha) {
     cpu::axpy_(data_ptr(), other.data_ptr(), alpha, numel());
 }
 
+Tensor Tensor::detach() const {
+    auto data = std::make_shared<TensorData>();
+    data->storage = impl_->storage;
+    data->shape = impl_->shape;
+    data->dtype = impl_->dtype;
+    data->requires_grad = false;
+    // grad and grad_node both default-null (never copied) -- that's
+    // exactly what "cut from the graph" means.
+    return Tensor(data);
+}
+
 std::vector<float> Tensor::to_vector() const {
     std::vector<float> out(static_cast<size_t>(numel()));
     cpu::copy(data_ptr(), out.data(), numel());

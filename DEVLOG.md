@@ -1491,6 +1491,45 @@ cosmetic) against the full 10,000-image test set, batched only to keep
 any one matmul at a modest size, not because a single 10000×784 matmul
 would actually trouble Accelerate.
 
+## detach()
+
+`BatchNorm1d`'s running-stats update (previous section) went through
+`tolist()`/`from_flat()` specifically because Kansai had no way to cut a
+value out of an active autograd graph -- the batch mean/variance it
+needs to fold into `running_mean`/`running_var` are differentiable
+(needed for `x`'s own gradient), and folding them in *without* first
+breaking that connection would grow the graph across every training
+step. `Tensor::detach()` closes that gap directly: a new `Tensor`
+sharing the original's `Storage` (a real view -- O(1), no data copy,
+the same refcounted sharing `Storage` was already built for) but with
+`requires_grad=false` and no `grad_node`. `BatchNorm1d` now uses it
+directly (`mean.detach()`, real `Tensor` ops to fold into the running
+buffers) instead of round-tripping through Python floats -- cleaner and
+faster, with the exact same numerical result (checked: the normalization
+test suite's own numbers are unchanged before and after this refactor).
+
+Eager-only, on purpose: no `TraceValue.detach()`, no KIR op. The reason
+isn't laziness -- it's that `detach()` wouldn't actually fix
+`BatchNorm1d`'s own `kir.trace()`-ability even if it existed there too.
+The real obstacle is that updating `self.running_mean`/`self.running_var`
+is a Python-level attribute *reassignment*, a side effect a traced graph
+has no way to express regardless of whether the value feeding it is
+detached -- so extending tracing support to `detach()` would still leave
+`BatchNorm1d` untraceable in training mode, for a different, deeper
+reason already documented in the previous section. Not attempted where
+it wouldn't actually solve the stated problem.
+
+Verified beyond the BatchNorm1d refactor itself: `detach()` preserves
+values exactly; it's a genuine *view*, not a copy (checked directly --
+mutating through a detached handle via `add_` is visible on the
+original, since they share `Storage`); a computation built entirely
+from detached tensors never requires grad; and, the sharpest check,
+detaching *mid-graph* cuts gradient flow through exactly that one path
+while leaving any other path to the same leaf tensor intact -- `loss =
+p.mul(q).detach().mul(q).sum()` correctly gives `q` a gradient (through
+its own undetached path) while `p` gets none at all (its only path to
+`loss` runs through the detached tensor).
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

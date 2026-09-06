@@ -180,29 +180,31 @@ class BatchNorm1d(Module):
     running_mean/running_var are buffers, not parameters -- plain
     Tensor attributes with requires_grad=False, deliberately invisible
     to named_parameters()/parameters() (no gradient should ever reach
-    them, and no optimizer should ever step them). Updating them by
-    round-tripping through tolist()/from_flat() rather than in-place
-    Tensor ops is a deliberate choice, not an oversight: Kansai has no
-    detach() to cut a value out of an active autograd graph, and the
-    batch mean/variance computed on the training path above DO sit
-    inside one (they're differentiable, needed for x's own gradient) --
-    going through plain Python floats is what actually breaks that
-    graph before folding into the buffers, avoiding growing it across
-    every training step. The unbiased (n/(n-1)) correction applied to
-    the batch variance before folding it into running_var, but NOT to
-    the biased variance actually used to normalize this batch, matches
-    the convention every real BatchNorm implementation uses.
+    them, and no optimizer should ever step them). Updated via
+    Tensor.detach() (a real Tensor view -- O(1), no data copy, sharing
+    the same Storage -- with requires_grad=False and no grad_node) on
+    this batch's own mean/variance, which otherwise DO sit inside the
+    active autograd graph (they're differentiable, needed for x's own
+    gradient): detaching them before folding into the running buffers
+    is what stops that graph from growing across every training step,
+    without needing to round-trip through plain Python floats to do it.
+    The unbiased (n/(n-1)) correction applied to the batch variance
+    before folding it into running_var, but NOT to the biased variance
+    actually used to normalize this batch, matches the convention every
+    real BatchNorm implementation uses.
 
-    Eager-only, deliberately: the training path's tolist()/from_flat()
-    running-stats bookkeeping needs real tensor DATA, which a kir.trace()
-    TraceValue never carries (it's symbolic -- shape/dtype only). Calling
-    kir.trace() on a graph containing a BatchNorm1d in training mode
-    fails outright (an AttributeError on TraceValue.tolist()) rather
-    than silently tracing something wrong -- a real, stated limitation,
-    not a bug to fix here. LayerNorm above has no such restriction: it's
-    a pure composition of already-traceable ops with no side-effecting
-    bookkeeping, so it traces, fuses, and differentiates through KIR
-    exactly like any other op.
+    Eager-only, deliberately, for a reason detach() doesn't change:
+    updating self.running_mean/self.running_var is a Python-level
+    attribute REASSIGNMENT, a side effect a traced graph has no way to
+    express regardless of whether the value feeding it is detached --
+    detach() itself is eager-only too (no TraceValue.detach() exists),
+    so kir.trace() on a graph containing a BatchNorm1d in training mode
+    fails outright with a clear AttributeError rather than silently
+    tracing something wrong. A real, stated limitation, not a bug to
+    fix here. LayerNorm above has no such restriction: it's a pure
+    composition of already-traceable ops with no side-effecting
+    bookkeeping at all, so it traces, fuses, and differentiates through
+    KIR exactly like any other op.
     """
 
     def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1):
@@ -225,14 +227,15 @@ class BatchNorm1d(Module):
 
             n = x.shape[0]
             correction = n / (n - 1) if n > 1 else 1.0
-            mean_flat = mean.tolist()
-            var_flat = var.tolist()
-            new_running_mean = [(1 - self.momentum) * rm + self.momentum * bm
-                                 for rm, bm in zip(self.running_mean.tolist(), mean_flat)]
-            new_running_var = [(1 - self.momentum) * rv + self.momentum * bv * correction
-                                for rv, bv in zip(self.running_var.tolist(), var_flat)]
-            self.running_mean = core.from_flat(new_running_mean, [self.num_features])
-            self.running_var = core.from_flat(new_running_var, [self.num_features])
+            momentum_t = core.from_flat([self.momentum], [1])
+            one_minus_momentum_t = core.from_flat([1.0 - self.momentum], [1])
+            correction_t = core.from_flat([correction], [1])
+
+            mean_detached = mean.detach().reshape([self.num_features])
+            var_detached = var.detach().reshape([self.num_features])
+            self.running_mean = self.running_mean.mul(one_minus_momentum_t).add(mean_detached.mul(momentum_t))
+            self.running_var = self.running_var.mul(one_minus_momentum_t).add(
+                var_detached.mul(correction_t).mul(momentum_t))
         else:
             centered = x.sub(self.running_mean)
             normalized = centered.div(self.running_var.add(eps_t).sqrt())

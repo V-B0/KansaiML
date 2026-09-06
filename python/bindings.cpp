@@ -48,6 +48,7 @@ NB_MODULE(_core, m) {
         // any hot path this matters for.
         .def("add_", &Tensor::add_, nb::arg("other"), nb::arg("alpha") = 1.0f,
              nb::call_guard<nb::gil_scoped_release>())
+        .def("detach", &Tensor::detach, nb::call_guard<nb::gil_scoped_release>())
         .def("add", &Tensor::add, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
         .def("sub", &Tensor::sub, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
         .def("mul", &Tensor::mul, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())

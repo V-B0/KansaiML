@@ -66,6 +66,24 @@ public:
     // In-place update, bypassing autograd entirely. Used by optimizers.
     void add_(const Tensor& other, float alpha = 1.0f);
 
+    // A new Tensor handle sharing this one's Storage (a real view, O(1),
+    // no data copy -- Storage is already refcounted via shared_ptr for
+    // exactly this kind of sharing) but with requires_grad=false and no
+    // grad_node: cut from the autograd graph. Used wherever a value
+    // needs to keep being READ or fed into further computation without
+    // that computation growing back into the graph the value came from
+    // -- BatchNorm1d's running-stats update is the motivating case (see
+    // its own docstring in python/kansai/nn.py): folding a
+    // still-attached batch mean/variance into a persistent buffer would
+    // grow the graph across every training step, not just use its
+    // current value. Eager-only: no KIR op or TraceValue method exists
+    // for this, since the actual problem it solves for BatchNorm1d
+    // (mutating self.running_mean/var as a Python-level side effect)
+    // isn't something a traced graph can express regardless of whether
+    // the value feeding it is detached -- adding "detach" tracing
+    // support wouldn't make that path traceable, so it isn't attempted.
+    Tensor detach() const;
+
     Tensor add(const Tensor& other) const;
     Tensor sub(const Tensor& other) const;
     Tensor mul(const Tensor& other) const;

@@ -43,6 +43,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — Activations/losses | `tanh`/`sigmoid`/`gelu`/`leaky_relu`, `sum`/`mean`/`max(dim)`, `softmax`, `cross_entropy` | ✅ done |
 | — Normalization | `LayerNorm`, `BatchNorm1d`, `Module.train()`/`eval()` | ✅ done |
 | — Real benchmark | MNIST end to end: **97.58% test accuracy**, 31.7s | ✅ done |
+| — `detach()` | Cut a value from the autograd graph — a real view, O(1) | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
