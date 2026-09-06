@@ -915,6 +915,90 @@ clearest sign of what's actually happening: "metal"'s ~15.7ms leg is
 almost entirely hidden inside "cpu"'s own leg's duration, close to the
 best case two genuinely concurrent, unequal-duration tasks can achieve.
 
+## Serialization
+
+`python/kansai/serialize.py`: `save(module, path)` / `load(module,
+path)`, closing the last item on this project's original Phase 4
+roadmap. Scope drawn deliberately narrow, the same way quantization's
+scope was: parameter *values* only, not architecture. Reconstructing a
+model's hyperparameters (layer sizes, how a Sequential's children
+compose) from a saved file is a real, separate, harder problem needing
+a stable schema for describing structure itself, not just numbers -- so
+the contract matches PyTorch's own `state_dict`/`load_state_dict` split:
+the caller constructs the model first (with constructor arguments a
+training script already has), then `load()` fills in the numbers. The
+other real option here -- serializing a traced KIR `Graph`'s own
+structure, nodes/edges/attrs, for a jit'd model -- is harder still (a
+stable node-id/op-name schema) and unattempted, stated as such rather
+than silently folded into this.
+
+Getting from `Module` to a named, loadable set of tensors needed one
+small prerequisite: `parameters()` only ever returned a flat, order-
+dependent list, with no name attached to tell a saved tensor apart from
+which attribute it came from. `Module.named_parameters()` (new) does
+the identical recursion `parameters()` already did over `vars(self)`,
+just keeping the dotted attribute path instead of discarding it --
+`"layers.0.weight"` for a `Sequential`'s first sub-layer's weight, the
+same shape of name PyTorch's own `named_parameters()` produces for the
+same reason. `parameters()` itself is now defined in terms of it
+(`[t for _, t in self.named_parameters()]`) rather than duplicating the
+recursion -- a small, genuine simplification, not scope creep.
+
+File format, invented for this project rather than reused wholesale,
+but structurally close to a well-known one on purpose: a length-
+prefixed JSON header (`{name: {shape, dtype, offset, nbytes}}`)
+followed by one flat data blob, the same two-part shape HuggingFace's
+`safetensors` uses -- NOT claimed binary-compatible with it, since this
+omits things the real spec requires (8-byte offset alignment, an
+`__metadata__` key) that nothing here needs. Deliberately not pickle,
+PyTorch's own historical default and the reason loading an arbitrary
+`.pt` file off the internet is a real, well-known security concern
+(unpickling can execute arbitrary code as a side effect of reconstructing
+an object graph). `json.loads` parses data, never executes it, and the
+tensor payload is unpacked as raw floats via Python's `array` module,
+not deserialized as objects -- the worst a corrupted or adversarial file
+can do here is fail a loud, specific check, never run code.
+
+Loading a value back into an already-constructed `Module` needed a
+second small design decision: `Tensor` exposes no generic in-place
+"overwrite my own data" operation (only `add_`, not a natural fit for
+"replace this parameter's value" without an awkward subtract-then-add),
+so `load()` reassigns the attribute directly (`setattr`) rather than
+mutating the existing `Tensor` object -- walking the dotted name back
+down through the module tree (`_set_by_path`, the exact inverse of how
+`named_parameters()` built that name) to find where. Correct, but with
+a real, stated consequence worth surfacing rather than discovering by
+surprise: an optimizer built from `model.parameters()` *before* a
+`load()` call still holds the OLD `Tensor` objects by identity in its
+own params list, so it would keep updating parameters the model's
+forward pass no longer uses after the load replaced them. `load()`
+before constructing an optimizer, not after -- the same ordering
+PyTorch's own `load_state_dict` requires for the identical reason.
+
+Checked in `tests/test_serialize.py`: a round trip through
+`save()`/`load()` reproduces a trained model's parameters bit-for-bit
+(float32 through raw bytes and back is lossless, not approximate -- any
+deviation at all would be a real bug) and its forward-pass output
+exactly, for both the trained XOR `Sequential` model and a `Conv2d`
+(confirming this isn't special-cased to one layer type); four distinct
+failure modes -- a shape mismatch, a checkpoint missing a parameter the
+model expects, a checkpoint carrying one the model doesn't, and
+corrupted magic bytes -- are each rejected with a specific, useful error
+rather than a silent wrong load or a crash three layers down inside
+`json`/`array`; and the file's actual byte size is checked against what
+the header independently predicts, not just trusted to be right because
+nothing crashed.
+
+Not attempted, stated up front: architecture/hyperparameter
+serialization and KIR `Graph` serialization (both above), any form of
+versioned migration between checkpoint format revisions (there's only
+ever been the one, `"KAN1"`), and a C++ bulk reader/writer -- this goes
+through `Tensor.tolist()`/`core.from_flat()` the same "prototype in
+Python first" way `distributed.py`'s split/concat and `quantize.py`'s
+(de)quantization already do, fine at this project's own model sizes, a
+real un-optimized cost (one Python float object per element, both
+directions) at a size large enough for that to matter.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

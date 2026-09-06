@@ -6,17 +6,29 @@ from ._core import randn, zeros
 
 class Module:
     def parameters(self):
-        params = []
-        for value in vars(self).values():
+        return [t for _, t in self.named_parameters()]
+
+    def named_parameters(self, prefix: str = ""):
+        """Yields (name, tensor) for every trainable parameter,
+        name-qualified by attribute path -- "layers.0.weight" for the
+        first sub-layer of a Sequential, say. Same recursion
+        parameters() already did, just keeping the path that gets there
+        instead of discarding it. That path is exactly what
+        kansai.serialize needs to match a saved tensor back to the
+        right attribute on load -- a flat, order-dependent list (what
+        parameters() alone gives you) has no name to check a checkpoint
+        against, only a position, which breaks the moment two model
+        definitions differ in ways that don't change parameter count
+        (a reordered layer, an extra non-trainable bumper)."""
+        for key, value in vars(self).items():
             if isinstance(value, core.Tensor) and value.requires_grad:
-                params.append(value)
+                yield (f"{prefix}{key}", value)
             elif isinstance(value, Module):
-                params.extend(value.parameters())
+                yield from value.named_parameters(f"{prefix}{key}.")
             elif isinstance(value, (list, tuple)):
-                for item in value:
+                for i, item in enumerate(value):
                     if isinstance(item, Module):
-                        params.extend(item.parameters())
-        return params
+                        yield from item.named_parameters(f"{prefix}{key}.{i}.")
 
     def zero_grad(self):
         for p in self.parameters():
