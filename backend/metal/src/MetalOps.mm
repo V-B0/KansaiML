@@ -141,6 +141,32 @@ void require_available() {
     if (!state().ok) throw std::runtime_error("kan::metal: no Metal device/pipeline available on this system");
 }
 
+// Wraps `ptr` directly as a GPU-visible buffer instead of copying it
+// into a separate Metal-owned one -- the whole point of NoCopy. Safe
+// only because kan::Storage (core/Storage.cpp) always allocates
+// page-aligned memory rounded *up* to a full page, specifically so
+// every Tensor's buffer qualifies for this; `length` here only needs to
+// be the logical byte count actually used (<=  the real allocation),
+// never the full page-rounded size. `deallocator:nil` means Metal never
+// frees this memory itself -- its lifetime stays owned by the caller's
+// Storage, which must outlive the command buffer this gets used in;
+// true everywhere here since every metal:: function blocks on
+// waitUntilCompleted before returning, so the underlying Tensor is
+// always still alive (the caller holds it) when the GPU touches it.
+// Input buffers are declared `device const float*` in every kernel
+// here, so the GPU-side compiler -- not the C++ type system -- is what
+// actually enforces read-only access to a `const float*` wrapped this
+// way; the const_cast just satisfies the Objective-C API, which has no
+// const-correct overload.
+id<MTLBuffer> wrap_no_copy(id<MTLDevice> device, const void* ptr, NSUInteger length) {
+    id<MTLBuffer> buf = [device newBufferWithBytesNoCopy:const_cast<void*>(ptr)
+                                                    length:length
+                                                   options:MTLResourceStorageModeShared
+                                               deallocator:nil];
+    if (!buf) throw std::runtime_error("kan::metal: newBufferWithBytesNoCopy failed (pointer not page-aligned?)");
+    return buf;
+}
+
 // Shared dispatch shape for the two elementwise kernels (bias_relu,
 // add_bias): both take (x, bias, out, features) and run one thread per
 // output element.
@@ -151,14 +177,9 @@ void dispatch_elementwise_bias_op(id<MTLComputePipelineState> pipeline, const fl
         MetalState& s = state();
         int64_t n = batch * features;
 
-        id<MTLBuffer> buf_x = [s.device newBufferWithBytes:x
-                                                      length:static_cast<NSUInteger>(n * sizeof(float))
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_bias = [s.device newBufferWithBytes:bias
-                                                         length:static_cast<NSUInteger>(features * sizeof(float))
-                                                        options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_out = [s.device newBufferWithLength:static_cast<NSUInteger>(n * sizeof(float))
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_x = wrap_no_copy(s.device, x, static_cast<NSUInteger>(n * sizeof(float)));
+        id<MTLBuffer> buf_bias = wrap_no_copy(s.device, bias, static_cast<NSUInteger>(features * sizeof(float)));
+        id<MTLBuffer> buf_out = wrap_no_copy(s.device, out, static_cast<NSUInteger>(n * sizeof(float)));
         uint32_t uF = static_cast<uint32_t>(features);
 
         id<MTLCommandBuffer> cmd = [s.queue commandBuffer];
@@ -175,8 +196,9 @@ void dispatch_elementwise_bias_op(id<MTLComputePipelineState> pipeline, const fl
         [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
-
-        std::memcpy(out, [buf_out contents], static_cast<size_t>(n) * sizeof(float));
+        // No memcpy: buf_out wraps `out`'s own memory directly, and the
+        // GPU's writes are guaranteed visible on the CPU the moment
+        // waitUntilCompleted returns.
     }
 }
 
@@ -191,14 +213,9 @@ void matmul(const float* a, const float* b, float* out, int64_t M, int64_t K, in
     @autoreleasepool {
         MetalState& s = state();
 
-        id<MTLBuffer> buf_a = [s.device newBufferWithBytes:a
-                                                      length:static_cast<NSUInteger>(M * K * sizeof(float))
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_b = [s.device newBufferWithBytes:b
-                                                      length:static_cast<NSUInteger>(K * N * sizeof(float))
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_out = [s.device newBufferWithLength:static_cast<NSUInteger>(M * N * sizeof(float))
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_a = wrap_no_copy(s.device, a, static_cast<NSUInteger>(M * K * sizeof(float)));
+        id<MTLBuffer> buf_b = wrap_no_copy(s.device, b, static_cast<NSUInteger>(K * N * sizeof(float)));
+        id<MTLBuffer> buf_out = wrap_no_copy(s.device, out, static_cast<NSUInteger>(M * N * sizeof(float)));
 
         uint32_t uM = static_cast<uint32_t>(M), uK = static_cast<uint32_t>(K), uN = static_cast<uint32_t>(N);
 
@@ -231,8 +248,7 @@ void matmul(const float* a, const float* b, float* out, int64_t M, int64_t K, in
         [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
-
-        std::memcpy(out, [buf_out contents], static_cast<size_t>(M * N) * sizeof(float));
+        // No memcpy: buf_out wraps `out` directly.
     }
 }
 
@@ -245,14 +261,9 @@ void matmul_mps(const float* a, const float* b, float* out, int64_t M, int64_t K
         NSUInteger rowBytesB = static_cast<NSUInteger>(N) * sizeof(float);
         NSUInteger rowBytesC = static_cast<NSUInteger>(N) * sizeof(float);
 
-        id<MTLBuffer> buf_a = [s.device newBufferWithBytes:a
-                                                      length:static_cast<NSUInteger>(M) * rowBytesA
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_b = [s.device newBufferWithBytes:b
-                                                      length:static_cast<NSUInteger>(K) * rowBytesB
-                                                     options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_out = [s.device newBufferWithLength:static_cast<NSUInteger>(M) * rowBytesC
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_a = wrap_no_copy(s.device, a, static_cast<NSUInteger>(M) * rowBytesA);
+        id<MTLBuffer> buf_b = wrap_no_copy(s.device, b, static_cast<NSUInteger>(K) * rowBytesB);
+        id<MTLBuffer> buf_out = wrap_no_copy(s.device, out, static_cast<NSUInteger>(M) * rowBytesC);
 
         MPSMatrixDescriptor* descA = [MPSMatrixDescriptor matrixDescriptorWithRows:static_cast<NSUInteger>(M)
                                                                             columns:static_cast<NSUInteger>(K)
@@ -284,8 +295,7 @@ void matmul_mps(const float* a, const float* b, float* out, int64_t M, int64_t K
         [gemm encodeToCommandBuffer:cmd leftMatrix:matA rightMatrix:matB resultMatrix:matC];
         [cmd commit];
         [cmd waitUntilCompleted];
-
-        std::memcpy(out, [buf_out contents], static_cast<size_t>(M) * rowBytesC);
+        // No memcpy: buf_out wraps `out` directly.
     }
 }
 
@@ -308,13 +318,23 @@ void run_elementwise_chain(const float* x0, int64_t batch, int64_t features,
 
         id<MTLCommandBuffer> cmd = [s.queue commandBuffer];
 
-        id<MTLBuffer> cur = [s.device newBufferWithBytes:x0 length:nbytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cur = wrap_no_copy(s.device, x0, nbytes);
 
-        for (const ElemStep& step : steps) {
-            id<MTLBuffer> bias_buf = [s.device newBufferWithBytes:step.bias
-                                                            length:static_cast<NSUInteger>(features * sizeof(float))
-                                                           options:MTLResourceStorageModeShared];
-            id<MTLBuffer> next = [s.device newBufferWithLength:nbytes options:MTLResourceStorageModeShared];
+        for (size_t i = 0; i < steps.size(); ++i) {
+            const ElemStep& step = steps[i];
+            bool is_last = (i + 1 == steps.size());
+
+            id<MTLBuffer> bias_buf = wrap_no_copy(s.device, step.bias, static_cast<NSUInteger>(features * sizeof(float)));
+            // Every step but the last writes into a pure GPU scratch
+            // buffer (no corresponding host tensor exists for an
+            // intermediate value, so there's nothing to NoCopy-wrap);
+            // the last step writes directly into the caller's `out`,
+            // which -- like every kan::Tensor's storage -- is already
+            // page-aligned, so wrapping it skips the final copy-back
+            // entirely.
+            id<MTLBuffer> next = is_last
+                ? wrap_no_copy(s.device, out, nbytes)
+                : [s.device newBufferWithLength:nbytes options:MTLResourceStorageModeShared];
             id<MTLComputePipelineState> pipeline =
                 step.kernel == ElemKernel::BiasRelu ? s.bias_relu_pipeline : s.add_bias_pipeline;
 
@@ -340,8 +360,7 @@ void run_elementwise_chain(const float* x0, int64_t batch, int64_t features,
 
         [cmd commit];
         [cmd waitUntilCompleted];
-
-        std::memcpy(out, [cur contents], static_cast<size_t>(nbytes));
+        // No memcpy: the last step's buffer wraps `out` directly.
     }
 }
 

@@ -193,23 +193,43 @@ kir.run_metal(big_fused, big_X)
 core.metal_matmul_mps(big_X, big_w)
 core.metal_bias_relu(core.metal_matmul_mps(big_X, big_w), big_bias1)
 
-t0 = time.perf_counter()
-for _ in range(iters):
-    kir.run_metal(big_fused, big_X)
-t_batched = (time.perf_counter() - t0) / iters
+
+def median_time(fn, iters):
+    # This chain is only two elementwise steps bookended by one matmul,
+    # so the margin batching wins by here is small (~1.1-1.2x measured)
+    # and each call is sub-millisecond -- well within range for a single
+    # 100-iteration average to occasionally read as a wash or a tiny
+    # loss from ordinary OS scheduling noise alone (confirmed directly:
+    # three back-to-back runs of this exact comparison came back 0.90x,
+    # 1.01x, 1.07x with no code change in between). Taking the median of
+    # several independent trials is the standard fix for a benchmark
+    # this close to the noise floor -- not loosening the assertion.
+    trials = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            fn()
+        trials.append((time.perf_counter() - t0) / iters)
+    trials.sort()
+    return trials[len(trials) // 2]
+
+
+t_batched = median_time(lambda: kir.run_metal(big_fused, big_X), iters)
+
+
+def unbatched_step():
+    x = core.metal_matmul_mps(big_X, big_w)
+    x = core.metal_bias_relu(x, big_bias1)
+    core.metal_add_bias(x, big_bias2)
+
 
 # The pre-batching equivalent: the same three ops (same matmul kernel --
 # metal_matmul_mps, what run_metal itself now uses -- so this isolates
 # the batching effect specifically, not a mix of "batching" and
 # "switched matmul kernels"), each its own command buffer.
-t0 = time.perf_counter()
-for _ in range(iters):
-    x = core.metal_matmul_mps(big_X, big_w)
-    x = core.metal_bias_relu(x, big_bias1)
-    core.metal_add_bias(x, big_bias2)
-t_unbatched = (time.perf_counter() - t0) / iters
+t_unbatched = median_time(unbatched_step, iters)
 
-print(f"\nbatching benchmark on the real chained graph (batch 128, dim 512):")
+print(f"\nbatching benchmark on the real chained graph (batch 128, dim 512), median of 5 trials:")
 print(f"  unbatched (3 command buffers): {t_unbatched*1e3:7.3f} ms/iter")
 print(f"  run_metal (batched elementwise): {t_batched*1e3:7.3f} ms/iter")
 print(f"  speedup: {t_unbatched/t_batched:.2f}x")
