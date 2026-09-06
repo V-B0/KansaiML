@@ -41,6 +41,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | 4 — Distributed | `DeviceMesh`/`DTensor`, distributed gradients, concurrent dispatch, int8 quantization, serialization | ✅ done |
 | — Core ops | `reshape`/`transpose`/`slice`/`cat`, general broadcasting, `sqrt`/`reciprocal`/`div`, `Adam` | ✅ done |
 | — Activations/losses | `tanh`/`sigmoid`/`gelu`/`leaky_relu`, `sum`/`mean`/`max(dim)`, `softmax`, `cross_entropy` | ✅ done |
+| — Normalization | `LayerNorm`, `BatchNorm1d`, `Module.train()`/`eval()` | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -109,7 +110,14 @@ independent from-scratch log-sum-exp implementation (not Kansai's own
 `softmax().log()` composed a second time), and a 3-class classifier
 trained end to end with `Linear → ReLU → Linear → cross_entropy` +
 `Adam` reaches 100% accuracy — the first classification task (XOR is
-regression-shaped) this project has ever trained.
+regression-shaped) this project has ever trained; `LayerNorm` is a pure
+composition of already-existing ops (traces, fuses, and runs on Metal
+like any other), `BatchNorm1d` measurably normalizes by its own running
+statistics in eval mode rather than a fresh batch's (checked by feeding
+a wildly out-of-distribution example after training and confirming the
+output isn't the near-zero a fresh batch's own trivial statistics would
+give), and the same 3-class classifier reaches 100% accuracy again with
+either layer dropped in.
 
 ## Why
 
@@ -207,7 +215,8 @@ Python (Tensor, nn.Module, optim)
   to/from disk, a pickle-free length-prefixed-JSON-header + flat-blob
   format
 - `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`, `Tanh`,
-  `Sigmoid`, `GELU`, `LeakyReLU`, `Softmax`, `Sequential`, `SGD`, `Adam`
+  `Sigmoid`, `GELU`, `LeakyReLU`, `Softmax`, `LayerNorm`, `BatchNorm1d`,
+  `Sequential`, `SGD`, `Adam`
 - `tests/` — every claim above, checked: numerical gradient checks,
   cross-checks between independent implementations, and benchmarks that
   assert real speedups rather than just printing numbers

@@ -1353,6 +1353,95 @@ blobs), trained with `Linear → ReLU → Linear → cross_entropy` and
 task (as opposed to regression, XOR included) this project has ever
 trained end to end.
 
+## LayerNorm, BatchNorm1d
+
+Both normalize (subtract a mean, divide by a standard deviation, then
+apply a learnable per-feature scale and shift) -- they differ only in
+*which axis* the mean/variance are computed over, and that difference
+turned out to matter for how cheaply each could be built.
+
+**`LayerNorm`** normalizes over the last axis only -- `(..., num_features)`
+for any leading shape, the common case every transformer's own
+LayerNorm actually uses (the embedding dimension alone, not several
+axes jointly). It's a pure composition of ops that already existed
+before this section started (`mean(dim)`, `sub`, `mul`, `div`, `sqrt`,
+`add`, all already broadcasting-aware): no new kernel, `GradNode`, KIR
+op, or vjp rule anywhere. That composability paid off immediately --
+`LayerNorm` traces, fuses, dispatches to Metal, and differentiates
+through `kir.grad` exactly like any other op, verified the same way
+softmax/cross_entropy were, with no extra plumbing required to make any
+of that true.
+
+**`BatchNorm1d`** normalizes over the batch axis instead, per feature --
+`(batch, num_features)` input only; `BatchNorm2d` for conv activations
+(normalizing per-*channel* across `N`, `H`, and `W` jointly) is real,
+unattempted future work, needing a multi-axis reduction `mean(dim)`
+doesn't do in one call today (a transpose+reshape detour around it is
+possible, just not built here). Two things make it a genuinely
+different, harder problem than `LayerNorm`, not just "the same idea
+with `dim=0`":
+
+1. **Train/eval mode is real, load-bearing state**, not a convenience
+   flag. Training mode normalizes by the *current batch's* own mean/
+   variance; eval mode normalizes by a *running* mean/variance
+   accumulated via an exponential moving average across every training
+   batch seen so far -- because a single example at inference time has
+   no batch statistics of its own to normalize by. This needed real
+   infrastructure that didn't exist before: `Module.train(mode)`/
+   `Module.eval()`, recursing into every reachable sub-`Module` the same
+   way `named_parameters()` already does, with a class-level `training =
+   True` default so it works without any subclass needing its own
+   `__init__` to set it (none of them call `super().__init__()` today).
+2. **The running-stats update has to NOT be part of the autograd
+   graph**, or every training step would grow it indefinitely. Kansai
+   has no `detach()` to cut a value out of an active graph, so this
+   goes through `tolist()`/`from_flat()` for exactly that value --
+   round-tripping through plain Python floats is what actually breaks
+   the graph, not an incidental implementation detail. The differentiable
+   path (this batch's own normalization, needed for `x`'s and `weight`/
+   `bias`'s gradients) and the non-differentiable path (folding this
+   batch's statistics into the running buffers) are genuinely separate
+   pieces of the same `forward()` call, computed from the same `mean`/
+   `var` tensors but consumed completely differently.
+   `running_mean`/`running_var` are buffers, not parameters -- plain
+   `requires_grad=False` attributes, invisible to `named_parameters()`
+   on purpose, so no gradient ever reaches them and no optimizer ever
+   steps them. The variance folded into `running_var` gets the standard
+   unbiased (`n/(n-1)`) correction; the variance actually used to
+   normalize *this* batch stays biased (divide by `n`) -- two different
+   numbers from the same computation, matching the convention every
+   real BatchNorm implementation uses, not a simplification.
+
+One direct, honest consequence of point 2: `BatchNorm1d` in training
+mode is **not** `kir.trace()`-able. Tracing calls `.tolist()` on a
+`TraceValue`, which carries no real data (shape/dtype only, by design --
+that's the entire point of tracing), so it fails outright with an
+`AttributeError` rather than silently tracing something wrong. Checked
+directly, not just asserted: `kir.trace()` on a graph containing a
+training-mode `BatchNorm1d` raises exactly that error. `LayerNorm` has
+no such restriction, and its own KIR-path test (`trace` → all
+interpreters → `kir.grad`) proves it.
+
+Verified: forward values for both against a from-scratch manual
+normalization (not Kansai's own `mean()`/`var` composed a second time),
+backward against central differences for both (`BatchNorm1d`'s check
+uses a *fresh* instance per finite-difference evaluation, since reusing
+one would let one evaluation's running-stats update -- a real,
+intentional side effect of a training-mode forward pass -- contaminate
+the next and corrupt the estimate itself, not just be untidy);
+`running_mean`/`running_var` actually change after a training-mode
+forward pass, and eval mode measurably normalizes by those running
+statistics rather than by a fresh batch's own (checked by feeding a
+single wildly-out-of-distribution example after training on unrelated
+data and confirming the output is *not* trivially near zero, which
+normalizing by that example's own -- degenerate, single-point --
+statistics would produce); `Module.train()`/`eval()` recursing correctly
+through a `Sequential`; and, practically, the same 3-class Gaussian-blob
+classifier from the previous section trained twice more -- once with a
+`LayerNorm` layer, once with a `BatchNorm1d` layer -- both reaching 100%
+accuracy, confirming each is a genuine working layer in a real training
+loop, not just forward-correct in isolation.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`
