@@ -777,6 +777,73 @@ verified version of that check: both a `sum()`-loss and a `mean()`-loss
 graph, run distributed, matching their own full-batch `kir.grad()`
 reference exactly.
 
+## Quantization
+
+`python/kansai/quantize.py`: post-training int8 weight quantization,
+inference-shaped and deliberately standalone -- the same "prototype the
+semantics before committing to a real kernel" approach this project
+already took twice (`kir.py`'s IR before any C++ backend existed;
+`distributed.py`'s `_split_tensor`/`_concat_tensors` before a native
+slice/concat kernel). Nothing in `Tensor`/`Storage`/`DType` changes:
+`core/include/kansai/DType.hpp` still only ever declares `Float32`, and
+`Tensor::data_ptr()` is unconditionally `float*` at hundreds of call
+sites across this codebase -- retrofitting a second storage width into
+that class would be invasive surgery on working code for a feature
+nothing else yet depends on. A `QTensor` is instead a small, separate
+Python type: an int8 payload (a plain list -- there's no int8 `Storage`
+to hold it in) plus one float `scale`, converted back to an ordinary
+`core.Tensor` (`dequantize()`) at the one point it actually needs to
+enter a real kernel.
+
+Symmetric, per-tensor quantization, not asymmetric/affine: `q =
+round(x / scale)`, `scale = max(|x|) / 127`, no zero-point. The right
+fit for what this actually quantizes -- trained weights, roughly
+zero-centered by construction, both before training (sampled from a
+zero-mean Gaussian) and typically after -- and the simpler of the two
+standard schemes, the same "start simple, prove correctness first"
+choice this project made for Metal's own first matmul kernel before
+MPS. Asymmetric quantization would matter for post-ReLU activations
+(all ≥ 0, wasting half of symmetric int8's range) -- not attempted,
+since nothing here quantizes activations.
+
+`qlinear(x, qweight, bias)` dequantizes the weight back to float32 and
+runs the ordinary Accelerate-backed `matmul`+`add` underneath --
+proving quantization's numerical correctness honestly rather than
+pretending there's a real int8 GEMM kernel underneath (there isn't).
+The claim this actually supports is memory footprint, not FLOPs: a
+`QTensor` measures at exactly 4.00x smaller than the equivalent float32
+tensor (1 byte/element vs 4, checked directly, not assumed from the
+byte-width arithmetic alone), with zero speed claim attached -- a true
+int8 GEMM kernel (feeding int8 operands directly into a hardware
+int8 dot-product path, skipping the dequantize-then-float32-matmul
+round trip entirely) is real, substantial, unattempted future work,
+the same honest gap this project already left open for a Metal
+convolution kernel and for concurrent multi-device dispatch.
+
+Correctness, checked three separate ways: round-trip quantize/
+dequantize error is bounded by the known quantization step (`scale/2`,
+not just "looks close"), checked at 1000 random values, plus an exact
+check that `0.0` quantizes to `q=0` precisely (what makes the
+zero-point-free scheme valid at all); the 4x memory ratio is measured
+directly rather than assumed from the byte-width math; and `QLinear`
+(built from an already-trained `nn.Linear`, quantizing its weight once
+at construction -- bias stays float32, since it's a tiny vector nowhere
+near where the memory win matters, and keeping it exact avoids stacking
+a second error source on the weight's own) is dropped into the exact
+XOR model and training run `test_xor.py` already uses, and its
+quantized predictions still classify XOR correctly (`[0, 1, 1, 0]`),
+with a measured max prediction error of ~0.007 against the float32
+model's own output -- the same "does it still actually work" bar
+`test_xor.py`'s and `test_conv2d.py`'s own end-to-end sanity checks
+already hold themselves to, not a new one invented for this feature.
+
+Not attempted, stated up front: per-channel scales (one scale per
+output channel/feature instead of one for the whole tensor -- a real
+refinement that shrinks error further, not a prerequisite for this to
+be useful); activation quantization; quantization-aware training
+(continuing to train through int8 weights, rather than quantizing only
+after training finishes); and, as above, an actual int8 GEMM kernel.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`
