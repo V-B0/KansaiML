@@ -364,6 +364,57 @@ class MultiHeadAttention(Module):
         return merged.matmul(self.w_o)
 
 
+class TransformerBlock(Module):
+    """One decoder-style transformer block: pre-LN self-attention with
+    a residual connection, then a position-wise feed-forward network
+    (`Linear -> GELU -> Linear`) with its own residual connection --
+    `x = x + attn(LN(x))`, `x = x + ffn(LN(x))`. Pre-LN (`LayerNorm`
+    BEFORE each sublayer, not after) rather than the original
+    "Attention Is All You Need" placement -- the choice essentially
+    every transformer since GPT-2 has converged on, since it trains
+    stably without the careful learning-rate warmup schedule post-LN
+    needs to avoid diverging early in training; at the scale this
+    project actually trains at, that's one less thing to have to get
+    right just to match a stylistic choice the field itself has moved
+    past.
+
+    Only reachable now because `kir.grad`'s own batched-matmul gap
+    closed (see the devlog entry of the same name) -- eager training
+    through this class was always fine, but tracing a full forward
+    pass and differentiating it via `kir.grad` needed that fix first,
+    the same real blocker `MultiHeadAttention`'s own docstring used to
+    describe.
+
+    `d_ff` is the feed-forward network's hidden width -- conventionally
+    `4 * d_model` (the ratio the original Transformer paper and GPT-2
+    both use), but left as an explicit, required argument rather than
+    defaulted to that multiple, since silently picking a width tied to
+    `d_model` is exactly the kind of hidden default this project's own
+    conventions avoid.
+
+    Pure composition, no new kernel/`GradNode`/KIR op of its own --
+    every piece (`LayerNorm`, `MultiHeadAttention`, `Linear`, `GELU`,
+    `add` for both residuals) already existed; this is those five
+    pieces wired together in the standard shape, the same "nothing but
+    existing primitives" payoff `LayerNorm`/`softmax`/`AvgPool2d` each
+    got individually.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, seed: int = 0):
+        self.ln1 = LayerNorm(d_model)
+        self.attn = MultiHeadAttention(d_model, num_heads, seed=seed)
+        self.ln2 = LayerNorm(d_model)
+        self.fc1 = Linear(d_model, d_ff, seed=seed + 100)
+        self.gelu = GELU()
+        self.fc2 = Linear(d_ff, d_model, seed=seed + 101)
+
+    def forward(self, x, mask=None):
+        normed = self.ln1(x)
+        x = x.add(self.attn(normed, normed, normed, mask=mask))
+        x = x.add(self.fc2(self.gelu(self.fc1(self.ln2(x)))))
+        return x
+
+
 class BatchNorm1d(Module):
     """Normalizes each feature (column) across the batch dimension --
     (batch, num_features) input only; BatchNorm2d for conv activations

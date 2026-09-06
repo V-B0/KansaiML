@@ -55,6 +55,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — Training utilities | `clip_grad_norm_`, `StepLR`, `CosineAnnealingLR` | ✅ done |
 | — `Dataset`/`DataLoader` | Map-style, per-epoch reshuffle, replaces every hand-rolled batching loop | ✅ done |
 | — `kir.grad` batched matmul | Closed the 2D-only gap — `MultiHeadAttention` now differentiable via `kir.grad`, not just eager | ✅ done |
+| — `TransformerBlock` | Pre-LN attention + FFN, both residuals proven structurally, causal masking verified | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -211,7 +212,17 @@ zero change to the original 2D-only path (checked directly as a
 regression) — and, the actual payoff: tracing a full
 `MultiHeadAttention.forward` and differentiating it via `kir.grad` now
 matches eager `.backward()` to exact zero difference, including through
-`run_metal`.
+`run_metal`. `TransformerBlock` (pre-LN attention + FFN, both with
+residual connections) is checked structurally, not just by "training
+seems to work": zeroing exactly the two sublayers' own output
+projections makes the block reduce to an EXACT identity (output equals
+input to exact equality, gradient exactly all-ones), proving both
+residuals are wired correctly; a causal mask is confirmed to make each
+position's output genuinely independent of every later position's
+input (checked to exact equality, not approximately); and, practically,
+stacking two blocks into a tiny causal model trained to predict the
+first token's identity at every later position — a task no per-position
+network can solve without attention — reaches 100% accuracy.
 
 ## Why
 
@@ -323,7 +334,8 @@ Python (Tensor, nn.Module, optim)
   format
 - `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`, `Tanh`,
   `Sigmoid`, `GELU`, `LeakyReLU`, `Softmax`, `LayerNorm`, `BatchNorm1d`,
-  `AvgPool2d`, `MaxPool2d`, `Dropout`, `MultiHeadAttention`, `Embedding`,
+  `AvgPool2d`, `MaxPool2d`, `Dropout`, `MultiHeadAttention`,
+  `TransformerBlock`, `Embedding`,
   `Sequential`, `SGD`, `Adam`, `AdamW`, `clip_grad_norm_`, `StepLR`,
   `CosineAnnealingLR`
 - `python/kansai/data.py` — `Dataset`, `DataLoader` (map-style,

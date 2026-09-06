@@ -2185,6 +2185,58 @@ this whole gap was blocking, now genuinely closed rather than merely
 worked around. `Conv2d`'s own analogous `kir.grad` gap is a real,
 separate, unattempted piece of work -- not touched here.
 
+## TransformerBlock
+
+Only reachable now because `kir.grad`'s own batched-matmul gap (closed
+immediately before this) is the last real blocker a full transformer
+block would have hit -- eager training was always fine, but tracing a
+block and differentiating it via `kir.grad` needed that fix first.
+
+`x = x + attn(LN(x))`, `x = x + ffn(LN(x))` -- pre-LN (`LayerNorm`
+BEFORE each sublayer, not after, the original "Attention Is All You
+Need" placement), the choice essentially every transformer since GPT-2
+has converged on specifically because it trains stably without the
+careful learning-rate warmup schedule post-LN needs to avoid diverging
+early. At the scale this project trains at, that's one less thing to
+get right just to match a stylistic choice the field itself has moved
+past. `d_ff` (the feed-forward hidden width) is left as an explicit,
+required constructor argument rather than defaulted to the
+conventional `4 * d_model` -- silently picking a width tied to
+`d_model` is exactly the hidden-default shape this project's own
+conventions avoid.
+
+Pure composition, zero new kernel/`GradNode`/KIR work of its own:
+every piece (`LayerNorm`, `MultiHeadAttention`, `Linear`, `GELU`, `add`
+for both residuals) already existed -- this is those five pieces wired
+into the standard block shape, the same "nothing but existing
+primitives" payoff `LayerNorm`/`softmax`/`AvgPool2d`/`MultiHeadAttention`
+itself each already got individually, now one level up.
+
+Verified: output shape; that BOTH residual connections are wired
+correctly -- proven STRUCTURALLY rather than inferred from "training
+seems to work," by zeroing exactly the two sublayers' own output
+projections (`attn.w_o`, `fc2`'s weight and bias) so each branch
+contributes EXACTLY zero regardless of everything upstream, and
+confirming the block's output equals its input to exact equality (not
+approximately) while `d(sum(output))/d(input)` comes out exactly
+all-ones -- the real signature of an identity-plus-something residual
+path, not a coincidence of matching shapes; backward against central
+differences for the input, with every parameter across both sublayers
+confirmed to receive a gradient; the full KIR path including
+`kir.grad` matching eager exactly; a causal mask confirmed to make
+each position's output genuinely INDEPENDENT of every LATER position's
+input token -- checked by perturbing a future token and confirming
+every earlier position's own output doesn't move AT ALL (exact
+equality), the actual behavioral guarantee a causal mask has to
+provide, not just "the loss looks reasonable" -- while confirming the
+perturbed position's own output DOES change, so the mask isn't
+silently blocking everything; and, practically, stacking two
+`TransformerBlock`s into a tiny causal model trained to predict the
+FIRST token's identity at every later position in the sequence -- a
+task a per-position-only network provably cannot solve (position 0's
+identity isn't locally visible anywhere else without looking back
+through attention) -- reaching 100% per-position accuracy.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`
