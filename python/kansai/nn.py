@@ -417,11 +417,10 @@ class TransformerBlock(Module):
 
 class BatchNorm1d(Module):
     """Normalizes each feature (column) across the batch dimension --
-    (batch, num_features) input only; BatchNorm2d for conv activations
-    (normalizing per-CHANNEL across N, H, and W jointly) is real,
-    unattempted future work, needing a multi-axis reduction this
-    project's mean(dim) doesn't do in one call (a transpose+reshape
-    detour around it is possible, just not built here yet).
+    (batch, num_features) input only; see BatchNorm2d below (for conv
+    activations, normalizing per-CHANNEL across N, H, and W jointly)
+    for the transpose+reshape detour that reuses this class's entire
+    forward() unmodified once C has been moved into this shape.
 
     Training mode (the default -- see Module.train()/eval()) normalizes
     by the CURRENT batch's own mean/variance and folds them into
@@ -495,6 +494,42 @@ class BatchNorm1d(Module):
             normalized = centered.div(self.running_var.add(eps_t).sqrt())
 
         return normalized.mul(self.weight).add(self.bias)
+
+
+class BatchNorm2d(BatchNorm1d):
+    """BatchNorm1d's exact same algorithm (mean/var-across-the-batch,
+    running-stat bookkeeping, train/eval split -- every word of that
+    class's own docstring applies here unchanged, including its
+    eager-only limitation) applied to `(N, C, H, W)` conv activations,
+    normalizing each CHANNEL jointly across N, H, AND W -- the
+    dimension every real BatchNorm2d normalizes over, not just N.
+
+    Subclasses BatchNorm1d rather than reimplementing it: `mean(dim)`
+    only reduces ONE axis per call (no multi-axis reduction in a
+    single call), so there's no way to reduce over N, H, and W at once
+    directly -- but moving C to the LAST axis and flattening N, H, W
+    together into one leading axis turns this into EXACTLY
+    BatchNorm1d's own `(batch, num_features)` case, batch=N*H*W,
+    num_features=C. `transpose(1, 2).transpose(2, 3)` performs that
+    permutation (`Tensor.transpose` only swaps two axes at a time, so
+    (N,C,H,W) -> (N,H,W,C) takes two calls: swap C/H first, then the
+    now-relocated C with W), `reshape` (a pure, cheap reinterpretation
+    of already-contiguous row-major data -- `Tensor.transpose` itself
+    always returns a fresh, fully-packed tensor in its new shape's
+    layout, per its own doc comment, so this reshape is always valid)
+    flattens N/H/W into one axis, `BatchNorm1d.forward` (inherited,
+    completely unmodified) does the actual normalization, and the same
+    two operations run in reverse to restore `(N, C, H, W)`. Zero new
+    kernels, zero new KIR nodes, zero duplicated running-stat logic --
+    the same "compose from what already exists" approach LayerNorm/
+    AvgPool2d/softmax/`Tensor::mean` itself all already took.
+    """
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+        x_nhwc = x.transpose(1, 2).transpose(2, 3).reshape([N * H * W, C])
+        normalized = super().forward(x_nhwc)
+        return normalized.reshape([N, H, W, C]).transpose(2, 3).transpose(1, 2)
 
 
 def _flatten_ids(nested):

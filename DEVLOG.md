@@ -2477,6 +2477,63 @@ momentum again on top of that -- not just "the formula type-checks,"
 a real, measured speed difference on the exact kind of surface
 momentum exists to fix.
 
+## BatchNorm2d
+
+Closes a gap `BatchNorm1d`'s own docstring had flagged from the start:
+`Conv2d` existed with no matching normalization layer for its own
+`(N, C, H, W)` activations, real, unattempted future work needing a
+multi-axis reduction `mean(dim)` can't do in one call (it only reduces
+ONE axis per call; normalizing per-channel means reducing over N, H,
+*and* W jointly).
+
+Closed via the "transpose+reshape detour" that same docstring already
+sketched: `transpose(1,2).transpose(2,3)` moves C to the last axis
+(`(N,C,H,W) -> (N,H,W,C)` -- two calls since `Tensor.transpose` only
+swaps two axes at a time), `reshape([N*H*W, C])` flattens N/H/W into
+one leading axis (valid because `transpose` always returns a fresh,
+fully-packed tensor in its new shape's layout, never a lazy view --
+see its own doc comment), which turns this into EXACTLY
+`BatchNorm1d`'s own `(batch, num_features)` case with `batch=N*H*W`,
+`num_features=C`. `BatchNorm2d` subclasses `BatchNorm1d` and overrides
+ONLY `forward()` to wrap that permutation around an unmodified call to
+the inherited one -- reusing every word of training/eval-mode
+splitting, running-stat bookkeeping, and the eager-only limitation
+that class's own docstring already documents, zero new kernels, zero
+new KIR nodes, zero duplicated logic.
+
+A genuinely subtle testing pitfall surfaced (and worth recording,
+since it's easy to fall into again): checking backward with `.sum()`
+of the output as the loss initially looked like a serious bug --
+central differences disagreed with the analytical gradient by roughly
+3 orders of magnitude. The actual explanation is a mathematical
+identity, not a bug: `sum_i (x_i - mean)/std` is EXACTLY 0 for any x
+with nonzero variance (mean-subtraction makes the sum telescope to
+zero, algebraically, always) -- so `.sum()` of any batch-normalized
+output is a CONSTANT function of the input, and its true gradient
+really is exactly zero. Sum-of-squares is the same trap one level up
+(unit-variance normalization makes `sum_i normalized_i^2` exactly `n`,
+the population-variance identity, also constant in x). Both being
+constant means an implementation with a real bug and a correct one
+would produce IDENTICAL (both near-zero) results under either check --
+a completely uninformative test that happens to "pass" either way. The
+actual gradient check (`tests/test_batchnorm2d.py`) uses a
+position-WEIGHTED sum instead -- different, fixed, non-uniform weights
+per element before summing, breaking the symmetry that made the
+simpler losses degenerate, since it depends on more than the
+normalized distribution's first and second moments.
+
+Verified: forward (training mode) against a manual per-CHANNEL
+mean/variance computed over N, H, AND W jointly (the actual thing this
+layer has to get right that `BatchNorm1d`'s own per-column-over-batch
+case never exercises); backward against central differences using the
+position-weighted loss above, with a fresh `BatchNorm2d` instance per
+perturbed evaluation (reusing one would let one evaluation's
+running-stats update contaminate the next); eval mode confirmed to use
+running statistics rather than a fresh (near-zero-variance)
+out-of-distribution batch's own; and, practically, a real
+`Conv2d` -> `BatchNorm2d` -> `ReLU` -> `Linear` network trained on a
+synthetic two-blob image classification task reaches 100% accuracy.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

@@ -61,6 +61,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — `no_grad()` | Reentrant context manager, skips graph-building for inference/validation | ✅ done |
 | — `kir.grad` conv2d | Closed the last of the two 2D/gap-scope holes — matmul was the other | ✅ done |
 | — SGD momentum | Heavy-ball + Nesterov, `buf` initialized to `grad` on the first step | ✅ done |
+| — `BatchNorm2d` | Per-channel over N,H,W jointly — transpose+reshape onto `BatchNorm1d`, zero new kernels | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -297,7 +298,19 @@ recurrence, and, practically, on a genuinely ill-conditioned loss
 surface (100x steeper along one axis than the other — plain gradient
 descent is textbook-known to oscillate there) momentum reaches under a
 third of plain SGD's loss at the same step budget, Nesterov beating
-plain momentum again on top of that.
+plain momentum again on top of that. `BatchNorm2d` closes the gap
+`BatchNorm1d`'s own docstring had flagged since it shipped —
+per-channel normalization over N, H, *and* W jointly for `Conv2d`'s
+`(N,C,H,W)` activations, via a transpose+reshape onto `BatchNorm1d`'s
+own unmodified `forward()` (zero new kernels). Checked against a
+manual per-channel mean/variance and, for backward, a deliberately
+non-degenerate position-weighted loss — `.sum()` or sum-of-squares of
+any batch-normalized output is mathematically CONSTANT with respect to
+the input (a real trap: both would make a genuinely broken
+implementation and a correct one produce identical, uninformatively
+near-zero results) — and, practically, a real `Conv2d → BatchNorm2d →
+ReLU → Linear` network reaches 100% accuracy on a synthetic
+classification task.
 
 ## Why
 
@@ -408,7 +421,7 @@ Python (Tensor, nn.Module, optim)
   to/from disk, a pickle-free length-prefixed-JSON-header + flat-blob
   format
 - `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`, `Tanh`,
-  `Sigmoid`, `GELU`, `LeakyReLU`, `Softmax`, `LayerNorm`, `BatchNorm1d`,
+  `Sigmoid`, `GELU`, `LeakyReLU`, `Softmax`, `LayerNorm`, `BatchNorm1d`, `BatchNorm2d`,
   `AvgPool2d`, `MaxPool2d`, `Dropout`, `MultiHeadAttention`,
   `TransformerBlock`, `Embedding`,
   `Sequential`, `SGD`, `Adam`, `AdamW`, `clip_grad_norm_`, `StepLR`,
