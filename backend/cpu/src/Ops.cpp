@@ -351,6 +351,94 @@ void matmul_tn(const float* a, const float* b, float* out, int64_t reduce, int64
 #endif
 }
 
+namespace {
+// Shared by batched_matmul/_nt/_tn below: for every index in the
+// broadcast output batch shape, the element offset into a's own (and
+// b's own) batch region -- reusing broadcast_strides (above), the same
+// stride-0-for-a-broadcast-axis trick add/sub/mul's own broadcasting
+// kernels already share. Computed once, up front, rather than
+// re-decomposing the batch coordinate inside each of the three
+// functions' own per-item loop.
+struct BatchOffsets {
+    std::vector<int64_t> a_offsets, b_offsets;
+};
+
+BatchOffsets compute_batch_offsets(const int64_t* a_batch_shape, int64_t a_batch_rank,
+                                    const int64_t* b_batch_shape, int64_t b_batch_rank,
+                                    const int64_t* out_batch_shape, int64_t out_batch_rank) {
+    std::vector<int64_t> a_strides(static_cast<size_t>(out_batch_rank));
+    std::vector<int64_t> b_strides(static_cast<size_t>(out_batch_rank));
+    broadcast_strides(a_batch_shape, a_batch_rank, out_batch_rank, a_strides.data());
+    broadcast_strides(b_batch_shape, b_batch_rank, out_batch_rank, b_strides.data());
+
+    std::vector<int64_t> out_strides(static_cast<size_t>(out_batch_rank));
+    if (out_batch_rank > 0) {
+        out_strides[static_cast<size_t>(out_batch_rank - 1)] = 1;
+        for (int64_t i = out_batch_rank - 2; i >= 0; --i)
+            out_strides[static_cast<size_t>(i)] = out_strides[static_cast<size_t>(i + 1)] * out_batch_shape[i + 1];
+    }
+
+    int64_t num_batches = 1;
+    for (int64_t i = 0; i < out_batch_rank; ++i) num_batches *= out_batch_shape[i];
+
+    BatchOffsets result;
+    result.a_offsets.resize(static_cast<size_t>(num_batches));
+    result.b_offsets.resize(static_cast<size_t>(num_batches));
+    std::vector<int64_t> coord(static_cast<size_t>(out_batch_rank));
+    for (int64_t idx = 0; idx < num_batches; ++idx) {
+        int64_t rem = idx;
+        for (int64_t d = 0; d < out_batch_rank; ++d) {
+            coord[d] = rem / out_strides[d];
+            rem %= out_strides[d];
+        }
+        int64_t aoff = 0, boff = 0;
+        for (int64_t d = 0; d < out_batch_rank; ++d) {
+            aoff += coord[d] * a_strides[d];
+            boff += coord[d] * b_strides[d];
+        }
+        result.a_offsets[static_cast<size_t>(idx)] = aoff;
+        result.b_offsets[static_cast<size_t>(idx)] = boff;
+    }
+    return result;
+}
+} // namespace
+
+void batched_matmul(const float* a, const int64_t* a_batch_shape, int64_t a_batch_rank,
+                     const float* b, const int64_t* b_batch_shape, int64_t b_batch_rank,
+                     const int64_t* out_batch_shape, int64_t out_batch_rank,
+                     int64_t M, int64_t K, int64_t N, float* out) {
+    auto offs = compute_batch_offsets(a_batch_shape, a_batch_rank, b_batch_shape, b_batch_rank,
+                                       out_batch_shape, out_batch_rank);
+    for (size_t idx = 0; idx < offs.a_offsets.size(); ++idx) {
+        matmul(a + offs.a_offsets[idx] * M * K, b + offs.b_offsets[idx] * K * N,
+               out + static_cast<int64_t>(idx) * M * N, M, K, N);
+    }
+}
+
+void batched_matmul_nt(const float* a, const int64_t* a_batch_shape, int64_t a_batch_rank,
+                        const float* b, const int64_t* b_batch_shape, int64_t b_batch_rank,
+                        const int64_t* out_batch_shape, int64_t out_batch_rank,
+                        int64_t rows, int64_t reduce, int64_t cols, float* out) {
+    auto offs = compute_batch_offsets(a_batch_shape, a_batch_rank, b_batch_shape, b_batch_rank,
+                                       out_batch_shape, out_batch_rank);
+    for (size_t idx = 0; idx < offs.a_offsets.size(); ++idx) {
+        matmul_nt(a + offs.a_offsets[idx] * rows * reduce, b + offs.b_offsets[idx] * cols * reduce,
+                  out + static_cast<int64_t>(idx) * rows * cols, rows, reduce, cols);
+    }
+}
+
+void batched_matmul_tn(const float* a, const int64_t* a_batch_shape, int64_t a_batch_rank,
+                        const float* b, const int64_t* b_batch_shape, int64_t b_batch_rank,
+                        const int64_t* out_batch_shape, int64_t out_batch_rank,
+                        int64_t reduce, int64_t rows, int64_t cols, float* out) {
+    auto offs = compute_batch_offsets(a_batch_shape, a_batch_rank, b_batch_shape, b_batch_rank,
+                                       out_batch_shape, out_batch_rank);
+    for (size_t idx = 0; idx < offs.a_offsets.size(); ++idx) {
+        matmul_tn(a + offs.a_offsets[idx] * reduce * rows, b + offs.b_offsets[idx] * reduce * cols,
+                  out + static_cast<int64_t>(idx) * rows * cols, reduce, rows, cols);
+    }
+}
+
 float reduce_sum(const float* x, int64_t n) {
     float acc = 0.0f;
     for (int64_t i = 0; i < n; ++i) acc += x[i];

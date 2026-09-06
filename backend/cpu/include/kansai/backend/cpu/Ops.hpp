@@ -145,6 +145,37 @@ void matmul_nt(const float* a, const float* b, float* out, int64_t rows, int64_t
 // grad_output needs.
 void matmul_tn(const float* a, const float* b, float* out, int64_t reduce, int64_t rows, int64_t cols);
 
+// Batched matmul: `a` and `b` each have their own "batch shape" (every
+// dim except the trailing two, which are the actual M/K/N matrix dims)
+// -- broadcast against each other via the same NumPy-style rule add/
+// sub/mul's own broadcasting already uses (right-aligned, size-1 dims
+// stretch; a rank-0 batch, an ordinary 2D tensor, broadcasts against
+// any batch shape by reading its one matrix repeatedly). `out_batch`
+// is that broadcast result, already computed by the caller (Tensor::
+// matmul, reusing its own broadcast_shapes helper) -- these functions
+// only need it to know how many (M,K)x(K,N) pairs to iterate and where
+// to read each one from (a stride-0 read for whichever operand is
+// smaller along a given batch axis, via the same broadcast_strides
+// helper add/sub/mul's own broadcasting kernels already share). Each
+// calls the existing 2D matmul/matmul_nt/matmul_tn once per batch item
+// -- no separate batched GEMM logic, just broadcast-aware indexing
+// around the same Accelerate-backed kernel every other op already uses.
+// _nt/_tn are what Tensor::matmul's own batched backward needs, the
+// same way the plain (non-batched) matmul_nt/matmul_tn above are what
+// the 2D case's backward needs.
+void batched_matmul(const float* a, const int64_t* a_batch_shape, int64_t a_batch_rank,
+                     const float* b, const int64_t* b_batch_shape, int64_t b_batch_rank,
+                     const int64_t* out_batch_shape, int64_t out_batch_rank,
+                     int64_t M, int64_t K, int64_t N, float* out);
+void batched_matmul_nt(const float* a, const int64_t* a_batch_shape, int64_t a_batch_rank,
+                        const float* b, const int64_t* b_batch_shape, int64_t b_batch_rank,
+                        const int64_t* out_batch_shape, int64_t out_batch_rank,
+                        int64_t rows, int64_t reduce, int64_t cols, float* out);
+void batched_matmul_tn(const float* a, const int64_t* a_batch_shape, int64_t a_batch_rank,
+                        const float* b, const int64_t* b_batch_shape, int64_t b_batch_rank,
+                        const int64_t* out_batch_shape, int64_t out_batch_rank,
+                        int64_t reduce, int64_t rows, int64_t cols, float* out);
+
 float reduce_sum(const float* x, int64_t n);
 
 // out += alpha * x, in place. Not autograd-tracked — used by optimizers.

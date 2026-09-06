@@ -304,30 +304,106 @@ Tensor Tensor::mul(const Tensor& other) const {
 Tensor Tensor::matmul(const Tensor& other) const {
     const Tensor& a = *this;
     const Tensor& b = other;
-    if (a.ndim() != 2 || b.ndim() != 2 || a.shape()[1] != b.shape()[0])
-        throw std::runtime_error("matmul: incompatible shapes");
 
-    int64_t M = a.shape()[0], K = a.shape()[1], N = b.shape()[1];
-    Tensor out = Tensor::zeros({M, N}, false);
-    cpu::matmul(a.data_ptr(), b.data_ptr(), out.data_ptr(), M, K, N);
+    if (a.ndim() == 2 && b.ndim() == 2) {
+        // The common case keeps its own exact, unchanged fast path --
+        // no batch-broadcast bookkeeping, no behavior change from
+        // before batched matmul existed.
+        if (a.shape()[1] != b.shape()[0])
+            throw std::runtime_error("matmul: incompatible shapes");
+
+        int64_t M = a.shape()[0], K = a.shape()[1], N = b.shape()[1];
+        Tensor out = Tensor::zeros({M, N}, false);
+        cpu::matmul(a.data_ptr(), b.data_ptr(), out.data_ptr(), M, K, N);
+
+        if (a.requires_grad() || b.requires_grad()) {
+            auto node = std::make_shared<GradNode>();
+            node->name = "matmul";
+            node->inputs = {a, b};
+            node->backward_fn = [a, b, M, K, N](const Tensor& grad_output) -> std::vector<Tensor> {
+                Tensor grad_a = Tensor::zeros({M, K}, false);
+                cpu::matmul_nt(grad_output.data_ptr(), b.data_ptr(), grad_a.data_ptr(), M, N, K);
+                Tensor grad_b = Tensor::zeros({K, N}, false);
+                cpu::matmul_tn(a.data_ptr(), grad_output.data_ptr(), grad_b.data_ptr(), M, K, N);
+                return {grad_a, grad_b};
+            };
+            out.set_grad_node(node);
+            out.set_requires_grad(true);
+        }
+        return out;
+    }
+
+    // Batched path: at least one operand has rank > 2. The trailing two
+    // dims of each are the real matrix dims (M,K) and (K,N); everything
+    // before that broadcasts via the same NumPy-style rule add/sub/mul's
+    // own broadcast_shapes already implements (a rank-2 operand simply
+    // has an empty/rank-0 batch shape, which broadcasts against any
+    // batch shape by reading its one matrix repeatedly -- the "a shared
+    // weight applied across a batch" case).
+    if (a.ndim() < 2 || b.ndim() < 2)
+        throw std::runtime_error("matmul: both operands must be at least 2D");
+    int64_t M = a.shape()[a.ndim() - 2], Ka = a.shape()[a.ndim() - 1];
+    int64_t Kb = b.shape()[b.ndim() - 2], N = b.shape()[b.ndim() - 1];
+    if (Ka != Kb)
+        throw std::runtime_error("matmul: inner dimensions don't match");
+    int64_t K = Ka;
+
+    std::vector<int64_t> a_batch(a.shape().begin(), a.shape().end() - 2);
+    std::vector<int64_t> b_batch(b.shape().begin(), b.shape().end() - 2);
+    std::vector<int64_t> out_batch = broadcast_shapes(a_batch, b_batch, "matmul");
+
+    std::vector<int64_t> out_shape = out_batch;
+    out_shape.push_back(M);
+    out_shape.push_back(N);
+
+    Tensor out = Tensor::zeros(out_shape, false);
+    cpu::batched_matmul(a.data_ptr(), a_batch.data(), static_cast<int64_t>(a_batch.size()), b.data_ptr(),
+                         b_batch.data(), static_cast<int64_t>(b_batch.size()), out_batch.data(),
+                         static_cast<int64_t>(out_batch.size()), M, K, N, out.data_ptr());
 
     if (a.requires_grad() || b.requires_grad()) {
         auto node = std::make_shared<GradNode>();
         node->name = "matmul";
         node->inputs = {a, b};
-        node->backward_fn = [a, b, M, K, N](const Tensor& grad_output) -> std::vector<Tensor> {
-            // grad_a = grad_output (M,N) @ b(K,N)^T -> (M,K). b's transpose
-            // is never materialized -- matmul_nt reads b's own (K,N)
-            // layout directly (BLAS's CblasTrans, or the fallback's
-            // swapped indexing).
-            Tensor grad_a = Tensor::zeros({M, K}, false);
-            cpu::matmul_nt(grad_output.data_ptr(), b.data_ptr(), grad_a.data_ptr(), M, N, K);
+        auto a_shape = a.shape();
+        auto b_shape = b.shape();
+        node->backward_fn = [a, b, a_shape, b_shape, a_batch, b_batch, out_batch, M, K, N](
+                                 const Tensor& grad_output) -> std::vector<Tensor> {
+            // grad_a_full (out_batch,M,K) = grad_output (out_batch,M,N)
+            // @ b(out_batch,K,N)^T, at the FULL broadcast batch shape
+            // first (mirroring the 2D case's matmul_nt call, batched);
+            // reduced down to a's own (possibly smaller) batch shape
+            // afterward, exactly the same "compute at the broadcast
+            // shape, then reduce_to_shape" pattern general add/sub/mul
+            // broadcasting already established.
+            std::vector<int64_t> full_a_shape = out_batch;
+            full_a_shape.push_back(M);
+            full_a_shape.push_back(K);
+            Tensor grad_a_full = Tensor::zeros(full_a_shape, false);
+            cpu::batched_matmul_nt(grad_output.data_ptr(), out_batch.data(), static_cast<int64_t>(out_batch.size()),
+                                    b.data_ptr(), b_batch.data(), static_cast<int64_t>(b_batch.size()),
+                                    out_batch.data(), static_cast<int64_t>(out_batch.size()), M, N, K,
+                                    grad_a_full.data_ptr());
 
-            // grad_b = a(M,K)^T @ grad_output(M,N) -> (K,N). Same idea,
-            // transposing a instead of b.
-            Tensor grad_b = Tensor::zeros({K, N}, false);
-            cpu::matmul_tn(a.data_ptr(), grad_output.data_ptr(), grad_b.data_ptr(), M, K, N);
+            std::vector<int64_t> full_b_shape = out_batch;
+            full_b_shape.push_back(K);
+            full_b_shape.push_back(N);
+            Tensor grad_b_full = Tensor::zeros(full_b_shape, false);
+            cpu::batched_matmul_tn(a.data_ptr(), a_batch.data(), static_cast<int64_t>(a_batch.size()),
+                                    grad_output.data_ptr(), out_batch.data(), static_cast<int64_t>(out_batch.size()),
+                                    out_batch.data(), static_cast<int64_t>(out_batch.size()), M, K, N,
+                                    grad_b_full.data_ptr());
 
+            Tensor grad_a = (a_shape == full_a_shape) ? grad_a_full : Tensor::zeros(a_shape, false);
+            if (a_shape != full_a_shape)
+                cpu::reduce_to_shape(grad_a_full.data_ptr(), full_a_shape.data(),
+                                      static_cast<int64_t>(full_a_shape.size()), a_shape.data(), a.ndim(),
+                                      grad_a.data_ptr());
+            Tensor grad_b = (b_shape == full_b_shape) ? grad_b_full : Tensor::zeros(b_shape, false);
+            if (b_shape != full_b_shape)
+                cpu::reduce_to_shape(grad_b_full.data_ptr(), full_b_shape.data(),
+                                      static_cast<int64_t>(full_b_shape.size()), b_shape.data(), b.ndim(),
+                                      grad_b.data_ptr());
             return {grad_a, grad_b};
         };
         out.set_grad_node(node);

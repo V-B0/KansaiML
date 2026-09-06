@@ -1609,6 +1609,72 @@ cross_entropy`) trained on a synthetic 3-class image task, reaching
 100% accuracy -- proving `MaxPool2d`'s gradient composes correctly
 through a real `Conv2d` backward, not just in isolation.
 
+## Batched matmul
+
+`matmul` required both operands to be exactly 2D -- the single biggest
+concrete gap standing between this project and multi-head attention,
+which fundamentally needs `(batch, heads, seq, d_k) @ (batch, heads,
+d_k, seq)`. Closed by treating every dimension except the trailing two
+as a NumPy-style broadcastable "batch" shape -- the exact same right-
+aligned rule `add`/`sub`/`mul`'s own general broadcasting already
+established two sections back, just applied to the dims *before* the
+actual `M`/`K`/`N` matrix contraction instead of to the whole shape. A
+rank-2 operand (the ordinary case) has an empty, rank-0 batch shape,
+which broadcasts against any other batch shape by reading its one
+matrix repeatedly -- "a shared weight matrix applied across an entire
+batch" falls out of the general rule for free, not as a special case.
+
+Reuses everything broadcasting already built rather than duplicating
+it: `broadcast_strides` (the stride-0-for-a-broadcast-axis trick,
+`backend/cpu`) drives three new batch-aware wrappers
+(`batched_matmul`/`_nt`/`_tn`), each just an outer loop over every
+broadcast batch index calling the EXISTING 2D `matmul`/`matmul_nt`/
+`matmul_tn` once per item -- no new GEMM logic, only broadcast-aware
+indexing around the same Accelerate-backed kernel every other op
+already uses. Backward computes `grad_a`/`grad_b` at the *full*
+broadcast batch shape first (via the same batched `_nt`/`_tn` calls),
+then reduces down to whichever operand's own batch shape was smaller
+via `reduce_to_shape` -- the identical "compute broadcast, then reduce"
+pattern general `add`/`sub`/`mul` broadcasting's own backward already
+uses, not a new one invented for this. The exact 2D+2D case keeps its
+own original code path completely unchanged -- no batch-broadcast
+bookkeeping, no behavior change, checked directly as a regression.
+
+A real bug surfaced and fixed during this work, the same way the
+`_metal_elementwise_kind` broadcasting bug was caught during the
+broadcasting section: `run_metal`'s own `"matmul"` dispatch called
+`metal_matmul_mps` (Metal's own GEMM, 2D-only) *unconditionally* --
+correct before batched matmul existed, a guaranteed crash afterward on
+anything with a batch dimension. Caught before it shipped by the test
+suite's own `run_metal` check on a 4D input, not discovered by a user
+later; fixed with the same honest CPU fallback `reshape`/`transpose`/
+`leaky_relu`/etc. already use in `run_metal` for ops without a Metal
+kernel of their own.
+
+One real, stated gap this does NOT close, on purpose: `kir.grad`'s own
+`_vjp_matmul` still emits `"matmul_nt"`/`"matmul_tn"` nodes, and
+`core.matmul_nt`/`matmul_tn` (the `GradOps`-level functions those nodes
+call) are themselves still 2D-only -- extending them to batched form
+would need their own `batched_matmul_nt`/`_tn`-equivalent exposed all
+the way through `GradOps`/bindings/KIR, real, separate work not
+attempted here. This is the *same* pre-existing gap `conv2d` already
+had with `kir.grad` (never fixed either, stated honestly at the time),
+not a new one introduced by this section -- eager `.backward()`
+differentiates a batched matmul correctly right now (verified
+extensively below); `kir.grad` on a graph containing one fails with a
+clear error instead of silently computing something wrong.
+
+Verified: forward values against an independent from-scratch nested-
+loop matmul (not Kansai's own matmul called a different way, which
+could share a bug with the implementation under test) for the matching-
+batch case, the real 4D attention shape specifically, and both
+broadcast directions (a shared 2D weight across a batch, and a batch
+dimension of size 1 stretching to match the other operand's); backward
+against central differences for both the matching-batch and the
+broadcast case; the full KIR forward path (`trace` → `run`/`run_fused`/
+`run_metal`, the last of which is exactly where the bug above was
+caught); and `kir.grad`'s documented gap confirmed to fail cleanly.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

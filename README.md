@@ -45,6 +45,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — Real benchmark | MNIST end to end: **97.58% test accuracy**, 31.7s | ✅ done |
 | — `detach()` | Cut a value from the autograd graph — a real view, O(1) | ✅ done |
 | — Pooling/regularization | `AvgPool2d`, `MaxPool2d` (real argmax gradient), `Dropout` | ✅ done |
+| — Batched matmul | Any rank ≥ 2, NumPy-style batch-dim broadcasting | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -133,7 +134,15 @@ across it — reusing the existing, deliberately non-differentiable
 gradient, a real trap caught before it shipped), and a real
 `Conv2d → ReLU → MaxPool2d → Linear → cross_entropy` CNN reaches 100%
 accuracy on a synthetic image task, proving that gradient composes
-correctly through a real `Conv2d` backward, not just in isolation.
+correctly through a real `Conv2d` backward, not just in isolation;
+`matmul` now handles any rank ≥ 2 with NumPy-style batch-dim
+broadcasting — `(batch, heads, seq, d_k) @ (batch, heads, d_k, seq)`,
+the shape multi-head attention needs, checked against an independent
+nested-loop reference, backward included. A real bug surfaced and
+fixed along the way: `run_metal`'s own matmul dispatch called Metal's
+2D-only GEMM kernel unconditionally, which would have crashed on
+anything batched — caught by the test suite itself, not a user, fixed
+with the same CPU-fallback pattern other Metal-less ops already use.
 
 ## Why
 

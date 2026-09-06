@@ -155,11 +155,31 @@ class TraceValue:
         return self._binop(other, "mul", _broadcast_shape(self.shape, other.shape, "mul"))
 
     def matmul(self, other):
+        # Mirrors Tensor::matmul's own two paths (core/src/Tensor.cpp):
+        # forward shape computation is exactly what's needed here, so
+        # this stays in sync with it -- but see this project's own
+        # devlog for a real, stated gap this does NOT close:
+        # kir.grad's _vjp_matmul is still 2D-only (it emits "matmul_nt"/
+        # "matmul_tn" nodes, and core.matmul_nt/matmul_tn are themselves
+        # 2D-only), the same pre-existing gap conv2d already has with
+        # kir.grad. Forward tracing/run()/run_metal() all get batched
+        # matmul for real (they just call Tensor::matmul, which now
+        # handles it); kir.grad through a batched matmul node does not,
+        # yet.
         other = self._coerce(other)
-        if len(self.shape) != 2 or len(other.shape) != 2 or self.shape[1] != other.shape[0]:
-            raise ValueError(f"matmul: incompatible shapes {self.shape} vs {other.shape}")
-        out_shape = [self.shape[0], other.shape[1]]
-        return self._binop(other, "matmul", out_shape)
+        if len(self.shape) == 2 and len(other.shape) == 2:
+            if self.shape[1] != other.shape[0]:
+                raise ValueError(f"matmul: incompatible shapes {self.shape} vs {other.shape}")
+            return self._binop(other, "matmul", [self.shape[0], other.shape[1]])
+
+        if len(self.shape) < 2 or len(other.shape) < 2:
+            raise ValueError(f"matmul: both operands must be at least 2D, got {self.shape} vs {other.shape}")
+        M, Ka = self.shape[-2], self.shape[-1]
+        Kb, N = other.shape[-2], other.shape[-1]
+        if Ka != Kb:
+            raise ValueError(f"matmul: inner dimensions don't match {self.shape} vs {other.shape}")
+        out_batch = _broadcast_shape(self.shape[:-2], other.shape[:-2], "matmul")
+        return self._binop(other, "matmul", out_batch + [M, N])
 
     def conv2d(self, weight, bias, stride, padding):
         weight = self._coerce(weight)
@@ -1531,8 +1551,14 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
         flush_chain()  # this node isn't chainable -- dispatch whatever was pending first
 
         if node.op == "matmul":
+            # metal_matmul_mps is 2D-only (no Metal batched-GEMM kernel
+            # exists) -- fall back to the CPU eager path (which now
+            # handles batched/broadcast matmul directly) for anything
+            # else, the same honest fallback reshape/transpose/slice/
+            # cat/leaky_relu/etc. already take here for an identical
+            # reason.
             a, b = (values[i] for i in node.inputs)
-            values[node.id] = core.metal_matmul_mps(a, b)
+            values[node.id] = core.metal_matmul_mps(a, b) if len(a.shape) == 2 and len(b.shape) == 2 else a.matmul(b)
             continue
         if node.op == "fused_sub_square":
             a, b = (values[i] for i in node.inputs)
