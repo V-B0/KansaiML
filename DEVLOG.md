@@ -1675,6 +1675,69 @@ broadcast case; the full KIR forward path (`trace` → `run`/`run_fused`/
 `run_metal`, the last of which is exactly where the bug above was
 caught); and `kir.grad`'s documented gap confirmed to fail cleanly.
 
+## MultiHeadAttention
+
+The capstone this whole recent stretch of sections was actually
+building toward: standard scaled dot-product multi-head attention --
+`softmax(Q W_q (K W_k)^T / sqrt(d_k)) (V W_v) W_o`, split across
+`num_heads` independent heads -- general cross-attention (`query`,
+`key`, `value` can be different tensors with different sequence
+lengths; ordinary self-attention is just `mha(x, x, x)`).
+
+Only reachable now because two things landed together in this same
+session: batched matmul (previous section) and `softmax(dim)` (several
+sections back). `Q`/`K`/`V` here are genuinely 4D --
+`(batch, num_heads, seq, d_k)` -- and every matmul inside (`Q @ K^T`,
+`weights @ V`) is a REAL batched matmul over `(batch, num_heads)`, not
+a Python-level loop calling 2D matmul once per head. Splitting and
+merging heads is `reshape` + `transpose` (already existing, already
+correct for this exact use before today); the `1/sqrt(d_k)` scale
+reuses the same shape-`[1]`-broadcast-constant idiom `Adam`/
+`BatchNorm1d` already established. The entire class is a pure
+composition -- no new kernel, `GradNode`, or KIR work of its own,
+compounding the same payoff `LayerNorm`/`softmax`/`AvgPool2d` each got
+individually, now all at once in one real, useful layer.
+
+The optional `mask` is ADDITIVE (broadcast-added to the raw scores
+before `softmax`), not a boolean selection -- a real design constraint,
+not a stylistic choice: Kansai has no `where`/comparison-op/boolean-
+masking primitive yet (a real, stated gap in this project's own feature
+inventory), so an additive mask is what makes masking possible AT ALL
+right now, using only `add`, which already exists and is already
+broadcasting-aware. Using an actual `-inf` for masked positions was
+deliberately avoided in favor of a large negative finite number -- the
+textbook `-inf` choice produces `NaN` the instant every score in a row
+is masked (`softmax`'s numerator becomes `exp(-inf - (-inf))`, an
+indeterminate `0/0` after the max-subtraction step), a real numerical
+trap most naive attention implementations don't think to check for
+until it actually happens.
+
+Eager-only in practice, though not by an enforced restriction the way
+`BatchNorm1d`'s training path or `MaxPool2d` are: nothing here refuses
+to trace, but `kir.grad`'s own matmul vjp rule is 2D-only (this
+project's own stated, pre-existing gap, same as `conv2d`'s), so
+differentiating a graph built from this via `kir.grad` would hit that
+limitation. Eager `.backward()` is unaffected, and is what every check
+below actually verifies.
+
+Verified: output shapes for self-attention and cross-attention
+(different query/key sequence lengths, confirming this isn't secretly
+self-attention-only); forward values against a from-scratch single-head
+(`num_heads=1`) attention implementation in plain Python -- not
+Kansai's own ops called a different way, which could share a bug with
+the real implementation; backward against central differences,
+checked for the input AND confirmed that all four projection weights
+(`w_q`/`w_k`/`w_v`/`w_o`) actually receive a gradient, not just the
+easiest one to check; an additive causal mask confirmed to zero
+attention to every future position while each row's weights still sum
+to exactly 1 (not inferred from "the loss looks reasonable" -- read
+directly off the attention weights themselves); and, practically, a
+small attention-based sequence classifier (`MultiHeadAttention` →
+mean-pool → `Linear` → `cross_entropy`) trained on a synthetic task --
+each sequence carries a class-specific "marker" vector planted at a
+RANDOM position among distractors, so the model has to find it
+regardless of where it lands -- reaching 100% accuracy.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

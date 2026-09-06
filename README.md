@@ -46,6 +46,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — `detach()` | Cut a value from the autograd graph — a real view, O(1) | ✅ done |
 | — Pooling/regularization | `AvgPool2d`, `MaxPool2d` (real argmax gradient), `Dropout` | ✅ done |
 | — Batched matmul | Any rank ≥ 2, NumPy-style batch-dim broadcasting | ✅ done |
+| — MultiHeadAttention | Real scaled dot-product attention, cross-attention, masking | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -142,7 +143,14 @@ nested-loop reference, backward included. A real bug surfaced and
 fixed along the way: `run_metal`'s own matmul dispatch called Metal's
 2D-only GEMM kernel unconditionally, which would have crashed on
 anything batched — caught by the test suite itself, not a user, fixed
-with the same CPU-fallback pattern other Metal-less ops already use.
+with the same CPU-fallback pattern other Metal-less ops already use;
+`MultiHeadAttention` (real scaled dot-product attention with genuinely
+batched `Q@K^T`/`weights@V`, general cross-attention, and an additive
+mask for causal/decoder-style use) matches a from-scratch single-head
+Python reference exactly, a causal mask is checked to zero every
+future-position weight while each row still sums to 1, and a small
+attention-based sequence classifier reaches 100% accuracy on a
+synthetic "find the marker at a random position" task.
 
 ## Why
 
@@ -241,7 +249,8 @@ Python (Tensor, nn.Module, optim)
   format
 - `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`, `Tanh`,
   `Sigmoid`, `GELU`, `LeakyReLU`, `Softmax`, `LayerNorm`, `BatchNorm1d`,
-  `AvgPool2d`, `MaxPool2d`, `Dropout`, `Sequential`, `SGD`, `Adam`
+  `AvgPool2d`, `MaxPool2d`, `Dropout`, `MultiHeadAttention`,
+  `Sequential`, `SGD`, `Adam`
 - `tests/` — every claim above, checked: numerical gradient checks,
   cross-checks between independent implementations, and benchmarks that
   assert real speedups rather than just printing numbers

@@ -268,6 +268,97 @@ class LayerNorm(Module):
         return normalized.mul(self.weight).add(self.bias)
 
 
+class MultiHeadAttention(Module):
+    """Standard scaled dot-product multi-head attention ("Attention Is
+    All You Need"): `softmax(Q W_q (K W_k)^T / sqrt(d_k)) (V W_v) W_o`,
+    split across `num_heads` independent heads. General cross-attention
+    (`query`, `key`, `value` may be different tensors, and `key`/`value`
+    may have a different sequence length than `query`) -- ordinary
+    self-attention is just `mha(x, x, x)`.
+
+    Only reachable now because two things this project just built landed
+    together: batched matmul (this section's own previous entry -- Q/K/V
+    here are 4D, `(batch, num_heads, seq, d_k)`, and every matmul below
+    is genuinely batched over `(batch, num_heads)`, not a Python-level
+    loop over 2D calls) and `softmax(dim)` (a few sections back). Every
+    other piece -- splitting/merging heads via `reshape` + `transpose`,
+    the `1/sqrt(d_k)` scale via the same shape-`[1]`-broadcast-constant
+    idiom `Adam`/`BatchNorm1d` already use, the optional additive mask
+    -- was already sitting there waiting to be composed; this class adds
+    no new kernel, `GradNode`, or KIR work of its own at all, the same
+    "pure composition" payoff `LayerNorm`/`softmax`/`AvgPool2d` above
+    already got, now compounding across all of them at once.
+
+    `mask`, if given, is ADDITIVE (broadcast-added to the raw scores
+    before `softmax`, typically `0` where allowed and a large negative
+    number -- not literal `-inf`, which would produce `NaN` the moment
+    every score in a row is masked and `softmax`'s `exp(0)` values all
+    still sum to a real, if tiny, number -- where forbidden, e.g. a
+    causal mask for a decoder). The additive-mask convention (rather
+    than a boolean mask selecting positions) is deliberate, not just
+    convenient: Kansai has no `where`/comparison-op/boolean-masking
+    primitive yet, so an additive mask -- expressible with `add`, which
+    already exists and is already broadcasting-aware -- is what makes
+    masking possible AT ALL right now, not a stylistic preference over
+    an equally-easy alternative.
+
+    Eager-only in practice, not by an enforced restriction: nothing
+    here calls anything that would refuse to trace, but `kir.grad`'s
+    matmul vjp rule is 2D-only (previous section's own stated gap), so
+    a graph built from this and differentiated via `kir.grad` would hit
+    that same limitation. Eager `.backward()` is unaffected and is what
+    every test/training loop below actually verifies.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, seed: int = 0):
+        if d_model % num_heads != 0:
+            raise ValueError(f"MultiHeadAttention: d_model={d_model} must be divisible by num_heads={num_heads}")
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        std = 1.0 / math.sqrt(d_model)
+        self.w_q = randn([d_model, d_model], std=std, requires_grad=True, seed=seed)
+        self.w_k = randn([d_model, d_model], std=std, requires_grad=True, seed=seed + 1)
+        self.w_v = randn([d_model, d_model], std=std, requires_grad=True, seed=seed + 2)
+        self.w_o = randn([d_model, d_model], std=std, requires_grad=True, seed=seed + 3)
+
+    def _split_heads(self, x, batch, seq):
+        # (batch, seq, d_model) -> (batch, num_heads, seq, d_k). Reshape
+        # first (splitting d_model into (num_heads, d_k), a real
+        # row-major reshape, not a relayout) then transpose seq and
+        # num_heads into place -- a genuine data permutation, so the
+        # RESULT is freshly contiguous, unlike PyTorch's own transpose
+        # (Kansai has no non-contiguous-view concept at all, so there's
+        # no separate .contiguous() step needed before the reshape two
+        # calls later merges the heads back).
+        return x.reshape([batch, seq, self.num_heads, self.d_k]).transpose(1, 2)
+
+    def _merge_heads(self, x, batch, seq):
+        # The exact inverse of _split_heads.
+        return x.transpose(1, 2).reshape([batch, seq, self.d_model])
+
+    def forward(self, query, key, value, mask=None):
+        batch, seq_q, _ = query.shape
+        _, seq_k, _ = key.shape
+
+        q = self._split_heads(query.matmul(self.w_q), batch, seq_q)
+        k = self._split_heads(key.matmul(self.w_k), batch, seq_k)
+        v = self._split_heads(value.matmul(self.w_v), batch, seq_k)
+
+        scale = core.from_flat([1.0 / math.sqrt(self.d_k)], [1])
+        # q @ k^T: (batch, heads, seq_q, d_k) @ (batch, heads, d_k, seq_k)
+        # -> (batch, heads, seq_q, seq_k) -- a genuinely batched matmul
+        # over (batch, heads) both times, not a per-head Python loop.
+        scores = q.matmul(k.transpose(2, 3)).mul(scale)
+        if mask is not None:
+            scores = scores.add(mask)
+        weights = scores.softmax(3)  # over seq_k, the last axis
+        attended = weights.matmul(v)  # (batch, heads, seq_q, d_k)
+
+        merged = self._merge_heads(attended, batch, seq_q)
+        return merged.matmul(self.w_o)
+
+
 class BatchNorm1d(Module):
     """Normalizes each feature (column) across the batch dimension --
     (batch, num_features) input only; BatchNorm2d for conv activations
