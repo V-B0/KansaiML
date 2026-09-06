@@ -179,6 +179,22 @@ class TraceValue:
         nid = self.graph.add("mean", [self.node_id], [1], self.dtype)
         return TraceValue(self.graph, nid, [1], self.dtype)
 
+    def sqrt(self):
+        nid = self.graph.add("sqrt", [self.node_id], list(self.shape), self.dtype)
+        return TraceValue(self.graph, nid, list(self.shape), self.dtype)
+
+    def reciprocal(self):
+        nid = self.graph.add("reciprocal", [self.node_id], list(self.shape), self.dtype)
+        return TraceValue(self.graph, nid, list(self.shape), self.dtype)
+
+    def div(self, other):
+        # Composed from mul + reciprocal, same as Tensor::div -- traces
+        # to a "reciprocal" node followed by a "mul" node, never a "div"
+        # node itself, so neither gets its own vjp rule or interpreter
+        # dispatch case; mul's and reciprocal's own already cover it.
+        other = self._coerce(other)
+        return self.mul(other.reciprocal())
+
     def reshape(self, shape):
         n = 1
         for d in self.shape:
@@ -274,6 +290,8 @@ _OP_TABLE = {
     "relu": lambda a: a.relu(),
     "sum": lambda a: a.sum(),
     "mean": lambda a: a.mean(),
+    "sqrt": lambda a: a.sqrt(),
+    "reciprocal": lambda a: a.reciprocal(),
     # vjp ops grad() builds backward graphs out of (see the Memory
     # planning section below is where fusion/DCE live; grad() and its
     # vjp rules are further down, in the Autograd section) -- forward-
@@ -978,6 +996,35 @@ def _vjp_cat(bwd, node, primal_id, g_out, by_id):
     return grads
 
 
+def _vjp_sqrt(bwd, node, primal_id, g_out, by_id):
+    """d/dx sqrt(x) = 0.5 / sqrt(x) = 0.5/out -- reuses this node's own
+    (re-embedded) forward output via primal_id[node.id] rather than
+    recomputing sqrt(x) a second time, the same "reuse the primal
+    output, not the input" choice Tensor::sqrt's own eager backward_fn
+    makes (core/src/Tensor.cpp)."""
+    out_shape = node.shape
+    out_primal = primal_id[node.id]
+    recip_out = bwd.add("reciprocal", [out_primal], out_shape, node.dtype)
+    tmp = bwd.add("mul", [g_out, recip_out], out_shape, node.dtype)
+    half_id = bwd.add("constant", [], [1], node.dtype, value=core.from_flat([0.5], [1]))
+    grad_x = bwd.add("mul", [tmp, half_id], out_shape, node.dtype)
+    return [grad_x]
+
+
+def _vjp_reciprocal(bwd, node, primal_id, g_out, by_id):
+    """d/dx (1/x) = -1/x^2 = -out^2 -- same "reuse the primal output"
+    choice as sqrt's vjp above and Tensor::reciprocal's own eager
+    backward_fn. The negation reuses _vjp_sub's own zero-minus-x idiom
+    rather than introducing a separate "-1 constant" pattern."""
+    out_shape = node.shape
+    out_primal = primal_id[node.id]
+    out_sq = bwd.add("mul", [out_primal, out_primal], out_shape, node.dtype)
+    tmp = bwd.add("mul", [g_out, out_sq], out_shape, node.dtype)
+    zero_id = bwd.add("constant", [], out_shape, node.dtype, value=core.zeros(out_shape))
+    grad_x = bwd.add("sub", [zero_id, tmp], out_shape, node.dtype)
+    return [grad_x]
+
+
 _VJP_RULES = {
     "add": _vjp_add,
     "sub": _vjp_sub,
@@ -990,6 +1037,8 @@ _VJP_RULES = {
     "transpose": _vjp_transpose,
     "slice": _vjp_slice,
     "cat": _vjp_cat,
+    "sqrt": _vjp_sqrt,
+    "reciprocal": _vjp_reciprocal,
 }
 
 

@@ -74,6 +74,22 @@ public:
     Tensor sum() const;
     Tensor mean() const;
 
+    // Elementwise sqrt/reciprocal, standard IEEE-754 semantics -- see
+    // backend/cpu's own doc comment for the edge cases (sqrt of a
+    // negative input, reciprocal of zero) this doesn't specially guard.
+    Tensor sqrt() const;
+    Tensor reciprocal() const;
+
+    // a.div(b) == a.mul(b.reciprocal()) -- composed from two already-
+    // autograd-aware ops rather than its own kernel or backward_fn, so
+    // its gradient falls out of mul's and reciprocal's own chain rules
+    // automatically. A real, un-fused cost (two passes -- reciprocal
+    // then multiply -- instead of one division pass) in exchange for
+    // adding a whole new op category for free; a dedicated fused divide
+    // kernel is a real, unattempted future optimization if this ever
+    // shows up as a bottleneck.
+    Tensor div(const Tensor& other) const;
+
     // self: (N, Cin, H, W), weight: (Cout, Cin, kH, kW), bias: (Cout,).
     // Forward is im2col + the same matmul kernel every other op already
     // uses (one call per batch item); backward reuses matmul_nt/matmul_tn

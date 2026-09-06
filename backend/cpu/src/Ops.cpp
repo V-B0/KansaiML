@@ -1,5 +1,6 @@
 #include "kansai/backend/cpu/Ops.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -177,6 +178,22 @@ void relu_fwd(const float* x, float* out, int64_t n) {
 
 void relu_bwd(const float* x, const float* grad_out, float* grad_in, int64_t n) {
     for (int64_t i = 0; i < n; ++i) grad_in[i] = x[i] > 0.0f ? grad_out[i] : 0.0f;
+}
+
+void sqrt_fwd(const float* x, float* out, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) out[i] = std::sqrt(x[i]);
+}
+
+void sqrt_bwd(const float* out, const float* grad_out, float* grad_in, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) grad_in[i] = 0.5f * grad_out[i] / out[i];
+}
+
+void reciprocal_fwd(const float* x, float* out, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) out[i] = 1.0f / x[i];
+}
+
+void reciprocal_bwd(const float* out, const float* grad_out, float* grad_in, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) grad_in[i] = -grad_out[i] * out[i] * out[i];
 }
 
 void matmul(const float* a, const float* b, float* out, int64_t M, int64_t K, int64_t N) {

@@ -467,6 +467,50 @@ Tensor Tensor::mean() const {
     return out;
 }
 
+Tensor Tensor::sqrt() const {
+    const Tensor& x = *this;
+    Tensor out = Tensor::zeros(x.shape(), false);
+    cpu::sqrt_fwd(x.data_ptr(), out.data_ptr(), x.numel());
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "sqrt";
+        node->inputs = {x};
+        node->backward_fn = [out](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(out.shape(), false);
+            cpu::sqrt_bwd(out.data_ptr(), grad_output.data_ptr(), grad_x.data_ptr(), out.numel());
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
+Tensor Tensor::reciprocal() const {
+    const Tensor& x = *this;
+    Tensor out = Tensor::zeros(x.shape(), false);
+    cpu::reciprocal_fwd(x.data_ptr(), out.data_ptr(), x.numel());
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "reciprocal";
+        node->inputs = {x};
+        node->backward_fn = [out](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(out.shape(), false);
+            cpu::reciprocal_bwd(out.data_ptr(), grad_output.data_ptr(), grad_x.data_ptr(), out.numel());
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
+Tensor Tensor::div(const Tensor& other) const {
+    return this->mul(other.reciprocal());
+}
+
 Tensor Tensor::reshape(std::vector<int64_t> new_shape) const {
     const Tensor& x = *this;
     int64_t n = numel_of(new_shape);

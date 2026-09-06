@@ -60,6 +60,17 @@ void reduce_to_shape(const float* grad, const int64_t* grad_shape, int64_t grad_
 void relu_fwd(const float* x, float* out, int64_t n);
 void relu_bwd(const float* x, const float* grad_out, float* grad_in, int64_t n);
 
+// Elementwise sqrt/reciprocal, standard IEEE-754 semantics (sqrt of a
+// negative input is NaN, reciprocal of 0 is +-inf -- same as every
+// other framework, not specially guarded against here). Each backward
+// kernel takes the FORWARD op's own output, not its input: d/dx
+// sqrt(x) = 0.5/sqrt(x) = 0.5/out, and d/dx (1/x) = -1/x^2 = -out^2,
+// so reusing `out` avoids recomputing the sqrt/reciprocal a second time.
+void sqrt_fwd(const float* x, float* out, int64_t n);
+void sqrt_bwd(const float* out, const float* grad_out, float* grad_in, int64_t n);
+void reciprocal_fwd(const float* x, float* out, int64_t n);
+void reciprocal_bwd(const float* out, const float* grad_out, float* grad_in, int64_t n);
+
 // a: (M,K) row-major, b: (K,N) row-major, out: (M,N) row-major
 void matmul(const float* a, const float* b, float* out, int64_t M, int64_t K, int64_t N);
 

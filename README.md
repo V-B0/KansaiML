@@ -39,7 +39,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | 2 — KIR | Tracing, fusion, memory pooling, source-transform autograd | ✅ done |
 | 3 — GPU backend | Real Metal compute (tiled kernel + MPS, full op + Conv2d coverage) | ✅ done |
 | 4 — Distributed | `DeviceMesh`/`DTensor`, distributed gradients, concurrent dispatch, int8 quantization, serialization | ✅ done |
-| — Core ops | `reshape`/`transpose`/`slice`/`cat`, general broadcasting, full autograd + KIR integration | ✅ done |
+| — Core ops | `reshape`/`transpose`/`slice`/`cat`, general broadcasting, `sqrt`/`reciprocal`/`div`, `Adam` | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -95,7 +95,13 @@ confirmed to still take the exact same route they always did, not just
 compute the same numbers — a real routing bug this work surfaced and
 fixed (`run_metal` was one shape-equality check away from silently
 sending a general broadcast through a Metal kernel built for a different
-shape entirely), caught by the test suite failing on first run.
+shape entirely), caught by the test suite failing on first run; `Adam`
+(the standard first/second-moment optimizer, implemented entirely from
+`sqrt`/`div`/broadcasting over existing Tensor ops rather than a
+dedicated kernel) matches a from-scratch independent Python
+re-implementation to float32 precision across five steps of a known
+gradient sequence, and trains the same XOR model `test_xor.py` trains
+with SGD to the same near-zero loss.
 
 ## Why
 
@@ -193,7 +199,7 @@ Python (Tensor, nn.Module, optim)
   to/from disk, a pickle-free length-prefixed-JSON-header + flat-blob
   format
 - `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`,
-  `Sequential`, `SGD`
+  `Sequential`, `SGD`, `Adam`
 - `tests/` — every claim above, checked: numerical gradient checks,
   cross-checks between independent implementations, and benchmarks that
   assert real speedups rather than just printing numbers

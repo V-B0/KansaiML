@@ -1193,6 +1193,82 @@ above -- confirmation that the bias-broadcast case still takes the
 exact same fused/Metal fast paths it always did, not just that it still
 computes the right numbers.
 
+## sqrt, reciprocal, div, and Adam
+
+Kansai had no way to take a square root or divide two tensors at all --
+not a gap anyone had hit yet, because nothing before this needed either
+one: SGD's entire update is one `add_` call. Adam's update rule needs
+both (`sqrt` for the second-moment normalizer, division to apply it),
+so implementing Adam meant adding real elementwise ops first, not
+Adam-specific shortcuts.
+
+`sqrt`/`reciprocal` are ordinary new elementwise ops, following the
+exact same recipe as every op before them: `backend/cpu` kernels
+(`sqrt_fwd`/`sqrt_bwd`, `reciprocal_fwd`/`reciprocal_bwd` -- each
+backward kernel takes the forward op's own *output*, not its input,
+since `d/dx sqrt(x) = 0.5/sqrt(x) = 0.5/out` and `d/dx(1/x) = -1/x^2 =
+-out^2` -- reusing `out` avoids recomputing the sqrt/reciprocal a second
+time), `Tensor` methods with real `GradNode` backward closures, GIL-
+released nanobind bindings, `TraceValue` methods, an `_OP_TABLE` entry
+each, and `kir.grad` vjp rules. Unlike `reshape`/`transpose`/`slice`/
+`cat`, neither needs any attrs (a shape, a pair of dims, a range) --
+just one Tensor in, one Tensor out -- so neither needed special-casing
+in any interpreter's dispatch loop at all: `_OP_TABLE` alone is enough,
+and `run_metal` picks them up through its own existing CPU-fallback path
+for free, the same one `matmul_nt`/`matmul_tn`/`relu_backward`/
+`sum_axis0`/`broadcast_scalar` already use.
+
+`div` isn't its own primitive at all: `Tensor::div(other)` is exactly
+`this->mul(other.reciprocal())`, both at the eager level and in
+`TraceValue`'s own tracing -- so a traced `.div(...)` call records a
+`"reciprocal"` node followed by a `"mul"` node, never a `"div"` node,
+and needs no dedicated backward rule or interpreter dispatch case of
+its own: `mul`'s and `reciprocal`'s own already-correct chain rules
+compose into the right answer automatically. A real, honest cost (two
+elementwise passes -- reciprocal then multiply -- instead of one fused
+division kernel) for skipping an entire new op category; a dedicated
+`div` kernel is real, unattempted future work if this ever shows up as
+a bottleneck.
+
+**Adam** (`python/kansai/optim.py`): the standard per-parameter
+first/second-moment running-average optimizer (Kingma & Ba, 2014) --
+what essentially every real training recipe reaches for by default,
+where plain SGD (the only optimizer this project had before) needs a
+hand-tuned schedule and often momentum on top to converge at a
+comparable rate. No weight decay -- this is the original paper's
+algorithm, not AdamW's decoupled-decay variant, which stays a real,
+separate, unattempted addition rather than an undocumented option
+folded into the same class (PyTorch ships them as two distinct classes
+for exactly this reason: silently changing what "Adam" computes by
+adding a decay term would be a correctness surprise, not a
+convenience).
+
+Implemented entirely in Python over existing Tensor ops -- `mul`,
+`add`, `sub`, `sqrt`, `div`, and general broadcasting for the scalar
+hyperparameters (`beta1`, `1-beta2`, `eps`, and the folded
+learning-rate/bias-correction terms, each built once per `step()` call
+as a shape-`[1]` tensor that broadcasts against any parameter's own
+shape) -- rather than a dedicated C++ optimizer kernel. The same
+"prototype in Python first" tradeoff `distributed.py`'s split/concat
+and `quantize.py`'s (de)quantization already made, and only possible at
+all now that `sqrt`/`div` exist: several separate elementwise passes
+per parameter per step, each its own allocation, instead of one fused
+kernel -- correct and clear before fast, the same call this project's
+history has made every time the two traded off against each other.
+
+Verified two genuinely independent ways: step-by-step against a
+from-scratch Adam re-implementation in plain Python (no `kansai.Tensor`
+anywhere in it, so it can't share a bug with the implementation under
+test), across five steps with a fixed, known gradient sequence -- long
+enough that the running averages' accumulation over time and the bias
+correction terms are both actually exercised, not just a first step
+where `m`/`v` start at zero and a subtly wrong implementation might
+still happen to agree -- matching to float32 precision every step; and
+practically, training the exact same XOR model `test_xor.py` trains
+with SGD, converging to the same near-zero loss bar with Adam instead,
+confirming this is a genuine drop-in optimizer on a real model, not
+just a formula that matches in isolation.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

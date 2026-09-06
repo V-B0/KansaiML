@@ -62,10 +62,14 @@ NB_MODULE(_core, m) {
              nb::call_guard<nb::gil_scoped_release>())
         .def("slice", &Tensor::slice, nb::arg("dim"), nb::arg("start"), nb::arg("stop"),
              nb::call_guard<nb::gil_scoped_release>())
+        .def("sqrt", &Tensor::sqrt, nb::call_guard<nb::gil_scoped_release>())
+        .def("reciprocal", &Tensor::reciprocal, nb::call_guard<nb::gil_scoped_release>())
+        .def("div", &Tensor::div, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
         .def("__add__", &Tensor::add)
         .def("__sub__", &Tensor::sub)
         .def("__mul__", &Tensor::mul)
-        .def("__matmul__", &Tensor::matmul);
+        .def("__matmul__", &Tensor::matmul)
+        .def("__truediv__", &Tensor::div);
 
     m.def("zeros", &Tensor::zeros, nb::arg("shape"), nb::arg("requires_grad") = false);
     m.def("ones", &Tensor::ones, nb::arg("shape"), nb::arg("requires_grad") = false);
