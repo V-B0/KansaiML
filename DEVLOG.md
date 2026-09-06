@@ -2684,6 +2684,32 @@ fix specifically) and the `padding=0` branch; and, practically, a
 small `Conv1d`-based sequence classifier (detecting a short "spike"
 pattern anywhere in a 1D signal) trains to 100% accuracy.
 
+## The larger tinyshakespeare run: results
+
+`train_shakespeare_large.py` (introduced above, alongside `SGD`
+momentum) finished its real run: 2,000 steps in 4,014.8s (2.007s/step
+average) on Apple Silicon CPU, training loss falling from 2.83 to
+1.53, held-out validation perplexity falling from 8.07 (step 500) to
+**6.27** final -- meaningfully better than `train_shakespeare.py`'s
+own 277K-parameter run (8.28 final perplexity), exactly the direction
+more capacity should move it, not asserted but actually observed. No
+crash, no memory growth beyond what the pre-run 150-step check already
+predicted, at any point across the full 67-minute run -- the leak fix
+holding cleanly at 7.6x the original capstone's scale, under real,
+sustained load, not just a short synthetic probe.
+
+Sample generations at this size are a real, visible step up from the
+smaller model's own samples: recognizable character-name FRAGMENTS
+emerging on their own ("WARWICK:", "Second Messer:" -- Shakespeare
+history-play character names this model was never told about
+explicitly, only ever seeing them as characters in the training text),
+more consistent verse-like line structure, and noticeably fewer of the
+smaller model's run-on garbled tokens -- while still, honestly, not
+coherent prose. Reported exactly as observed, the same standard this
+capstone's own docstring commits to: a real, if modest, capacity
+increase produces a real, if modest, quality increase, and nothing
+more should be claimed than that.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

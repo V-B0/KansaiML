@@ -58,6 +58,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — `TransformerBlock` | Pre-LN attention + FFN, both residuals proven structurally, causal masking verified | ✅ done |
 | — Memory leak fix | Permanent `shared_ptr` cycle in exp/sqrt/reciprocal/tanh/sigmoid, found training a real transformer | ✅ fixed |
 | — tinyshakespeare capstone | Real transformer on real text, 2,000 steps, perplexity 10.5→8.28 | ✅ done |
+| — Scaled-up run (7.6x) | 2.1M params, 2,000 steps, perplexity → 6.27, clean under real sustained load | ✅ done |
 | — `no_grad()` | Reentrant context manager, skips graph-building for inference/validation | ✅ done |
 | — `kir.grad` conv2d | Closed the last of the two 2D/gap-scope holes — matmul was the other | ✅ done |
 | — SGD momentum | Heavy-ball + Nesterov, `buf` initialized to `grad` on the first step | ✅ done |
@@ -265,6 +266,20 @@ word shapes, plausible capitalization, character names in roughly the
 right places — without being coherent, exactly what a 277K-parameter
 character model trained for a couple thousand steps should honestly
 produce.
+
+A second run at 7.6x the scale (2,110,913 parameters — wider, deeper,
+longer context, bigger batches — via
+[`train_shakespeare_large.py`](examples/tinyshakespeare/train_shakespeare_large.py),
+kept separate so the numbers above stay fast to reproduce) finished
+clean: 2,000 steps in 4,015s on Apple Silicon CPU, held-out perplexity
+falling to **6.27** — meaningfully better than the smaller run's 8.28,
+the direction more capacity should move it, actually observed rather
+than assumed. No crash and no memory growth across the full 67-minute
+run, the leak fix above holding under real sustained load, not just a
+short probe. Sample generations take a visible step up too —
+recognizable Shakespeare character-name fragments emerging on their
+own ("WARWICK:", "Second Messer:", never told to the model explicitly)
+— while still, honestly, not coherent prose.
 
 Before chasing GPU dispatch as the next lever, it was actually
 measured: eager CPU vs. `kir.trace()` + `run_metal()` on the identical
