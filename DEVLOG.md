@@ -2445,6 +2445,38 @@ Metal kernel, so this exercises the CPU-fallback path `run_metal`
 already uses for reshape/transpose/etc., now proven correct for these
 three as well).
 
+## SGD momentum
+
+Continuing to fill ecosystem gaps: plain `SGD` (a single `add_` per
+step, unchanged as the `momentum=0` default) had no momentum at all --
+a real, previously-missing piece of the optimizer vocabulary next to
+`Adam`/`AdamW`, since without it SGD needs an impractically small,
+carefully hand-tuned learning rate to converge at any reasonable speed
+on anything but a toy problem.
+
+Classic heavy-ball momentum (`buf = momentum*buf + grad`) plus its
+Nesterov variant (`grad + momentum*buf` used as the actual update
+instead of `buf` directly), `buf` initialized to `grad` itself -- not
+zero -- on the first step a parameter's gradient is seen, PyTorch's
+own convention: starting from zero would make the first several
+steps' effective update artificially small while `buf` "warms up"
+toward the true running average, especially at a high momentum like
+0.9.
+
+Verified: `momentum=0` is a byte-for-byte regression against the
+original single-`add_` SGD; both the plain and Nesterov trajectories
+match a from-scratch pure-Python re-implementation of the recurrence
+(not a self-consistency check against the same Tensor ops this
+project's own implementation uses) over several steps of a fixed
+constant gradient; and, practically, on a genuinely ill-conditioned
+loss surface (curvature 100x steeper along one axis than the other,
+where plain gradient descent is textbook-known to oscillate rather
+than progress), momentum reaches under a third of plain SGD's loss at
+the same step budget and learning rate, and Nesterov beats plain
+momentum again on top of that -- not just "the formula type-checks,"
+a real, measured speed difference on the exact kind of surface
+momentum exists to fix.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

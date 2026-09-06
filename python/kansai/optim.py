@@ -1,13 +1,48 @@
 class SGD:
-    def __init__(self, params, lr: float = 0.1):
+    """Plain gradient descent (`momentum=0`, the default -- exactly the
+    original single-`add_` implementation, unchanged), or with classic
+    (Polyak) heavy-ball momentum, or its Nesterov variant. Momentum is
+    the standard trick almost every real SGD recipe reaches for on top
+    of the plain version, since without it convergence needs an
+    impractically small, carefully hand-tuned learning rate to stay
+    stable at any reasonable speed -- plain SGD alone was a real,
+    previously-missing piece of the optimizer vocabulary next to
+    `Adam`/`AdamW`.
+
+    `buf = momentum * buf + grad`, initialized to `grad` itself (not
+    zero) on the very first step a parameter's gradient is seen --
+    PyTorch's own convention, not an arbitrary choice: starting from
+    zero would make the first several steps' effective update
+    artificially small while `buf` "warms up" toward the true running
+    average, especially at a high momentum like 0.9.
+    `nesterov=True` additionally looks one momentum step ahead
+    (`grad + momentum*buf`) before applying the update rather than
+    using `buf` directly -- the well-known "look before you leap"
+    variant that converges faster in practice for the same bookkeeping.
+    """
+
+    def __init__(self, params, lr: float = 0.1, momentum: float = 0.0, nesterov: bool = False):
         self.params = list(params)
         self.lr = lr
+        self.momentum = momentum
+        self.nesterov = nesterov
+        self.buf = [None] * len(self.params)
 
     def step(self):
-        for p in self.params:
+        momentum_t = core.from_flat([self.momentum], [1]) if self.momentum != 0.0 else None
+        for i, p in enumerate(self.params):
             g = p.grad
-            if g is not None:
+            if g is None:
+                continue
+            if self.momentum == 0.0:
                 p.add_(g, -self.lr)
+                continue
+            if self.buf[i] is None:
+                self.buf[i] = core.zeros(list(p.shape)).add(g)
+            else:
+                self.buf[i] = self.buf[i].mul(momentum_t).add(g)
+            update = g.add(self.buf[i].mul(momentum_t)) if self.nesterov else self.buf[i]
+            p.add_(update, -self.lr)
 
     def zero_grad(self):
         for p in self.params:

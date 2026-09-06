@@ -60,6 +60,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — tinyshakespeare capstone | Real transformer on real text, 2,000 steps, perplexity 10.5→8.28 | ✅ done |
 | — `no_grad()` | Reentrant context manager, skips graph-building for inference/validation | ✅ done |
 | — `kir.grad` conv2d | Closed the last of the two 2D/gap-scope holes — matmul was the other | ✅ done |
+| — SGD momentum | Heavy-ball + Nesterov, `buf` initialized to `grad` on the first step | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -285,7 +286,18 @@ against `Tensor::conv2d`'s own eager backward to exact equality, and
 the full traced path — including through `run_metal`, which has no
 dedicated conv2d-backward kernel and falls back to CPU the same way
 reshape/transpose already do — matching already central-difference-
-verified eager gradients exactly.
+verified eager gradients exactly. `SGD` gained momentum (classic
+heavy-ball plus its Nesterov variant, `buf` initialized to `grad`
+itself on the first step rather than zero, PyTorch's own convention) —
+a real, previously-missing piece of the optimizer vocabulary, since
+plain SGD alone needs an impractically small learning rate to converge
+at reasonable speed on anything but a toy problem. Both variants
+checked against a from-scratch pure-Python reference of the
+recurrence, and, practically, on a genuinely ill-conditioned loss
+surface (100x steeper along one axis than the other — plain gradient
+descent is textbook-known to oscillate there) momentum reaches under a
+third of plain SGD's loss at the same step budget, Nesterov beating
+plain momentum again on top of that.
 
 ## Why
 
