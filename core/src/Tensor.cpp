@@ -44,9 +44,18 @@ int64_t Tensor::numel() const { return numel_of(impl_->shape); }
 
 namespace {
 thread_local StoragePool* g_active_pool = nullptr;
+// Backs no_grad() (Tensor.hpp): thread_local for the same reason
+// g_active_pool above is -- distributed.py's DeviceMesh dispatches
+// real, concurrently-overlapping threads (see its own docstring), so
+// a plain global here would race between them; each thread gets its
+// own no_grad state instead, defaulting to grad-tracking enabled.
+thread_local bool g_grad_enabled = true;
 }
 
 void set_active_pool(StoragePool* pool) { g_active_pool = pool; }
+
+bool grad_enabled() { return g_grad_enabled; }
+void set_grad_enabled(bool enabled) { g_grad_enabled = enabled; }
 
 std::shared_ptr<GradNode> Tensor::grad_node() const { return impl_->grad_node; }
 void Tensor::set_grad_node(std::shared_ptr<GradNode> node) { impl_->grad_node = std::move(node); }
@@ -161,7 +170,7 @@ Tensor Tensor::add(const Tensor& other) const {
         cpu::add_broadcast(a.data_ptr(), a.shape().data(), a.ndim(), b.data_ptr(), b.shape().data(), b.ndim(),
                             out_shape.data(), static_cast<int64_t>(out_shape.size()), out.data_ptr());
 
-    if (a.requires_grad() || b.requires_grad()) {
+    if ((a.requires_grad() || b.requires_grad()) && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "add";
         node->inputs = {a, b};
@@ -218,7 +227,7 @@ Tensor Tensor::sub(const Tensor& other) const {
         cpu::sub_broadcast(a.data_ptr(), a.shape().data(), a.ndim(), b.data_ptr(), b.shape().data(), b.ndim(),
                             out_shape.data(), static_cast<int64_t>(out_shape.size()), out.data_ptr());
 
-    if (a.requires_grad() || b.requires_grad()) {
+    if ((a.requires_grad() || b.requires_grad()) && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "sub";
         node->inputs = {a, b};
@@ -259,7 +268,7 @@ Tensor Tensor::mul(const Tensor& other) const {
         cpu::mul_broadcast(a.data_ptr(), a.shape().data(), a.ndim(), b.data_ptr(), b.shape().data(), b.ndim(),
                             out_shape.data(), static_cast<int64_t>(out_shape.size()), out.data_ptr());
 
-    if (a.requires_grad() || b.requires_grad()) {
+    if ((a.requires_grad() || b.requires_grad()) && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "mul";
         node->inputs = {a, b};
@@ -335,7 +344,7 @@ Tensor Tensor::matmul(const Tensor& other) const {
         Tensor out = Tensor::zeros({M, N}, false);
         cpu::matmul(a.data_ptr(), b.data_ptr(), out.data_ptr(), M, K, N);
 
-        if (a.requires_grad() || b.requires_grad()) {
+        if ((a.requires_grad() || b.requires_grad()) && grad_enabled()) {
             auto node = std::make_shared<GradNode>();
             node->name = "matmul";
             node->inputs = {a, b};
@@ -380,7 +389,7 @@ Tensor Tensor::matmul(const Tensor& other) const {
                          b_batch.data(), static_cast<int64_t>(b_batch.size()), out_batch.data(),
                          static_cast<int64_t>(out_batch.size()), M, K, N, out.data_ptr());
 
-    if (a.requires_grad() || b.requires_grad()) {
+    if ((a.requires_grad() || b.requires_grad()) && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "matmul";
         node->inputs = {a, b};
@@ -436,7 +445,7 @@ Tensor Tensor::relu() const {
     Tensor out = Tensor::zeros(x.shape(), false);
     cpu::relu_fwd(x.data_ptr(), out.data_ptr(), x.numel());
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "relu";
         node->inputs = {x};
@@ -456,7 +465,7 @@ Tensor Tensor::sum() const {
     Tensor out = Tensor::zeros({1}, false);
     out.data_ptr()[0] = cpu::reduce_sum(x.data_ptr(), x.numel());
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "sum";
         node->inputs = {x};
@@ -507,7 +516,7 @@ Tensor Tensor::conv2d(const Tensor& weight, const Tensor& bias, int64_t stride, 
     }
     cpu::add_bias_nchw(out.data_ptr(), bias.data_ptr(), out.data_ptr(), N, Cout, HWout);
 
-    if (x.requires_grad() || weight.requires_grad() || bias.requires_grad()) {
+    if ((x.requires_grad() || weight.requires_grad() || bias.requires_grad()) && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "conv2d";
         node->inputs = {x, weight, bias};
@@ -570,7 +579,7 @@ Tensor Tensor::max_pool2d(int64_t kernel_size, int64_t stride) const {
     auto argmax = std::make_shared<std::vector<int64_t>>(static_cast<size_t>(N * C * Hout * Wout));
     cpu::maxpool2d_fwd(x.data_ptr(), out.data_ptr(), argmax->data(), N, C, H, W, kernel_size, stride, Hout, Wout);
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "max_pool2d";
         node->inputs = {x};
@@ -593,7 +602,7 @@ Tensor Tensor::mean() const {
     int64_t n = x.numel();
     out.data_ptr()[0] = cpu::reduce_sum(x.data_ptr(), n) / static_cast<float>(n);
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "mean";
         node->inputs = {x};
@@ -613,7 +622,7 @@ Tensor Tensor::sqrt() const {
     Tensor out = Tensor::zeros(x.shape(), false);
     cpu::sqrt_fwd(x.data_ptr(), out.data_ptr(), x.numel());
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "sqrt";
         node->inputs = {x};
@@ -643,7 +652,7 @@ Tensor Tensor::reciprocal() const {
     Tensor out = Tensor::zeros(x.shape(), false);
     cpu::reciprocal_fwd(x.data_ptr(), out.data_ptr(), x.numel());
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "reciprocal";
         node->inputs = {x};
@@ -674,7 +683,7 @@ Tensor Tensor::exp() const {
     Tensor out = Tensor::zeros(x.shape(), false);
     cpu::exp_fwd(x.data_ptr(), out.data_ptr(), x.numel());
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "exp";
         node->inputs = {x};
@@ -712,7 +721,7 @@ Tensor Tensor::log() const {
     Tensor out = Tensor::zeros(x.shape(), false);
     cpu::log_fwd(x.data_ptr(), out.data_ptr(), x.numel());
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "log";
         node->inputs = {x};
@@ -736,7 +745,7 @@ Tensor Tensor::tanh() const {
     Tensor out = Tensor::zeros(x.shape(), false);
     cpu::tanh_fwd(x.data_ptr(), out.data_ptr(), x.numel());
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "tanh";
         node->inputs = {x};
@@ -760,7 +769,7 @@ Tensor Tensor::sigmoid() const {
     Tensor out = Tensor::zeros(x.shape(), false);
     cpu::sigmoid_fwd(x.data_ptr(), out.data_ptr(), x.numel());
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "sigmoid";
         node->inputs = {x};
@@ -784,7 +793,7 @@ Tensor Tensor::gelu() const {
     Tensor out = Tensor::zeros(x.shape(), false);
     cpu::gelu_fwd(x.data_ptr(), out.data_ptr(), x.numel());
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "gelu";
         node->inputs = {x};
@@ -804,7 +813,7 @@ Tensor Tensor::leaky_relu(float negative_slope) const {
     Tensor out = Tensor::zeros(x.shape(), false);
     cpu::leaky_relu_fwd(x.data_ptr(), out.data_ptr(), x.numel(), negative_slope);
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "leaky_relu";
         node->inputs = {x};
@@ -831,7 +840,7 @@ Tensor Tensor::sum(int64_t dim, bool keepdim) const {
     Tensor out = Tensor::zeros(reduced_shape, false);
     cpu::reduce_to_shape(x.data_ptr(), x.shape().data(), nd, reduced_shape.data(), nd, out.data_ptr());
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "sum_dim";
         node->inputs = {x};
@@ -937,7 +946,7 @@ Tensor Tensor::index_select(int64_t dim, const std::vector<int64_t>& indices) co
     cpu::index_select(x.data_ptr(), x.shape().data(), nd, dim, indices.data(),
                        static_cast<int64_t>(indices.size()), out.data_ptr());
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "index_select";
         node->inputs = {x};
@@ -963,7 +972,7 @@ Tensor Tensor::reshape(std::vector<int64_t> new_shape) const {
     Tensor out = Tensor::zeros(std::move(new_shape), false);
     cpu::copy(x.data_ptr(), out.data_ptr(), n);
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "reshape";
         node->inputs = {x};
@@ -990,7 +999,7 @@ Tensor Tensor::transpose(int64_t dim0, int64_t dim1) const {
     Tensor out = Tensor::zeros(out_shape, false);
     cpu::transpose(x.data_ptr(), x.shape().data(), nd, dim0, dim1, out.data_ptr());
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "transpose";
         node->inputs = {x};
@@ -1023,7 +1032,7 @@ Tensor Tensor::slice(int64_t dim, int64_t start, int64_t stop) const {
     Tensor out = Tensor::zeros(out_shape, false);
     cpu::slice(x.data_ptr(), x.shape().data(), nd, dim, start, stop, out.data_ptr());
 
-    if (x.requires_grad()) {
+    if (x.requires_grad() && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "slice";
         node->inputs = {x};
@@ -1073,7 +1082,7 @@ Tensor Tensor::cat(const std::vector<Tensor>& tensors, int64_t dim) {
         any_grad = any_grad || t.requires_grad();
     }
 
-    if (any_grad) {
+    if (any_grad && grad_enabled()) {
         auto node = std::make_shared<GradNode>();
         node->name = "cat";
         node->inputs = tensors;
@@ -1137,7 +1146,7 @@ void Tensor::backward() {
 
         auto node = t.grad_node();
         if (!node) {
-            if (t.requires_grad()) {
+            if (t.requires_grad() && grad_enabled()) {
                 if (auto existing = t.grad())
                     t.impl_->grad = existing->add(grad_output).impl_;
                 else

@@ -124,21 +124,23 @@ def compute_loss(model, batch_x, batch_y, vocab_size):
 
 def estimate_val_loss(model, val_tokens, vocab_size, n_batches=10, seed=1234):
     """A few random windows from the held-out tail, no gradient
-    tracking needed -- deliberately not wrapped in any "no_grad"
-    context (Kansai has no such context manager yet), so backward()
-    is simply never called on these; the graph gets built and
-    discarded, a real but cheap-at-this-scale inefficiency."""
+    tracking needed -- wrapped in kansai.no_grad() (added this session
+    specifically because this function's own graph-building was real,
+    needless work: backward() is never called on any of these, so the
+    graph kir grad-tracking would otherwise build gets thrown away
+    unread every single call)."""
     rng = random.Random(seed)
     losses = []
-    for _ in range(n_batches):
-        xs, ys = [], []
-        for _ in range(BATCH_SIZE):
-            i = rng.randint(0, len(val_tokens) - BLOCK_SIZE - 1)
-            chunk = val_tokens[i:i + BLOCK_SIZE + 1]
-            xs.append(chunk[:-1])
-            ys.append(chunk[1:])
-        loss = compute_loss(model, xs, ys, vocab_size)
-        losses.append(loss.tolist()[0])
+    with kansai.no_grad():
+        for _ in range(n_batches):
+            xs, ys = [], []
+            for _ in range(BATCH_SIZE):
+                i = rng.randint(0, len(val_tokens) - BLOCK_SIZE - 1)
+                chunk = val_tokens[i:i + BLOCK_SIZE + 1]
+                xs.append(chunk[:-1])
+                ys.append(chunk[1:])
+            loss = compute_loss(model, xs, ys, vocab_size)
+            losses.append(loss.tolist()[0])
     return sum(losses) / len(losses)
 
 
@@ -155,27 +157,28 @@ def generate(model, encode, decode, prompt: str, max_new_tokens: int, vocab_size
     immediately as generation proceeds."""
     rng = random.Random(seed)
     ids = encode(prompt)
-    for _ in range(max_new_tokens):
-        context = ids[-BLOCK_SIZE:]
-        pad = BLOCK_SIZE - len(context)
-        if pad > 0:
-            context = [0] * pad + context
-        logits = model([context])
-        last_logits = logits.tolist()[(BLOCK_SIZE - 1) * vocab_size: BLOCK_SIZE * vocab_size]
-        scaled = [v / temperature for v in last_logits]
-        m = max(scaled)
-        exps = [math.exp(v - m) for v in scaled]
-        total = sum(exps)
-        probs = [e / total for e in exps]
-        r = rng.random()
-        cum = 0.0
-        next_id = vocab_size - 1
-        for i, p in enumerate(probs):
-            cum += p
-            if r <= cum:
-                next_id = i
-                break
-        ids.append(next_id)
+    with kansai.no_grad():
+        for _ in range(max_new_tokens):
+            context = ids[-BLOCK_SIZE:]
+            pad = BLOCK_SIZE - len(context)
+            if pad > 0:
+                context = [0] * pad + context
+            logits = model([context])
+            last_logits = logits.tolist()[(BLOCK_SIZE - 1) * vocab_size: BLOCK_SIZE * vocab_size]
+            scaled = [v / temperature for v in last_logits]
+            m = max(scaled)
+            exps = [math.exp(v - m) for v in scaled]
+            total = sum(exps)
+            probs = [e / total for e in exps]
+            r = rng.random()
+            cum = 0.0
+            next_id = vocab_size - 1
+            for i, p in enumerate(probs):
+                cum += p
+                if r <= cum:
+                    next_id = i
+                    break
+            ids.append(next_id)
     return decode(ids)
 
 

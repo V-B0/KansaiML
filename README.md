@@ -58,6 +58,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — `TransformerBlock` | Pre-LN attention + FFN, both residuals proven structurally, causal masking verified | ✅ done |
 | — Memory leak fix | Permanent `shared_ptr` cycle in exp/sqrt/reciprocal/tanh/sigmoid, found training a real transformer | ✅ fixed |
 | — tinyshakespeare capstone | Real transformer on real text, 2,000 steps, perplexity 10.5→8.28 | ✅ done |
+| — `no_grad()` | Reentrant context manager, skips graph-building for inference/validation | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -258,6 +259,22 @@ word shapes, plausible capitalization, character names in roughly the
 right places — without being coherent, exactly what a 277K-parameter
 character model trained for a couple thousand steps should honestly
 produce.
+
+Before chasing GPU dispatch as the next lever, it was actually
+measured: eager CPU vs. `kir.trace()` + `run_metal()` on the identical
+`TransformerBlock` forward, batch sizes 48 through 512, showed no real
+speedup at any of them (0.96x–1.00x, outputs matching to exact
+equality) — Apple Silicon's Accelerate framework (AMX + NEON) is
+already highly competitive with the GPU at these sizes, so eager mode
+stays CPU-only for now rather than adding GPU-dispatch complexity a
+real workload hasn't actually needed yet. `no_grad()` (a reentrant
+context manager suppressing graph-building — `torch.no_grad()`'s
+equivalent, previously missing entirely) closes a real gap the
+capstone above ran into directly: `estimate_val_loss` and `generate`
+both built full, immediately-discarded backward graphs on every call
+before this existed. Checked to correctly restore prior state after
+the block exits (including on exception, and correctly when nested)
+while never changing the actual computed value.
 
 ## Why
 

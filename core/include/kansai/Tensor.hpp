@@ -248,6 +248,19 @@ private:
 // this requires from the caller.
 void set_active_pool(StoragePool* pool);
 
+// Per-thread grad-tracking switch backing kansai.no_grad(): while
+// disabled, every op's own `if (x.requires_grad())` check (Tensor.cpp)
+// also requires this, so no op attaches a GradNode or turns on its
+// output's requires_grad -- exactly what an inference/validation pass
+// wants (estimate_val_loss in examples/tinyshakespeare/
+// train_shakespeare.py built a full, immediately-discarded backward
+// graph every call before this existed, a real, previously-documented
+// inefficiency). Defaults to enabled; thread_local (see its own
+// definition in Tensor.cpp) since DeviceMesh dispatches real,
+// concurrently-overlapping threads that must not share this state.
+bool grad_enabled();
+void set_grad_enabled(bool enabled);
+
 // NumPy-style right-aligned broadcasting: pads the shorter shape with
 // implicit leading 1s, then each aligned pair of dims must either match
 // or one of them must be 1 -- the standard rule add/sub/mul/matmul's

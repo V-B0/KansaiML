@@ -2337,6 +2337,76 @@ roughly the right places -- without being coherent, exactly what a
 steps should honestly produce, reported as observed rather than
 cherry-picked or smoothed over.
 
+## Metal vs CPU: an honest scaling benchmark
+
+Before pursuing "make eager mode dispatch to Metal automatically" (the
+Metal GPU backend is currently reachable ONLY through the explicit
+`kir.trace()` + `run_metal()` path, not from ordinary `nn.Module`
+forward calls), actually measured whether it would help at the scales
+this project has validated so far, rather than assuming a GPU backend
+is automatically a win. Traced a single `TransformerBlock` forward pass
+and ran it through `run_metal` against the identical computation run
+eagerly on CPU/Accelerate, across a range of batch sizes:
+
+| batch | eager CPU | `run_metal` | speedup |
+|---|---|---|---|
+| 48 | 30.72ms | 32.16ms | 0.96x |
+| 128 | 82.28ms | 85.86ms | 0.96x |
+| 256 | 165.32ms | 165.19ms | 1.00x |
+| 512 | 328.95ms | 332.15ms | 0.99x |
+
+No real speedup at ANY of these sizes -- outputs matched to exact
+equality (`0.00e+00` max diff), so the Metal path is correct, just not
+faster here. This is a genuinely useful, honest finding rather than a
+disappointing one: Apple Silicon's Accelerate framework (AMX
+coprocessor + NEON SIMD) is already highly competitive with GPU
+dispatch for matrix sizes in this range, and the crossover point where
+Metal would actually win is a substantially larger model or batch than
+anything this project has trained end-to-end. Given this, investing in
+automatic eager-mode Metal dispatch -- a large, invasive change
+touching every op's dispatch path -- isn't currently justified by any
+real workload this project has validated; the CPU/Accelerate path
+alone is already a solid, competitive story on Mac at these scales.
+Revisit if/when a larger model actually needs it.
+
+## no_grad()
+
+A gap this session's own `estimate_val_loss` (in
+`examples/tinyshakespeare/train_shakespeare.py`) ran directly into:
+every validation call built a full backward graph that `.backward()`
+was never going to be called on, immediately discarded -- correct, but
+real, needless work Kansai had no way to avoid, since it had no
+equivalent of `torch.no_grad()` at all.
+
+Implemented as a single per-thread bool (`grad_enabled`, `thread_local`
+in `core/src/Tensor.cpp` for the identical reason `g_active_pool`
+already is one -- `distributed.py`'s `DeviceMesh` dispatches real,
+concurrently-overlapping threads that must never share this kind of
+state) that every one of the ~25 `if (x.requires_grad())`-style checks
+across every op now also requires before attaching a `GradNode`.
+Exposed as `kansai.no_grad()`, a reentrant Python context manager
+(`contextlib.contextmanager` around `core.set_grad_enabled`, restoring
+whatever state was active before the block rather than unconditionally
+re-enabling tracking -- so a `no_grad()` nested inside another one
+doesn't leak tracking back on when the inner block exits).
+
+Verified: ops run inside the block produce `requires_grad=False`
+outputs; grad-tracking is restored after the block exits, including
+when it raises (a real `try/finally`, not just the happy path); nested
+blocks restore correctly (the specific case a naive "always re-enable
+on exit" implementation would get wrong); ordinary graph-building and
+`.backward()` are completely unaffected outside the block; and,
+practically, that wrapping a real forward pass in `no_grad()` produces
+the IDENTICAL computed value as without it -- this only suppresses
+graph bookkeeping, never changes what forward actually computes. Both
+`estimate_val_loss` and `generate` in the tinyshakespeare capstone now
+use it. (A real bug caught applying this: wrapping `generate`'s
+sampling loop body in a `with` block without re-indenting the
+`ids.append(next_id)` line after it would have silently generated only
+ONE token total instead of the requested count -- caught by checking
+the actual output length against the requested token count, not just
+that the call didn't crash.)
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

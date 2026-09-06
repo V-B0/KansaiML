@@ -167,6 +167,15 @@ NB_MODULE(_core, m) {
         pool.release(t.storage_ptr());
     });
 
+    // Backs kansai.no_grad() (python/kansai/__init__.py) -- a plain
+    // bool, no pointer-lifetime dance like g_active_pool_pyref above
+    // needs, since there's no object whose lifetime this has to keep
+    // alive. Always toggled through that context manager on the Python
+    // side, which guarantees the enabled flag is restored even if the
+    // wrapped code raises.
+    m.def("set_grad_enabled", &set_grad_enabled, nb::arg("enabled"));
+    m.def("grad_enabled", &grad_enabled);
+
 #ifdef KANSAI_HAS_METAL
     // Every one of these blocks on waitUntilCompleted internally (see
     // backend/metal/MetalOps.mm) -- without releasing the GIL here,

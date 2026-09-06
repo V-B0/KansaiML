@@ -1,4 +1,7 @@
+import contextlib
+
 from ._core import Tensor, zeros, ones, randn, from_flat
+from . import _core as core
 
 
 def _flatten(nested):
@@ -44,4 +47,37 @@ def where(cond, a, b):
     return b.add(cond.mul(a.sub(b)))
 
 
-__all__ = ["Tensor", "zeros", "ones", "randn", "tensor", "from_flat", "where"]
+@contextlib.contextmanager
+def no_grad():
+    """Suppresses autograd graph-building for every op run inside this
+    block, regardless of any input's own `requires_grad` -- the standard
+    "I'm about to run inference/validation and never call backward()"
+    escape hatch every DL framework has, and this one previously
+    didn't: `estimate_val_loss` in examples/tinyshakespeare/
+    train_shakespeare.py built a full backward graph on every single
+    validation call, immediately discarded without ever calling
+    `.backward()` on it -- correct, but real, needless work (and, worse,
+    every leaf-adjacent intermediate along the way used to hold a
+    now-fixed GradNode reference cycle -- see DEVLOG.md's own account of
+    that bug -- so building graphs nothing will ever differentiate was
+    genuinely costly before that fix, not just wasteful in principle).
+
+    Implemented as a single per-thread flag (core.set_grad_enabled,
+    thread_local in C++ -- see Tensor.hpp's own comment on
+    grad_enabled() for why: DeviceMesh dispatches real, concurrently-
+    overlapping threads that must not share this state) that every op's
+    own `if (x.requires_grad())` check in Tensor.cpp now also requires.
+    Reentrant/nestable: restores whatever grad-tracking state was
+    active before this block (not unconditionally re-enabling it), so
+    a `no_grad()` block nested inside another one doesn't incorrectly
+    turn tracking back on when the inner block exits.
+    """
+    previous = core.grad_enabled()
+    core.set_grad_enabled(False)
+    try:
+        yield
+    finally:
+        core.set_grad_enabled(previous)
+
+
+__all__ = ["Tensor", "zeros", "ones", "randn", "tensor", "from_flat", "where", "no_grad"]
