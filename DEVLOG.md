@@ -688,12 +688,11 @@ bookkeeping rather than only the simplest case.
 
 Two limitations stated up front rather than discovered later:
 
-- **Forward-only**, same as fusion/pooling/`run_metal` before it. A real
-  DTensor needs auto-inserted collectives during backward -- all-reduce
-  for a `Replicate()`'d gradient, all-gather for a `Shard()`'d one --
-  which is exactly the "auto-comm insertion" line from this project's
-  own original Phase 4 roadmap, and genuinely separate, substantial
-  work from the data model itself.
+- **`dtensor_run` itself is forward-only**, same as fusion/pooling/
+  `run_metal` before it -- no `grad_node` is attached to anything it
+  computes. Distributed *backward* is handled separately, by
+  `dtensor_grad` -- see the next section for why that needed its own
+  design rather than being a small addition to `dtensor_run`.
 - **No real concurrency.** `dtensor_run` dispatches to each device in a
   plain Python loop, one after another. Nothing in this codebase's
   nanobind bindings releases the GIL, so even calling the CPU and Metal
@@ -711,6 +710,72 @@ whenever the sharded dimension divides evenly across the mesh, silently
 shard is unattempted future work). The test suite's own batch size (8,
 split 4+4 across two devices) was chosen specifically to satisfy this,
 not by accident.
+
+## Distributed gradients
+
+`dtensor_grad(graph, wrt, wrt_placements, *dtensor_args)` closes the gap
+the previous section left open on purpose: distributed *backward*, with
+auto-inserted collectives, on the same two real backends `dtensor_run`
+already proves forward. Design: build `kir.grad(graph, wrt)` once (an
+*unfused* graph, per `kir.grad`'s own contract), run it per mesh device
+against that device's own shard exactly the way `dtensor_run` runs the
+forward graph, then combine each `wrt` entry's per-device *local*
+gradient into the one true answer via the collective its own placement
+calls for -- all-reduce (sum) for `Replicate()`, all-gather (concat) for
+`Shard(dim)`. This needed adding `"tuple"` and `"broadcast_scalar"`
+handling to `run_metal` first: a multi-`wrt` `kir.grad()` graph ends in a
+`"tuple"` node, and `sum`/`mean`'s vjp rules emit `"broadcast_scalar"`,
+neither of which `run_metal` had ever needed a case for before nothing
+had run a backward graph through it. Without that fix `run_metal` would
+`KeyError` outright on any distributed backward pass; `matmul_nt`,
+`matmul_tn`, `relu_backward`, and `sum_axis0` (the rest of `grad()`'s
+backward-only vocabulary) still have no dedicated Metal kernel and fall
+through to the existing CPU `_OP_TABLE`, exactly the same fallback path
+every other unrecognized op already used -- writing Metal kernels for
+those is real, unattempted future work, not a gap this quietly hides.
+
+Correctness bar: the gradient computed from N devices each seeing 1/N of
+a batch, combined by these collectives, must equal the gradient computed
+from one device seeing the whole batch at once -- the standard
+data-parallel-training claim, checked directly against `kir.grad()` run
+on the unsharded graph (not re-proving `kir.grad()` vs eager agreement,
+which `test_kir_grad.py` already covers on its own). Verified on a
+Linear+ReLU model, batch `Shard(0)`'d across `["cpu", "metal"]` with
+weight/bias `Replicate()`'d (baked into the graph as `constant` nodes,
+found via `find_constant()` on the original tensor objects -- the
+ordinary data-parallel shape), for both a `wrt` list of three entries
+(weight, bias, and the sharded input itself, to exercise both
+collectives together) and a single-entry `wrt` (`kir.grad()` returns a
+plain graph rather than a `"tuple"`-rooted one in that case, a genuinely
+different code path worth its own check) -- all matching the full-batch
+reference to within floating-point noise.
+
+The loss-scaling question every real data-parallel implementation has to
+face -- does summing per-device gradients silently need a `1/len(mesh)`
+correction when the loss is `mean()`-reduced rather than `sum()`-reduced
+-- got checked empirically rather than assumed either way, and the
+answer turned out more interesting than either guess: no correction is
+needed, for a reason specific to how this codebase's vjp rules work.
+`_vjp_mean` bakes its normalizing constant in as a plain Python float
+computed from `graph`'s own trace-time shape, and `graph` here is the
+same graph whose tracing convention `dtensor_run` already established --
+traced once against the full logical batch, never a single shard's
+shape. So a `mean()` loss traced against a full 8-row batch bakes in
+`scale = 1/8` regardless of which device later runs the backward graph,
+and every device's local gradient -- computed against only its own
+4-row shard -- already carries that full-batch `1/8`, not a per-shard
+`1/4`. Summing two such quarters-of-the-truth back together lands
+exactly on the true full-batch gradient with nothing left to correct.
+An earlier draft of this section assumed the opposite (that summing a
+`mean()`-based per-shard gradient would over-count by exactly
+`len(mesh)`, the textbook data-parallel gotcha) and wrote a test
+specifically to demonstrate that factor -- the test's own measured
+ratio came back `1.0000`, not `2.0000`, which is what actually caught
+the wrong assumption before it shipped as a false caveat in the
+docstring. `tests/test_distributed_grad.py` keeps the corrected,
+verified version of that check: both a `sum()`-loss and a `mean()`-loss
+graph, run distributed, matching their own full-batch `kir.grad()`
+reference exactly.
 
 ## Build
 

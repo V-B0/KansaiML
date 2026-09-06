@@ -38,7 +38,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | 1 — Foundation | Tensor/autograd core, CPU backend, `nn`/`optim` | ✅ done |
 | 2 — KIR | Tracing, fusion, memory pooling, source-transform autograd | ✅ done |
 | 3 — GPU backend | Real Metal compute (tiled kernel + MPS, full op + Conv2d coverage) | ✅ done |
-| 4 — Distributed | `DeviceMesh` + `DTensor` data model | 🟡 started — no distributed autograd yet |
+| 4 — Distributed | `DeviceMesh` + `DTensor`, distributed gradients | 🟡 in progress |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -57,7 +57,12 @@ for `Conv2d` specifically, against an independent nested-loop reference
 implementation with error on the order of 1e-6; `Conv2d`'s backward is
 checked against numerical differentiation; a batch sharded across
 `DeviceMesh(["cpu", "metal"])` runs each shard through that device's
-real interpreter and gathers back to exactly the unsharded result.
+real interpreter and gathers back to exactly the unsharded result;
+`dtensor_grad`'s auto-inserted collectives (all-reduce for a
+`Replicate()`'d gradient, all-gather for a `Shard()`'d one) reproduce
+the exact full-batch `kir.grad()` gradient from two devices each seeing
+half the batch, for both a `sum()`- and a `mean()`-reduced loss — the
+data-parallel-training correctness bar, not a smaller stand-in for it.
 
 ## Why
 

@@ -919,6 +919,20 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
     part that actually dominates runtime at any real channel count) on
     the GPU instead of Accelerate.
 
+    tuple and broadcast_scalar are handled the same way run()/run_fused()
+    handle them (unpack a multi-wrt() result / broadcast a reduction's
+    cotangent back out to its input shape) rather than going to Metal --
+    these only ever appear in a grad()-produced backward graph, never in
+    ordinary forward tracing, and exist here purely so a distributed
+    backward pass (see distributed.py's dtensor_grad) can run its
+    backward graph on the "metal" device at all; without these two
+    cases this function would KeyError on any such graph. The
+    backward-only ops grad() itself emits -- matmul_nt, matmul_tn,
+    relu_backward, sum_axis0 -- have no dedicated Metal kernel and fall
+    through to the CPU _OP_TABLE below, same as any other unrecognized
+    op; writing Metal kernels for those is real, unattempted future
+    work, not a gap this function hides.
+
     Consecutive bias_relu/add_bias nodes -- wherever one's only
     non-bias input is the immediately preceding one, e.g. a second
     layer's unactivated output feeding straight off the first layer's
@@ -960,6 +974,16 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
             continue
         if node.op == "constant":
             values[node.id] = node.attrs["value"]
+            continue
+        if node.op == "tuple":
+            flush_chain()
+            values[node.id] = tuple(values[i] for i in node.inputs)
+            continue
+        if node.op == "broadcast_scalar":
+            flush_chain()
+            values[node.id] = core.broadcast_scalar(
+                values[node.inputs[0]], node.shape, node.attrs["scale"]
+            )
             continue
 
         kind = _metal_elementwise_kind(node, by_id)

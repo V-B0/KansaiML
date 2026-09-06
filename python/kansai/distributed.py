@@ -21,13 +21,15 @@ tolist()/from_flat() rather than anything resembling a network
 transfer -- there's nothing to transfer, only a decision about which
 compute path runs on which slice of already-shared memory.
 
-Forward-only, deliberately, same as fusion/pooling/run_metal before it:
-there's no autograd through a DTensor. A real implementation needs
-auto-inserted collectives during backward -- all-reduce for a
-Replicate()'d gradient, all-gather for a Shard()'d one -- which is
-exactly the "auto-comm insertion" line from the project's own Phase 4
-roadmap, and genuinely separate, substantial work from the data model
-itself. Not attempted here.
+dtensor_run itself is still forward-only -- no grad_node is attached to
+anything it computes, same as run_metal/run_planned before it.
+Distributed *backward*, though, is real: dtensor_grad (below) builds
+the backward graph once via kir.grad, runs it per-device against each
+device's own shard exactly the way dtensor_run runs the forward graph,
+and auto-inserts the collective each wrt entry's own placement calls
+for -- all-reduce (sum) for a Replicate()'d one, all-gather (concat)
+for a Shard()'d one. See its own docstring for the full design and the
+loss-scaling subtlety that comes with it.
 
 No real concurrency either: dtensor_run dispatches to each device in a
 plain Python loop, one after another. nanobind doesn't release the GIL
@@ -238,3 +240,123 @@ def dtensor_run(graph, output_placement, *dtensor_args) -> DTensor:
             raise ValueError(f"unknown device {device!r}")
 
     return DTensor(mesh, output_placement, results)
+
+
+def _all_reduce_sum(tensors: list):
+    """Elementwise-sums a list of same-shape Tensors -- the collective a
+    Replicate()'d gradient needs. Every device ran the forward+backward
+    pass using the exact same value at this point (a weight baked into
+    the graph as a `constant` node, per find_constant()'s own docstring,
+    or an input placeholder itself Replicate()'d rather than sharded),
+    so each device's local gradient is only a partial contribution --
+    from that device's own slice of whatever *was* sharded upstream (the
+    batch, in the ordinary data-parallel shape) -- and the true gradient
+    is their sum, not any single device's answer on its own. Goes
+    through tolist()/from_flat() for the same reason _split_tensor and
+    _concat_tensors do: there's no native elementwise-N-way-add kernel,
+    and prototyping the collective's semantics in Python first is the
+    same tradeoff this module already made for split/gather."""
+    flats = [t.tolist() for t in tensors]
+    total = list(flats[0])
+    for flat in flats[1:]:
+        for i, v in enumerate(flat):
+            total[i] += v
+    return core.from_flat(total, list(tensors[0].shape))
+
+
+def dtensor_grad(graph, wrt: list, wrt_placements: list, *dtensor_args) -> list:
+    """Distributed backward. Builds kir.grad(graph, wrt) once (an
+    *unfused* graph -- see kir.grad's own docstring for why fusion has
+    to wait until after differentiation), runs it on each mesh device
+    against that device's own shard of every dtensor_arg -- exactly the
+    same per-device dispatch dtensor_run uses for the forward graph,
+    kir.run for "cpu" and kir.run_metal (on an elementwise_fusion'd copy,
+    same as dtensor_run) for "metal" -- and combines each wrt entry's N
+    per-device *local* gradients into the one true gradient via the
+    collective its own placement calls for:
+
+    - Replicate() -- typically a weight/bias found via
+      find_constant(graph, tensor) on the ORIGINAL tensor object dtensor
+      arguments never wrapped, since every device's forward pass read
+      that exact same constant-embedded value: each device's local
+      gradient is a partial contribution from its own data slice, and
+      the true gradient is their SUM (_all_reduce_sum, an all-reduce).
+    - Shard(dim) -- typically the traced graph's own placeholder that a
+      Shard()'d dtensor_arg feeds: each device only ever saw its own
+      slice of that input, so its local gradient already covers exactly
+      that slice and nothing else; concatenating the N local gradients
+      along `dim` reconstructs the full gradient (_concat_tensors, an
+      all-gather) with no scaling of any kind needed, since the pieces
+      are disjoint by construction.
+
+    wrt_placements is supplied explicitly by the caller, one entry per
+    wrt id, for the same reason dtensor_run takes an explicit
+    output_placement rather than inferring one: working out how a
+    gradient's placement follows from an arbitrary graph's structure is
+    a real, separate design problem, not attempted generically here.
+
+    The loss-scaling question a real data-parallel implementation always
+    has to face turns out to already have the right answer here, for a
+    non-obvious reason worth spelling out rather than leaving as an
+    unexamined assumption: grad()'s `sum`/`mean` vjp rules
+    (_vjp_sum/_vjp_mean) bake their normalizing constant in as a plain
+    Python float, computed from `graph`'s own trace-time shape -- and
+    `graph` is the SAME graph dtensor_run's own docstring already
+    establishes the convention for: traced once against a shape
+    representative of the full logical computation, not any one
+    device's shard (see dtensor_run's docstring on why an unevenly-
+    shardable shape isn't handled). Concretely: a `mean()` loss traced
+    against the full batch bakes in scale = 1/(full batch size), and
+    every device's local backward pass -- run against only that
+    device's own shard -- still multiplies by that SAME full-batch
+    scale, not a per-shard one. Each device's local gradient is
+    therefore already exactly "this shard's contribution to the
+    full-batch mean," and summing them via all-reduce reconstructs the
+    true full-batch-mean gradient directly -- no len(mesh) rescale,
+    and no `sum()`-vs-`mean()` distinction to get right by hand. Verified
+    in tests/test_distributed_grad.py by checking both loss reductions
+    against the same full-batch kir.grad() reference. The failure mode
+    this sidesteps (get the pitfall) would only appear if `graph` had
+    instead been traced against a single shard's own shape -- a
+    workflow this module never uses or recommends.
+
+    Returns one real kansai.Tensor per wrt entry (already reduced to the
+    single true answer) -- not a DTensor, since after all-reduce/
+    all-gather there's exactly one correct value and no remaining reason
+    to keep it partitioned.
+    """
+    if len(wrt) != len(wrt_placements):
+        raise ValueError("wrt and wrt_placements must be the same length")
+    if not dtensor_args:
+        raise ValueError("dtensor_grad needs at least one DTensor argument")
+    mesh = dtensor_args[0].mesh
+    for dt in dtensor_args:
+        if dt.mesh is not mesh:
+            raise ValueError("all DTensor arguments must share the same DeviceMesh")
+
+    bwd_graph = kir.grad(graph, wrt)
+
+    fused_bwd_graph = None
+    per_device_results = []
+    for i, device in enumerate(mesh.devices):
+        shard_inputs = [dt.shards[i] for dt in dtensor_args]
+        if device == "cpu":
+            out = kir.run(bwd_graph, *shard_inputs)
+        elif device == "metal":
+            if fused_bwd_graph is None:
+                fused_bwd_graph = kir.elementwise_fusion(bwd_graph)
+            out = kir.run_metal(fused_bwd_graph, *shard_inputs)
+        else:
+            raise ValueError(f"unknown device {device!r}")
+        per_device_results.append(out if isinstance(out, tuple) else (out,))
+
+    results = []
+    for j, placement in enumerate(wrt_placements):
+        per_device_j = [per_device_results[i][j] for i in range(len(mesh))]
+        if isinstance(placement, Replicate):
+            results.append(_all_reduce_sum(per_device_j))
+        elif isinstance(placement, Shard):
+            results.append(_concat_tensors(per_device_j, placement.dim))
+        else:
+            raise TypeError(f"unknown placement {placement!r}")
+    return results
