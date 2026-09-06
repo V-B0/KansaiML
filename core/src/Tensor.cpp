@@ -301,6 +301,23 @@ Tensor Tensor::mul(const Tensor& other) const {
     return out;
 }
 
+namespace {
+Tensor compare(const Tensor& a, const Tensor& b, const char* op_name,
+               void (*broadcast_kernel)(const float*, const int64_t*, int64_t, const float*, const int64_t*,
+                                         int64_t, const int64_t*, int64_t, float*)) {
+    bool exact = (a.shape() == b.shape());
+    std::vector<int64_t> out_shape = exact ? a.shape() : broadcast_shapes(a.shape(), b.shape(), op_name);
+    Tensor out = Tensor::zeros(out_shape, false);
+    broadcast_kernel(a.data_ptr(), a.shape().data(), a.ndim(), b.data_ptr(), b.shape().data(), b.ndim(),
+                      out_shape.data(), static_cast<int64_t>(out_shape.size()), out.data_ptr());
+    return out;
+}
+} // namespace
+
+Tensor Tensor::gt(const Tensor& other) const { return compare(*this, other, "gt", cpu::greater_broadcast); }
+Tensor Tensor::lt(const Tensor& other) const { return compare(*this, other, "lt", cpu::less_broadcast); }
+Tensor Tensor::eq(const Tensor& other) const { return compare(*this, other, "eq", cpu::equal_broadcast); }
+
 Tensor Tensor::matmul(const Tensor& other) const {
     const Tensor& a = *this;
     const Tensor& b = other;

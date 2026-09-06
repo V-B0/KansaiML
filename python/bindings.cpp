@@ -52,6 +52,9 @@ NB_MODULE(_core, m) {
         .def("add", &Tensor::add, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
         .def("sub", &Tensor::sub, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
         .def("mul", &Tensor::mul, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
+        .def("gt", &Tensor::gt, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
+        .def("lt", &Tensor::lt, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
+        .def("eq", &Tensor::eq, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
         .def("matmul", &Tensor::matmul, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
         .def("relu", &Tensor::relu, nb::call_guard<nb::gil_scoped_release>())
         // sum/mean are each overloaded in C++ (full reduction vs

@@ -87,6 +87,24 @@ public:
     Tensor add(const Tensor& other) const;
     Tensor sub(const Tensor& other) const;
     Tensor mul(const Tensor& other) const;
+
+    // Elementwise comparisons (general-broadcasting, same rule add/sub/
+    // mul's own broadcasting follows): 1.0 where the comparison holds,
+    // 0.0 where it doesn't. Deliberately NEVER attach a GradNode or set
+    // requires_grad, even if an input does -- a comparison's result is
+    // piecewise-constant in its inputs (a step function), so its true
+    // gradient is zero (or undefined right at the boundary) everywhere,
+    // not "whatever add/mul would propagate through it." Combined with
+    // `where` (cond.mul(a).add(ones_like(cond).sub(cond).mul(b)), pure
+    // composition -- no new op needed), this is what makes real
+    // boolean-style masking possible: MultiHeadAttention's own mask
+    // arg had to be additive-only before this existed (see its doc
+    // comment), specifically because Kansai had no comparison/where
+    // primitive yet.
+    Tensor gt(const Tensor& other) const;
+    Tensor lt(const Tensor& other) const;
+    Tensor eq(const Tensor& other) const;
+
     Tensor matmul(const Tensor& other) const;
     Tensor relu() const;
     Tensor sum() const;

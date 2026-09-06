@@ -48,6 +48,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — Batched matmul | Any rank ≥ 2, NumPy-style batch-dim broadcasting | ✅ done |
 | — MultiHeadAttention | Real scaled dot-product attention, cross-attention, masking | ✅ done |
 | — Indexing/`Embedding` | `index_select` (repeat-accumulating backward), token-lookup `nn.Embedding` | ✅ done |
+| — Comparisons/`where` | `gt`/`lt`/`eq` (deliberately non-differentiable), boolean-style `where` | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -162,7 +163,17 @@ through `run_metal`; `nn.Embedding`, built as pure `index_select` +
 `reshape` with zero new kernels, is checked the same way for repeated
 *token ids* within a batch, and a small "does this sequence contain
 the marker token" classifier (`Embedding` → mean-pool → `Linear` →
-`cross_entropy`) reaches 100% test accuracy.
+`cross_entropy`) reaches 100% test accuracy. `gt`/`lt`/`eq` close the
+gap `MultiHeadAttention`'s own additive-only mask used to have — real
+comparison ops, deliberately non-differentiable (confirmed:
+`requires_grad` never turns on, even when the input does) — and
+`where(cond, a, b)` is built as pure `sub`/`mul`/`add` composition
+(`b + cond*(a-b)`, no new kernel or KIR node at all), checked to route
+gradient into `a`/`b` at exactly the positions each branch was taken
+and never into `cond`, through both eager and the full traced
+`kir.grad` path; practically, training `where(x>0, w_pos·x, w_neg·x)`
+with `Adam` on a genuinely piecewise-linear target recovers both true
+slopes to four decimal places.
 
 ## Why
 

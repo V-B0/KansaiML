@@ -154,6 +154,18 @@ class TraceValue:
         other = self._coerce(other)
         return self._binop(other, "mul", _broadcast_shape(self.shape, other.shape, "mul"))
 
+    def gt(self, other):
+        other = self._coerce(other)
+        return self._binop(other, "gt", _broadcast_shape(self.shape, other.shape, "gt"))
+
+    def lt(self, other):
+        other = self._coerce(other)
+        return self._binop(other, "lt", _broadcast_shape(self.shape, other.shape, "lt"))
+
+    def eq(self, other):
+        other = self._coerce(other)
+        return self._binop(other, "eq", _broadcast_shape(self.shape, other.shape, "eq"))
+
     def matmul(self, other):
         # Mirrors Tensor::matmul's own two paths (core/src/Tensor.cpp):
         # forward shape computation is exactly what's needed here, so
@@ -407,6 +419,9 @@ _OP_TABLE = {
     "add": lambda a, b: a.add(b),
     "sub": lambda a, b: a.sub(b),
     "mul": lambda a, b: a.mul(b),
+    "gt": lambda a, b: a.gt(b),
+    "lt": lambda a, b: a.lt(b),
+    "eq": lambda a, b: a.eq(b),
     "matmul": lambda a, b: a.matmul(b),
     "relu": lambda a: a.relu(),
     "sum": lambda a: a.sum(),
@@ -1323,6 +1338,23 @@ def _vjp_index_select(bwd, node, primal_id, g_out, by_id):
     return [grad_x]
 
 
+def _vjp_compare(bwd, node, primal_id, g_out, by_id):
+    """Same "deliberate exact zero" shape _vjp_max_dim uses, for the
+    same underlying reason: gt/lt/eq are piecewise-constant (step)
+    functions of their inputs, so their true gradient is zero (or
+    undefined right at a boundary) everywhere -- there's no real
+    gradient here to approximate, unlike an op that's merely
+    non-differentiable at isolated points (relu at 0) but has a
+    well-defined gradient almost everywhere. Both operands get their
+    own zero, at their own (pre-broadcast) shape, not g_out's."""
+    a_id, b_id = node.inputs
+    a_shape = by_id[a_id].shape
+    b_shape = by_id[b_id].shape
+    zero_a = bwd.add("constant", [], a_shape, node.dtype, value=core.zeros(a_shape))
+    zero_b = bwd.add("constant", [], b_shape, node.dtype, value=core.zeros(b_shape))
+    return [zero_a, zero_b]
+
+
 _VJP_RULES = {
     "add": _vjp_add,
     "sub": _vjp_sub,
@@ -1346,6 +1378,9 @@ _VJP_RULES = {
     "sum_dim": _vjp_sum_dim,
     "max_dim": _vjp_max_dim,
     "index_select": _vjp_index_select,
+    "gt": _vjp_compare,
+    "lt": _vjp_compare,
+    "eq": _vjp_compare,
 }
 
 

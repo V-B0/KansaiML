@@ -45,7 +45,7 @@ void sum_over_batch(const float* grad_out, float* grad_bias, int64_t batch, int6
 }
 
 namespace {
-enum class BinOp { Add, Sub, Mul };
+enum class BinOp { Add, Sub, Mul, Gt, Lt, Eq };
 
 // Broadcast strides for one operand (`shape`, rank `rank`) against the
 // output (`out_shape`, rank `out_rank >= rank`), right-aligned: output
@@ -110,6 +110,9 @@ void broadcast_binary(const float* a, const int64_t* a_shape, int64_t a_rank,
             case BinOp::Add: out[idx] = av + bv; break;
             case BinOp::Sub: out[idx] = av - bv; break;
             case BinOp::Mul: out[idx] = av * bv; break;
+            case BinOp::Gt: out[idx] = av > bv ? 1.0f : 0.0f; break;
+            case BinOp::Lt: out[idx] = av < bv ? 1.0f : 0.0f; break;
+            case BinOp::Eq: out[idx] = av == bv ? 1.0f : 0.0f; break;
         }
     }
 }
@@ -131,6 +134,24 @@ void mul_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
                     const float* b, const int64_t* b_shape, int64_t b_rank,
                     const int64_t* out_shape, int64_t out_rank, float* out) {
     broadcast_binary(a, a_shape, a_rank, b, b_shape, b_rank, out_shape, out_rank, out, BinOp::Mul);
+}
+
+void greater_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
+                        const float* b, const int64_t* b_shape, int64_t b_rank,
+                        const int64_t* out_shape, int64_t out_rank, float* out) {
+    broadcast_binary(a, a_shape, a_rank, b, b_shape, b_rank, out_shape, out_rank, out, BinOp::Gt);
+}
+
+void less_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
+                     const float* b, const int64_t* b_shape, int64_t b_rank,
+                     const int64_t* out_shape, int64_t out_rank, float* out) {
+    broadcast_binary(a, a_shape, a_rank, b, b_shape, b_rank, out_shape, out_rank, out, BinOp::Lt);
+}
+
+void equal_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
+                      const float* b, const int64_t* b_shape, int64_t b_rank,
+                      const int64_t* out_shape, int64_t out_rank, float* out) {
+    broadcast_binary(a, a_shape, a_rank, b, b_shape, b_rank, out_shape, out_rank, out, BinOp::Eq);
 }
 
 void reduce_to_shape(const float* grad, const int64_t* grad_shape, int64_t grad_rank,

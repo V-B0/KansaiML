@@ -1826,6 +1826,78 @@ rest, forcing the model to actually learn individual token identity
 through the embedding table rather than any positional or count-based
 shortcut -- reaching 100% test accuracy.
 
+## Comparison ops and where
+
+`MultiHeadAttention`'s own `mask` argument had to be strictly
+additive, a real, explicitly stated limitation at the time it shipped:
+Kansai had no `where`/comparison-op/boolean-masking primitive at all,
+so an additive mask was the only way to make masking possible. That
+gap closes here.
+
+Three new comparison kernels -- `gt`/`lt`/`eq` -- slot into
+`broadcast_binary`'s existing `BinOp` switch (`backend/cpu/src/
+Ops.cpp`) right alongside `Add`/`Sub`/`Mul`, reusing the exact same
+general-broadcasting machinery (`broadcast_strides`, the stride-0-for-
+a-broadcast-axis trick) `add`/`sub`/`mul`'s own broadcast kernels
+already established -- no new broadcasting logic, just three new
+per-element comparisons (`1.0f`/`0.0f`) dropped into the same switch
+statement. `Tensor::gt/lt/eq` follow the exact-shape-fast-path-vs-
+general-broadcast shape every other binary op uses, with one
+deliberate, permanent difference: they never attach a `GradNode`, even
+when an operand requires grad. A comparison is a step function of its
+inputs -- its true gradient is zero (or undefined right at the
+boundary) everywhere, not "whatever the usual chain rule would give
+if this were differentiable," so it's correct to never wire a
+backward path at all, not an oversight to fix later.
+
+KIR integration follows the by-now-established binary-op pattern
+(`TraceValue.gt/lt/eq`, `_OP_TABLE` entries) -- but with a twist
+worth noting: none of the four interpreters needed a single new
+dispatch line. `gt`/`lt`/`eq` take no attrs (same as `add`/`sub`/
+`mul`), so `run`/`run_fused`/`run_planned`'s shared `_OP_TABLE`
+fallback already covers them for free, and `run_metal` (which has no
+Metal comparison kernel) falls through to that exact same `_OP_TABLE`
+CPU path automatically too -- the same honest fallback `reshape`/
+`transpose`/`slice`/`cat` already take, just without even needing the
+explicit `if node.op == ...` line those needed (they carry attrs;
+comparisons don't). `_vjp_compare` gives `kir.grad` a defined answer
+rather than a `KeyError` if a differentiated graph happens to touch a
+comparison node -- an explicit zero for BOTH operands, the identical
+"deliberate zero" pattern `_vjp_max_dim` already established for
+`max(dim)`, not a new kind of special case.
+
+`where(cond, a, b)` is the real payoff, and needed literally nothing
+new: it's `b + cond * (a - b)`, an algebraic rearrangement of the
+more obvious `cond*a + (1-cond)*b` chosen specifically to avoid
+needing a `ones_like(cond)` -- which would have meant either a new
+kernel or new KIR plumbing. Written that way, `where` only calls
+`sub`/`mul`/`add`, which already exist, identically, on both eager
+`Tensor` and traced `TraceValue` -- so `kansai.where`, one plain
+Python function living in `kansai/__init__.py` (not a C++ method, not
+a KIR node type at all), works unmodified whether it's called on real
+Tensors or inside a `kir.trace`'d graph. Gradient flows into `a`/`b`
+through their ordinary `sub`/`mul`/`add` vjps with zero special-
+casing needed for `where` itself; gradient into `cond` is exactly
+zero, inherited automatically from `gt`/`lt`/`eq`'s own vjp.
+
+Verified: `gt`/`lt`/`eq` forward at both exact-matching and general-
+broadcast shapes, and the non-differentiability itself (`requires_grad`
+confirmed to stay `False` on a comparison's output even when its input
+requires grad) plus rejection of a genuinely non-broadcastable shape
+pair; `where`'s forward against a manual selection and backward
+confirming gradient lands on `a` at exactly the positions its branch
+was taken, on `b` at exactly the complementary positions, and NEVER on
+`cond`; the combined `gt`+`where` pattern through the full KIR path --
+`trace`, all four interpreters, and `kir.grad` -- confirming that same
+gradient routing (zero into the compared values, correct into whichever
+branch) survives tracing exactly, not just eager; and, practically,
+fitting a genuinely piecewise-linear function (slope `2` for `x>0`,
+slope `-1` for `x<=0`) by training `where(x>0, w_pos*x, w_neg*x)` with
+`Adam` -- a task that only converges to the two correct slopes if
+gradient is actually routed through whichever branch each individual
+example took, and it does, landing on `w_pos=2.0000`, `w_neg=-1.0000`
+to four decimal places.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

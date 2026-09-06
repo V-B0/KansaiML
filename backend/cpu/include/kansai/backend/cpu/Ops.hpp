@@ -43,6 +43,23 @@ void mul_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
                     const float* b, const int64_t* b_shape, int64_t b_rank,
                     const int64_t* out_shape, int64_t out_rank, float* out);
 
+// Elementwise comparisons, same general-broadcasting shape as
+// add_broadcast/sub_broadcast/mul_broadcast above -- 1.0f where the
+// comparison holds, 0.0f where it doesn't. Non-differentiable (a
+// comparison's result doesn't vary smoothly with its inputs), so
+// there's no backward counterpart the way add/sub/mul each have one --
+// see Tensor::gt/lt/eq's own doc comment for how the resulting
+// GradNode wires a deliberate zero gradient instead.
+void greater_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
+                        const float* b, const int64_t* b_shape, int64_t b_rank,
+                        const int64_t* out_shape, int64_t out_rank, float* out);
+void less_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
+                     const float* b, const int64_t* b_shape, int64_t b_rank,
+                     const int64_t* out_shape, int64_t out_rank, float* out);
+void equal_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
+                      const float* b, const int64_t* b_shape, int64_t b_rank,
+                      const int64_t* out_shape, int64_t out_rank, float* out);
+
 // The general broadcasting backward primitive: sums `grad` (shape
 // grad_shape, rank grad_rank) down to `target_shape` (rank
 // target_rank <= grad_rank) -- the exact inverse of how a smaller
