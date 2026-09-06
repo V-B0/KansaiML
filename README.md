@@ -39,7 +39,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | 2 — KIR | Tracing, fusion, memory pooling, source-transform autograd | ✅ done |
 | 3 — GPU backend | Real Metal compute (tiled kernel + MPS, full op + Conv2d coverage) | ✅ done |
 | 4 — Distributed | `DeviceMesh`/`DTensor`, distributed gradients, concurrent dispatch, int8 quantization, serialization | ✅ done |
-| — Core ops | `reshape`/`transpose`/`slice`/`cat`, full autograd + KIR integration | ✅ done |
+| — Core ops | `reshape`/`transpose`/`slice`/`cat`, general broadcasting, full autograd + KIR integration | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -87,7 +87,15 @@ axes rather than only the easy case; `distributed.py`'s own split/concat
 are three lines apiece on top of these now, replacing roughly sixty
 lines of manual Python stride bookkeeping that used to exist specifically
 because Kansai had no slice/cat kernel — a real internal caller adopting
-the new ops on day one, not a capability sitting unused.
+the new ops on day one, not a capability sitting unused; `add`/`sub`/`mul`
+now accept any NumPy-compatible broadcast shape (previously one hardcoded
+pattern for `add`, none at all for `sub`/`mul`), with the pre-existing
+bias-broadcast fast paths (`fused_bias_relu`, Metal's batched dispatch)
+confirmed to still take the exact same route they always did, not just
+compute the same numbers — a real routing bug this work surfaced and
+fixed (`run_metal` was one shape-equality check away from silently
+sending a general broadcast through a Metal kernel built for a different
+shape entirely), caught by the test suite failing on first run.
 
 ## Why
 

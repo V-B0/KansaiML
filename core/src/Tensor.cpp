@@ -13,6 +13,31 @@ static int64_t numel_of(const std::vector<int64_t>& shape) {
     return n;
 }
 
+// NumPy-style right-aligned broadcasting: pads the shorter shape with
+// implicit leading 1s, then each aligned pair of dims must either match
+// or one of them must be 1 -- the standard rule, used here (rather than
+// the fixed "(batch, features) + (features,)" bias case add() already
+// special-cased before this existed) for any OTHER shape mismatch
+// add/sub/mul now accept. Throws on an incompatible pair rather than
+// silently picking one side, the same "fail loud" stance every other
+// shape check in this file already takes.
+static std::vector<int64_t> broadcast_shapes(const std::vector<int64_t>& a, const std::vector<int64_t>& b,
+                                              const char* op_name) {
+    int64_t ra = static_cast<int64_t>(a.size()), rb = static_cast<int64_t>(b.size());
+    int64_t out_rank = ra > rb ? ra : rb;
+    std::vector<int64_t> out(static_cast<size_t>(out_rank));
+    for (int64_t i = 0; i < out_rank; ++i) {
+        int64_t ai = i - (out_rank - ra);
+        int64_t bi = i - (out_rank - rb);
+        int64_t av = (ai >= 0) ? a[ai] : 1;
+        int64_t bv = (bi >= 0) ? b[bi] : 1;
+        if (av != bv && av != 1 && bv != 1)
+            throw std::runtime_error(std::string(op_name) + ": shapes are not broadcast-compatible");
+        out[i] = av > bv ? av : bv;
+    }
+    return out;
+}
+
 int64_t Tensor::numel() const { return numel_of(impl_->shape); }
 
 namespace {
@@ -99,30 +124,65 @@ Tensor Tensor::add(const Tensor& other) const {
     const Tensor& a = *this;
     const Tensor& b = other;
 
+    // Three paths, fastest first: the fixed 2D bias case (its own
+    // dedicated kernel, and what elementwise_fusion/the Metal backend's
+    // fused_bias_relu/add_bias specifically pattern-match -- unchanged,
+    // since real fused/GPU fast paths depend on this exact shape check
+    // staying exactly what it was), an exact shape match (the other
+    // pre-existing fast path), and -- new -- any other broadcast-
+    // compatible shape pair, via the general kernel. See
+    // broadcast_shapes's own comment for the rule; it throws if the
+    // shapes don't broadcast at all.
     bool bias_broadcast = (b.ndim() == 1 && a.ndim() == 2 && a.shape()[1] == b.shape()[0]);
-    if (!bias_broadcast && a.shape() != b.shape())
-        throw std::runtime_error("add: shape mismatch");
+    bool exact = (a.shape() == b.shape());
+    bool general_broadcast = !bias_broadcast && !exact;
 
-    Tensor out = Tensor::zeros(a.shape(), false);
+    std::vector<int64_t> out_shape = general_broadcast ? broadcast_shapes(a.shape(), b.shape(), "add") : a.shape();
+
+    Tensor out = Tensor::zeros(out_shape, false);
     if (bias_broadcast)
         cpu::add_bias_broadcast(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.shape()[0], a.shape()[1]);
-    else
+    else if (exact)
         cpu::add(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel());
+    else
+        cpu::add_broadcast(a.data_ptr(), a.shape().data(), a.ndim(), b.data_ptr(), b.shape().data(), b.ndim(),
+                            out_shape.data(), static_cast<int64_t>(out_shape.size()), out.data_ptr());
 
     if (a.requires_grad() || b.requires_grad()) {
         auto node = std::make_shared<GradNode>();
         node->name = "add";
         node->inputs = {a, b};
-        node->backward_fn = [bias_broadcast](const Tensor& grad_output) -> std::vector<Tensor> {
-            Tensor grad_a = grad_output;
-            Tensor grad_b;
+        auto a_shape = a.shape();
+        auto b_shape = b.shape();
+        node->backward_fn = [bias_broadcast, general_broadcast, a_shape, b_shape](
+                                 const Tensor& grad_output) -> std::vector<Tensor> {
             if (bias_broadcast) {
-                grad_b = Tensor::zeros({grad_output.shape()[1]}, false);
+                Tensor grad_b = Tensor::zeros({grad_output.shape()[1]}, false);
                 cpu::sum_over_batch(grad_output.data_ptr(), grad_b.data_ptr(),
                                      grad_output.shape()[0], grad_output.shape()[1]);
-            } else {
-                grad_b = grad_output;
+                return {grad_output, grad_b};
             }
+            if (!general_broadcast) return {grad_output, grad_output};
+
+            // General case: whichever operand didn't already have
+            // grad_output's own shape got there by broadcasting, so its
+            // gradient is grad_output summed back down over every axis
+            // that broadcast -- reduce_to_shape is a no-op (single full
+            // pass, no actual reduction) when a shape already matches,
+            // but skip it outright in that case anyway rather than pay
+            // for a copy neither operand needs.
+            Tensor grad_a = (a_shape == grad_output.shape())
+                                 ? grad_output
+                                 : Tensor::zeros(a_shape, false);
+            if (a_shape != grad_output.shape())
+                cpu::reduce_to_shape(grad_output.data_ptr(), grad_output.shape().data(), grad_output.ndim(),
+                                      a_shape.data(), static_cast<int64_t>(a_shape.size()), grad_a.data_ptr());
+            Tensor grad_b = (b_shape == grad_output.shape())
+                                 ? grad_output
+                                 : Tensor::zeros(b_shape, false);
+            if (b_shape != grad_output.shape())
+                cpu::reduce_to_shape(grad_output.data_ptr(), grad_output.shape().data(), grad_output.ndim(),
+                                      b_shape.data(), static_cast<int64_t>(b_shape.size()), grad_b.data_ptr());
             return {grad_a, grad_b};
         };
         out.set_grad_node(node);
@@ -134,20 +194,37 @@ Tensor Tensor::add(const Tensor& other) const {
 Tensor Tensor::sub(const Tensor& other) const {
     const Tensor& a = *this;
     const Tensor& b = other;
-    if (a.shape() != b.shape())
-        throw std::runtime_error("sub: shape mismatch");
 
-    Tensor out = Tensor::zeros(a.shape(), false);
-    cpu::sub(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel());
+    bool exact = (a.shape() == b.shape());
+    std::vector<int64_t> out_shape = exact ? a.shape() : broadcast_shapes(a.shape(), b.shape(), "sub");
+
+    Tensor out = Tensor::zeros(out_shape, false);
+    if (exact)
+        cpu::sub(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel());
+    else
+        cpu::sub_broadcast(a.data_ptr(), a.shape().data(), a.ndim(), b.data_ptr(), b.shape().data(), b.ndim(),
+                            out_shape.data(), static_cast<int64_t>(out_shape.size()), out.data_ptr());
 
     if (a.requires_grad() || b.requires_grad()) {
         auto node = std::make_shared<GradNode>();
         node->name = "sub";
         node->inputs = {a, b};
-        node->backward_fn = [](const Tensor& grad_output) -> std::vector<Tensor> {
+        auto a_shape = a.shape();
+        auto b_shape = b.shape();
+        node->backward_fn = [exact, a_shape, b_shape](const Tensor& grad_output) -> std::vector<Tensor> {
             Tensor neg = Tensor::zeros(grad_output.shape(), false);
             cpu::axpy_(neg.data_ptr(), grad_output.data_ptr(), -1.0f, grad_output.numel());
-            return {grad_output, neg};
+            if (exact) return {grad_output, neg};
+
+            Tensor grad_a = (a_shape == grad_output.shape()) ? grad_output : Tensor::zeros(a_shape, false);
+            if (a_shape != grad_output.shape())
+                cpu::reduce_to_shape(grad_output.data_ptr(), grad_output.shape().data(), grad_output.ndim(),
+                                      a_shape.data(), static_cast<int64_t>(a_shape.size()), grad_a.data_ptr());
+            Tensor grad_b = (b_shape == neg.shape()) ? neg : Tensor::zeros(b_shape, false);
+            if (b_shape != neg.shape())
+                cpu::reduce_to_shape(neg.data_ptr(), neg.shape().data(), neg.ndim(),
+                                      b_shape.data(), static_cast<int64_t>(b_shape.size()), grad_b.data_ptr());
+            return {grad_a, grad_b};
         };
         out.set_grad_node(node);
         out.set_requires_grad(true);
@@ -158,21 +235,53 @@ Tensor Tensor::sub(const Tensor& other) const {
 Tensor Tensor::mul(const Tensor& other) const {
     const Tensor& a = *this;
     const Tensor& b = other;
-    if (a.shape() != b.shape())
-        throw std::runtime_error("mul: shape mismatch");
 
-    Tensor out = Tensor::zeros(a.shape(), false);
-    cpu::mul(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel());
+    bool exact = (a.shape() == b.shape());
+    std::vector<int64_t> out_shape = exact ? a.shape() : broadcast_shapes(a.shape(), b.shape(), "mul");
+
+    Tensor out = Tensor::zeros(out_shape, false);
+    if (exact)
+        cpu::mul(a.data_ptr(), b.data_ptr(), out.data_ptr(), a.numel());
+    else
+        cpu::mul_broadcast(a.data_ptr(), a.shape().data(), a.ndim(), b.data_ptr(), b.shape().data(), b.ndim(),
+                            out_shape.data(), static_cast<int64_t>(out_shape.size()), out.data_ptr());
 
     if (a.requires_grad() || b.requires_grad()) {
         auto node = std::make_shared<GradNode>();
         node->name = "mul";
         node->inputs = {a, b};
-        node->backward_fn = [a, b](const Tensor& grad_output) -> std::vector<Tensor> {
-            Tensor grad_a = Tensor::zeros(a.shape(), false);
-            Tensor grad_b = Tensor::zeros(b.shape(), false);
-            cpu::mul(grad_output.data_ptr(), b.data_ptr(), grad_a.data_ptr(), a.numel());
-            cpu::mul(grad_output.data_ptr(), a.data_ptr(), grad_b.data_ptr(), a.numel());
+        node->backward_fn = [a, b, exact, out_shape](const Tensor& grad_output) -> std::vector<Tensor> {
+            if (exact) {
+                Tensor grad_a = Tensor::zeros(a.shape(), false);
+                Tensor grad_b = Tensor::zeros(b.shape(), false);
+                cpu::mul(grad_output.data_ptr(), b.data_ptr(), grad_a.data_ptr(), a.numel());
+                cpu::mul(grad_output.data_ptr(), a.data_ptr(), grad_b.data_ptr(), a.numel());
+                return {grad_a, grad_b};
+            }
+
+            // General case: d/da(a*b) = grad_output * b, d/db(a*b) =
+            // grad_output * a -- computed at the full broadcast shape
+            // first (mul_broadcast handles b or a broadcasting up to
+            // grad_output's own shape, exactly the forward op's own
+            // logic run again), then reduced down to each operand's
+            // real shape.
+            Tensor grad_a_full = Tensor::zeros(out_shape, false);
+            cpu::mul_broadcast(grad_output.data_ptr(), grad_output.shape().data(), grad_output.ndim(),
+                                b.data_ptr(), b.shape().data(), b.ndim(),
+                                out_shape.data(), static_cast<int64_t>(out_shape.size()), grad_a_full.data_ptr());
+            Tensor grad_b_full = Tensor::zeros(out_shape, false);
+            cpu::mul_broadcast(grad_output.data_ptr(), grad_output.shape().data(), grad_output.ndim(),
+                                a.data_ptr(), a.shape().data(), a.ndim(),
+                                out_shape.data(), static_cast<int64_t>(out_shape.size()), grad_b_full.data_ptr());
+
+            Tensor grad_a = (a.shape() == out_shape) ? grad_a_full : Tensor::zeros(a.shape(), false);
+            if (a.shape() != out_shape)
+                cpu::reduce_to_shape(grad_a_full.data_ptr(), out_shape.data(), static_cast<int64_t>(out_shape.size()),
+                                      a.shape().data(), a.ndim(), grad_a.data_ptr());
+            Tensor grad_b = (b.shape() == out_shape) ? grad_b_full : Tensor::zeros(b.shape(), false);
+            if (b.shape() != out_shape)
+                cpu::reduce_to_shape(grad_b_full.data_ptr(), out_shape.data(), static_cast<int64_t>(out_shape.size()),
+                                      b.shape().data(), b.ndim(), grad_b.data_ptr());
             return {grad_a, grad_b};
         };
         out.set_grad_node(node);

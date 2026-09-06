@@ -18,6 +18,45 @@ void add_bias_broadcast(const float* x, const float* bias, float* out, int64_t b
 // reduces grad_out: (batch, features) over the batch dim -> grad_bias: (features,)
 void sum_over_batch(const float* grad_out, float* grad_bias, int64_t batch, int64_t features);
 
+// General NumPy-style broadcasting for add/sub/mul: `a` (shape a_shape,
+// rank a_rank) and `b` (shape b_shape, rank b_rank) combine into `out`
+// (shape out_shape, rank out_rank -- already computed by the caller via
+// right-aligned broadcasting rules, same as NumPy's). Unlike every
+// other kernel above (and the fixed bias_broadcast case), the two
+// operands can each independently be smaller than `out` along any
+// dimension -- a size-1 dimension, or a dimension that doesn't exist at
+// all on that operand -- broadcasts via a stride-0 read (every position
+// along that axis reads the same single source element) rather than
+// materializing a larger buffer. This is the fallback path taken only
+// when the operands' shapes don't already match exactly (the fast
+// same-shape kernels above stay the common case); a real, unattempted
+// lever for later is specializing this generic per-element coordinate
+// decomposition into 1D/2D-specific loops the way the fast paths already
+// are for the exact-match case.
+void add_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
+                    const float* b, const int64_t* b_shape, int64_t b_rank,
+                    const int64_t* out_shape, int64_t out_rank, float* out);
+void sub_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
+                    const float* b, const int64_t* b_shape, int64_t b_rank,
+                    const int64_t* out_shape, int64_t out_rank, float* out);
+void mul_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
+                    const float* b, const int64_t* b_shape, int64_t b_rank,
+                    const int64_t* out_shape, int64_t out_rank, float* out);
+
+// The general broadcasting backward primitive: sums `grad` (shape
+// grad_shape, rank grad_rank) down to `target_shape` (rank
+// target_rank <= grad_rank) -- the exact inverse of how a smaller
+// operand broadcasts up to a larger output in add/sub/mul's forward
+// pass above. Every axis `target_shape` doesn't have at all (a leading
+// axis grad_shape carries but target_shape doesn't), or holds as size 1
+// while grad_shape is bigger there, gets summed over. Generalizes the
+// old add-specific sum_over_batch (a fixed 2D "sum over axis 0" case)
+// to any rank and any combination of broadcast axes -- sum_over_batch
+// itself is unchanged and still used for that one fixed shape, since
+// nothing needed it to change.
+void reduce_to_shape(const float* grad, const int64_t* grad_shape, int64_t grad_rank,
+                      const int64_t* target_shape, int64_t target_rank, float* out);
+
 void relu_fwd(const float* x, float* out, int64_t n);
 void relu_bwd(const float* x, const float* grad_out, float* grad_in, int64_t n);
 

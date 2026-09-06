@@ -79,6 +79,29 @@ class Graph:
 # Tracing
 # ---------------------------------------------------------------------
 
+def _broadcast_shape(a_shape: list, b_shape: list, op_name: str) -> list:
+    """NumPy-style right-aligned broadcasting, the Python-side twin of
+    core/src/Tensor.cpp's own broadcast_shapes -- pads the shorter shape
+    with implicit leading 1s, then each aligned pair of dims must either
+    match or one of them must be 1. Raises on an incompatible pair
+    rather than silently guessing; the two implementations must agree
+    exactly, since this one only decides what shape a traced node
+    *records*, while the C++ one is what actually runs when that node
+    executes -- a mismatch between them would mean a graph whose
+    recorded shape lies about what really comes out of it."""
+    out_rank = max(len(a_shape), len(b_shape))
+    out = [1] * out_rank
+    for i in range(out_rank):
+        ai = i - (out_rank - len(a_shape))
+        bi = i - (out_rank - len(b_shape))
+        av = a_shape[ai] if ai >= 0 else 1
+        bv = b_shape[bi] if bi >= 0 else 1
+        if av != bv and av != 1 and bv != 1:
+            raise ValueError(f"{op_name}: shapes are not broadcast-compatible ({a_shape} vs {b_shape})")
+        out[i] = max(av, bv)
+    return out
+
+
 class TraceValue:
     """A placeholder tensor used only during tracing: carries shape/dtype
     metadata and a Node id, never real storage. Its operator surface
@@ -108,23 +131,18 @@ class TraceValue:
 
     def add(self, other):
         other = self._coerce(other)
-        bias_broadcast = (len(other.shape) == 1 and len(self.shape) == 2
-                           and self.shape[1] == other.shape[0])
-        if not bias_broadcast and self.shape != other.shape:
-            raise ValueError(f"add: shape mismatch {self.shape} vs {other.shape}")
-        return self._binop(other, "add", list(self.shape))
+        # _broadcast_shape already covers the old (batch,features) +
+        # (features,) bias case (a strict special case of general
+        # broadcasting), so there's no separate check needed for it.
+        return self._binop(other, "add", _broadcast_shape(self.shape, other.shape, "add"))
 
     def sub(self, other):
         other = self._coerce(other)
-        if self.shape != other.shape:
-            raise ValueError(f"sub: shape mismatch {self.shape} vs {other.shape}")
-        return self._binop(other, "sub", list(self.shape))
+        return self._binop(other, "sub", _broadcast_shape(self.shape, other.shape, "sub"))
 
     def mul(self, other):
         other = self._coerce(other)
-        if self.shape != other.shape:
-            raise ValueError(f"mul: shape mismatch {self.shape} vs {other.shape}")
-        return self._binop(other, "mul", list(self.shape))
+        return self._binop(other, "mul", _broadcast_shape(self.shape, other.shape, "mul"))
 
     def matmul(self, other):
         other = self._coerce(other)
@@ -285,6 +303,9 @@ def run(graph: Graph, *args) -> "core.Tensor":
             values[node.id] = core.broadcast_scalar(
                 values[node.inputs[0]], node.shape, node.attrs["scale"]
             )
+            continue
+        if node.op == "reduce_to_shape":
+            values[node.id] = core.reduce_to_shape(values[node.inputs[0]], node.shape)
             continue
         if node.op == "conv2d":
             x, w, b = (values[i] for i in node.inputs)
@@ -545,6 +566,9 @@ def run_fused(graph: Graph, *args) -> "core.Tensor":
             values[node.id] = core.broadcast_scalar(
                 values[node.inputs[0]], node.shape, node.attrs["scale"]
             )
+            continue
+        if node.op == "reduce_to_shape":
+            values[node.id] = core.reduce_to_shape(values[node.inputs[0]], node.shape)
             continue
         if node.op == "fused_bias_relu":
             x, bias = (values[i] for i in node.inputs)
@@ -807,29 +831,54 @@ def run_planned(graph: Graph, plan: MemoryPlan, pool, *args) -> "core.Tensor":
 # memory-plan it): this is what "the derivative is a program, not a
 # tape" (the project's design decision) actually cashes out to.
 
+def _reduce_if_needed(bwd, tensor_id, tensor_shape, target_shape, dtype):
+    """Emits a "reduce_to_shape" node summing `tensor_id` (shape
+    tensor_shape) down to `target_shape` -- unless they already match,
+    in which case there's nothing to reduce and the node is passed
+    through unchanged. Shared by add/sub/mul's vjp rules below: whichever
+    operand didn't already have the output's own shape got there by
+    broadcasting, so its gradient needs summing back down over every
+    axis that broadcast -- reduce_to_shape (general_to_shape's KIR-level
+    twin, see GradOps.hpp) is exactly that operation, generalizing the
+    old bias-specific sum_axis0 to any rank and any combination of
+    broadcast axes."""
+    if list(tensor_shape) == list(target_shape):
+        return tensor_id
+    return bwd.add("reduce_to_shape", [tensor_id], list(target_shape), dtype)
+
+
 def _vjp_add(bwd, node, primal_id, g_out, by_id):
     a_id, b_id = node.inputs
-    grad_a = g_out
-    if by_id[a_id].shape == by_id[b_id].shape:
-        grad_b = g_out
-    else:
-        # the bias-broadcast case: b is (features,), g_out is
-        # (batch, features) -- sum the batch dim back down to match.
-        grad_b = bwd.add("sum_axis0", [g_out], by_id[b_id].shape, node.dtype)
+    a_shape, b_shape = by_id[a_id].shape, by_id[b_id].shape
+    grad_a = _reduce_if_needed(bwd, g_out, node.shape, a_shape, node.dtype)
+    grad_b = _reduce_if_needed(bwd, g_out, node.shape, b_shape, node.dtype)
     return [grad_a, grad_b]
 
 
 def _vjp_sub(bwd, node, primal_id, g_out, by_id):
-    shape = node.shape
-    zero_id = bwd.add("constant", [], shape, node.dtype, value=core.zeros(shape))
-    neg_g = bwd.add("sub", [zero_id, g_out], shape, node.dtype)
-    return [g_out, neg_g]
+    a_id, b_id = node.inputs
+    a_shape, b_shape = by_id[a_id].shape, by_id[b_id].shape
+    out_shape = node.shape
+    zero_id = bwd.add("constant", [], out_shape, node.dtype, value=core.zeros(out_shape))
+    neg_g = bwd.add("sub", [zero_id, g_out], out_shape, node.dtype)
+    grad_a = _reduce_if_needed(bwd, g_out, out_shape, a_shape, node.dtype)
+    grad_b = _reduce_if_needed(bwd, neg_g, out_shape, b_shape, node.dtype)
+    return [grad_a, grad_b]
 
 
 def _vjp_mul(bwd, node, primal_id, g_out, by_id):
     a_id, b_id = node.inputs
-    grad_a = bwd.add("mul", [g_out, primal_id[b_id]], node.shape, node.dtype)
-    grad_b = bwd.add("mul", [g_out, primal_id[a_id]], node.shape, node.dtype)
+    a_shape, b_shape = by_id[a_id].shape, by_id[b_id].shape
+    out_shape = node.shape
+    # d/da(a*b) = g_out * b, d/db(a*b) = g_out * a -- computed at the
+    # full output shape first ("mul" broadcasts the smaller primal up
+    # automatically, the same general broadcasting the forward op
+    # itself now supports), then reduced down to each operand's own
+    # shape wherever that's smaller than the output.
+    grad_a_full = bwd.add("mul", [g_out, primal_id[b_id]], out_shape, node.dtype)
+    grad_b_full = bwd.add("mul", [g_out, primal_id[a_id]], out_shape, node.dtype)
+    grad_a = _reduce_if_needed(bwd, grad_a_full, out_shape, a_shape, node.dtype)
+    grad_b = _reduce_if_needed(bwd, grad_b_full, out_shape, b_shape, node.dtype)
     return [grad_a, grad_b]
 
 
@@ -1045,13 +1094,21 @@ def grad(graph: Graph, wrt: list) -> Graph:
 def _metal_elementwise_kind(node, by_id):
     """Returns "bias_relu"/"add_bias" if `node` is one of the two Metal
     elementwise kernels run_metal batches, else None. For an "add" node
-    this means bias-broadcast specifically (a plain same-shape add is
-    left on CPU, same as run_metal's non-batched ops)."""
+    this means bias-broadcast SPECIFICALLY -- (batch, features) +
+    (features,), the one shape metal_add_bias's own kernel actually
+    handles -- not just "any shape mismatch": now that add() supports
+    general N-D broadcasting too, a same-checked-but-wrong-shape general
+    broadcast (say (3,1) + (1,4)) would otherwise get misrouted through
+    a kernel that assumes the wrong indexing entirely. A plain same-shape
+    add, or any OTHER broadcast shape, is left on CPU, same as
+    run_metal's other non-batched ops -- matches _fusable's identical,
+    already-precise check in elementwise_fusion above."""
     if node.op == "fused_bias_relu":
         return "bias_relu"
     if node.op == "add":
         a_id, b_id = node.inputs
-        if by_id[a_id].shape != by_id[b_id].shape:
+        a_shape, b_shape = by_id[a_id].shape, by_id[b_id].shape
+        if len(a_shape) == 2 and len(b_shape) == 1 and a_shape[1] == b_shape[0]:
             return "add_bias"
     return None
 
@@ -1154,6 +1211,10 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
                 values[node.inputs[0]], node.shape, node.attrs["scale"]
             )
             continue
+        if node.op == "reduce_to_shape":
+            flush_chain()
+            values[node.id] = core.reduce_to_shape(values[node.inputs[0]], node.shape)
+            continue
 
         kind = _metal_elementwise_kind(node, by_id)
         if kind is not None:
@@ -1181,19 +1242,24 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
             values[node.id] = core.metal_fused_sub_square(a, b)
             continue
         if node.op == "add":
-            # Only a same-shape add ever reaches here -- a bias-broadcast
-            # one was already caught by _metal_elementwise_kind above and
-            # routed through the batched chain instead.
+            # A bias-broadcast add was already caught by
+            # _metal_elementwise_kind above and routed through the
+            # batched chain instead -- what reaches here is either a
+            # same-shape add (metal_add's own, only supported, case) or
+            # some other general-broadcast shape metal_add can't handle
+            # at all (no Metal broadcasting kernel exists yet -- same
+            # honest CPU fallback reshape/transpose/slice/cat already
+            # take here for the identical reason).
             a, b = (values[i] for i in node.inputs)
-            values[node.id] = core.metal_add(a, b)
+            values[node.id] = core.metal_add(a, b) if list(a.shape) == list(b.shape) else a.add(b)
             continue
         if node.op == "sub":
             a, b = (values[i] for i in node.inputs)
-            values[node.id] = core.metal_sub(a, b)
+            values[node.id] = core.metal_sub(a, b) if list(a.shape) == list(b.shape) else a.sub(b)
             continue
         if node.op == "mul":
             a, b = (values[i] for i in node.inputs)
-            values[node.id] = core.metal_mul(a, b)
+            values[node.id] = core.metal_mul(a, b) if list(a.shape) == list(b.shape) else a.mul(b)
             continue
         if node.op == "relu":
             (x,) = (values[i] for i in node.inputs)

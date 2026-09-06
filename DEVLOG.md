@@ -1104,12 +1104,94 @@ refactor, including the concurrency benchmark's own ~1.53x measurement
 -- confirming the native ops didn't just work in isolation, they slot
 into an existing, real caller with no behavior change.
 
-Not attempted here, stated up front: general NumPy-style broadcasting
-for `add`/`sub`/`mul` (still exactly one hardcoded pattern, the
-`(batch, features) + (features,)` bias case) -- a separate, also-
-substantial piece of work touching the elementwise kernels and their
-vjp rules rather than shape/layout, deliberately scoped out of this pass
-rather than rushed alongside it. A real next step, not forgotten.
+Not attempted in this pass, stated up front at the time: general
+NumPy-style broadcasting for `add`/`sub`/`mul` (still exactly one
+hardcoded pattern, the `(batch, features) + (features,)` bias case) --
+a separate, also-substantial piece of work touching the elementwise
+kernels and their vjp rules rather than shape/layout, deliberately
+scoped out rather than rushed alongside this. Done in the very next
+piece of work -- see the next section.
+
+## Broadcasting
+
+`add`, `sub`, `mul` now accept any right-aligned, NumPy-compatible pair
+of shapes -- before this, `add` supported exactly one broadcast shape
+(the `(batch, features) + (features,)` bias case, hardcoded), and
+`sub`/`mul` supported none at all: any other shape mismatch was a hard
+error. The design question that mattered most here wasn't "how to
+broadcast" (the standard right-align-and-stretch-size-1-dims rule,
+same as NumPy/PyTorch), it was "how to add it without breaking or
+slowing down the fast paths that already depend on the OLD, narrower
+bias-broadcast shape check" -- `elementwise_fusion`'s pattern match into
+`fused_bias_relu`, and `run_metal`'s own batched dispatch into
+`metal_add_bias`/`metal_elementwise_chain`, both real, measured,
+already-shipped performance wins that specifically recognize that one
+2D shape.
+
+The answer: three paths in `Tensor::add`, fastest-checked first --
+the fixed bias case (`cpu::add_bias_broadcast`, its own dedicated
+kernel, completely unchanged), an exact shape match (`cpu::add`, also
+unchanged), and, new, a general fallback (`cpu::add_broadcast`) taken
+only when neither of the first two applies. `sub`/`mul` get two paths
+each (exact match, then the new general fallback -- they never had a
+bias-specific case to preserve). The general kernels use the standard
+stride-0 broadcast trick: a `broadcast_strides` helper computes, per
+operand, a 0 stride for any axis that operand doesn't have or holds as
+size 1 while the output is bigger there, so a single generic N-D
+coordinate-decomposition loop (the same shape as `transpose`'s own, see
+the previous section) reads the *same* source element for every output
+position along a broadcast axis instead of materializing a larger
+buffer.
+
+Backward needed a genuinely new general primitive:
+`reduce_to_shape(grad, target_shape)` sums a gradient back down to a
+smaller shape, summing over every axis the smaller shape doesn't have
+at all or holds as size 1 -- the exact inverse of how that shape
+broadcast up to begin with, and a strict generalization of the old
+`sum_axis0` (a fixed "sum over axis 0 of a 2D tensor" case; verified to
+produce bit-identical results to it on the bias shape, and kept
+alongside it rather than replacing it, since nothing needed it to
+change). `mul`'s broadcast backward composes two primitives rather than
+needing a third: `d/da(a*b) = grad_output * b` computed at the *full*
+output shape first (via `mul_broadcast` again -- broadcasting `b` up
+exactly the way the forward pass itself did), then `reduce_to_shape`
+brings it back down to `a`'s own shape. Exposed as first-class KIR ops
+too (`reduce_to_shape` joins `sum_axis0`/`matmul_nt`/`matmul_tn` in
+`GradOps`, dispatched in `run`/`run_fused`/`run_metal` -- not
+`run_planned`, which already excludes `grad()`-produced graphs entirely,
+same as `tuple`/`broadcast_scalar`), so `kir.grad`'s `_vjp_add`/
+`_vjp_sub`/`_vjp_mul` could be *simplified*, not just extended: each
+now just compares an operand's own shape against the output's, calling
+`reduce_to_shape` only when they differ, uniformly across the bias
+case, the general case, and plain same-shape ops -- no separate
+bias-specific branch left in any of the three.
+
+A real bug surfaced and fixed during this work, not discovered later
+by a user: `run_metal`'s `_metal_elementwise_kind` decided whether an
+`"add"` node was "the bias case" by checking only *whether the two
+input shapes differed at all* -- true for the bias case, but now also
+true for a general broadcast like `(3,1) + (1,4)`, which would have
+been silently misrouted through `metal_add_bias`'s kernel (built for a
+completely different indexing scheme) rather than actually erroring or
+computing the right answer. Caught by `tests/test_broadcasting.py`
+itself failing on first run, not by inspection -- the fix tightens that
+check to the exact same shape predicate `elementwise_fusion`'s own
+(already-correct) `_fusable` uses, and a matching fix in `run_metal`'s
+plain `add`/`sub`/`mul` dispatch (fall back to the CPU eager op for any
+shape `metal_add`/`metal_sub`/`metal_mul` — none of which have a
+broadcasting Metal kernel yet — can't handle directly).
+
+Verified at the same bar as the ops in the previous section: forward
+values (including a rank-mismatch case, `(2,3,4) + (4,)`, that the OLD
+bias check's fixed "a must be exactly 2D" requirement could never have
+accepted), eager backward against central differences for a genuine
+2-way broadcast where *neither* operand already has the output's shape
+(a case the old bias logic never exercised, since one side, the batch
+dimension, always already matched), the full KIR path, and -- the
+regression check that actually caught the `_metal_elementwise_kind` bug
+above -- confirmation that the bias-broadcast case still takes the
+exact same fused/Metal fast paths it always did, not just that it still
+computes the right numbers.
 
 ## Build
 

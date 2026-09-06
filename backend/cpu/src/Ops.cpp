@@ -42,6 +42,135 @@ void sum_over_batch(const float* grad_out, float* grad_bias, int64_t batch, int6
             grad_bias[j] += grad_out[i * features + j];
 }
 
+namespace {
+enum class BinOp { Add, Sub, Mul };
+
+// Broadcast strides for one operand (`shape`, rank `rank`) against the
+// output (`out_shape`, rank `out_rank >= rank`), right-aligned: output
+// axis i (0-indexed from the left) corresponds to this operand's own
+// axis i - (out_rank - rank), if that's >= 0 -- else the operand has no
+// such axis at all (an implicit leading size-1). The returned stride
+// for an axis this operand broadcasts along (no such axis, or a size-1
+// axis stretching to something bigger) is 0, so every output position
+// along that axis reads the same single source element -- the standard
+// stride-0 broadcast trick, avoiding materializing a larger buffer.
+void broadcast_strides(const int64_t* shape, int64_t rank, int64_t out_rank, int64_t* strides_out) {
+    std::vector<int64_t> own_strides(static_cast<size_t>(rank));
+    if (rank > 0) {
+        own_strides[static_cast<size_t>(rank - 1)] = 1;
+        for (int64_t i = rank - 2; i >= 0; --i)
+            own_strides[static_cast<size_t>(i)] = own_strides[static_cast<size_t>(i + 1)] * shape[i + 1];
+    }
+    int64_t offset = out_rank - rank;
+    for (int64_t i = 0; i < out_rank; ++i) {
+        int64_t j = i - offset;
+        // j < 0: this operand has no such axis at all -- broadcast (stride 0).
+        // shape[j] == 1: broadcasting a size-1 axis (stride 0 either way -- if
+        // out_shape[i] is also 1 the decomposed coordinate there is always 0
+        // regardless of stride, and if out_shape[i] is bigger, 0 is exactly
+        // the "always read the one element" stride this needs).
+        strides_out[i] = (j < 0 || shape[j] == 1) ? 0 : own_strides[static_cast<size_t>(j)];
+    }
+}
+
+void broadcast_binary(const float* a, const int64_t* a_shape, int64_t a_rank,
+                       const float* b, const int64_t* b_shape, int64_t b_rank,
+                       const int64_t* out_shape, int64_t out_rank, float* out, BinOp op) {
+    std::vector<int64_t> a_strides(static_cast<size_t>(out_rank));
+    std::vector<int64_t> b_strides(static_cast<size_t>(out_rank));
+    broadcast_strides(a_shape, a_rank, out_rank, a_strides.data());
+    broadcast_strides(b_shape, b_rank, out_rank, b_strides.data());
+
+    std::vector<int64_t> out_strides(static_cast<size_t>(out_rank));
+    if (out_rank > 0) {
+        out_strides[static_cast<size_t>(out_rank - 1)] = 1;
+        for (int64_t i = out_rank - 2; i >= 0; --i)
+            out_strides[static_cast<size_t>(i)] = out_strides[static_cast<size_t>(i + 1)] * out_shape[i + 1];
+    }
+
+    int64_t n = 1;
+    for (int64_t i = 0; i < out_rank; ++i) n *= out_shape[i];
+
+    std::vector<int64_t> coord(static_cast<size_t>(out_rank));
+    for (int64_t idx = 0; idx < n; ++idx) {
+        int64_t rem = idx;
+        for (int64_t d = 0; d < out_rank; ++d) {
+            coord[d] = rem / out_strides[d];
+            rem %= out_strides[d];
+        }
+        int64_t aidx = 0, bidx = 0;
+        for (int64_t d = 0; d < out_rank; ++d) {
+            aidx += coord[d] * a_strides[d];
+            bidx += coord[d] * b_strides[d];
+        }
+        float av = a[aidx], bv = b[bidx];
+        switch (op) {
+            case BinOp::Add: out[idx] = av + bv; break;
+            case BinOp::Sub: out[idx] = av - bv; break;
+            case BinOp::Mul: out[idx] = av * bv; break;
+        }
+    }
+}
+} // namespace
+
+void add_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
+                    const float* b, const int64_t* b_shape, int64_t b_rank,
+                    const int64_t* out_shape, int64_t out_rank, float* out) {
+    broadcast_binary(a, a_shape, a_rank, b, b_shape, b_rank, out_shape, out_rank, out, BinOp::Add);
+}
+
+void sub_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
+                    const float* b, const int64_t* b_shape, int64_t b_rank,
+                    const int64_t* out_shape, int64_t out_rank, float* out) {
+    broadcast_binary(a, a_shape, a_rank, b, b_shape, b_rank, out_shape, out_rank, out, BinOp::Sub);
+}
+
+void mul_broadcast(const float* a, const int64_t* a_shape, int64_t a_rank,
+                    const float* b, const int64_t* b_shape, int64_t b_rank,
+                    const int64_t* out_shape, int64_t out_rank, float* out) {
+    broadcast_binary(a, a_shape, a_rank, b, b_shape, b_rank, out_shape, out_rank, out, BinOp::Mul);
+}
+
+void reduce_to_shape(const float* grad, const int64_t* grad_shape, int64_t grad_rank,
+                      const int64_t* target_shape, int64_t target_rank, float* out) {
+    std::vector<int64_t> grad_strides(static_cast<size_t>(grad_rank));
+    if (grad_rank > 0) {
+        grad_strides[static_cast<size_t>(grad_rank - 1)] = 1;
+        for (int64_t i = grad_rank - 2; i >= 0; --i)
+            grad_strides[static_cast<size_t>(i)] = grad_strides[static_cast<size_t>(i + 1)] * grad_shape[i + 1];
+    }
+    std::vector<int64_t> target_strides(static_cast<size_t>(target_rank));
+    if (target_rank > 0) {
+        target_strides[static_cast<size_t>(target_rank - 1)] = 1;
+        for (int64_t i = target_rank - 2; i >= 0; --i)
+            target_strides[static_cast<size_t>(i)] = target_strides[static_cast<size_t>(i + 1)] * target_shape[i + 1];
+    }
+
+    int64_t offset = grad_rank - target_rank;
+    int64_t n = 1;
+    for (int64_t i = 0; i < grad_rank; ++i) n *= grad_shape[i];
+    int64_t target_numel = 1;
+    for (int64_t i = 0; i < target_rank; ++i) target_numel *= target_shape[i];
+    std::fill(out, out + target_numel, 0.0f);
+
+    std::vector<int64_t> coord(static_cast<size_t>(grad_rank));
+    for (int64_t idx = 0; idx < n; ++idx) {
+        int64_t rem = idx;
+        for (int64_t d = 0; d < grad_rank; ++d) {
+            coord[d] = rem / grad_strides[d];
+            rem %= grad_strides[d];
+        }
+        int64_t tidx = 0;
+        for (int64_t d = 0; d < grad_rank; ++d) {
+            int64_t td = d - offset;
+            if (td < 0) continue;  // this axis doesn't exist in target -- summed away entirely
+            int64_t c = (target_shape[td] == 1) ? 0 : coord[d];
+            tidx += c * target_strides[td];
+        }
+        out[tidx] += grad[idx];
+    }
+}
+
 void relu_fwd(const float* x, float* out, int64_t n) {
     for (int64_t i = 0; i < n; ++i) out[i] = x[i] > 0.0f ? x[i] : 0.0f;
 }

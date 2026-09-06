@@ -45,4 +45,11 @@ Tensor matmul_tn(const Tensor& a, const Tensor& b) {
     return out;
 }
 
+Tensor reduce_to_shape(const Tensor& grad, std::vector<int64_t> target_shape) {
+    Tensor out = Tensor::zeros(target_shape, false);
+    cpu::reduce_to_shape(grad.data_ptr(), grad.shape().data(), grad.ndim(),
+                          target_shape.data(), static_cast<int64_t>(target_shape.size()), out.data_ptr());
+    return out;
+}
+
 } // namespace kan

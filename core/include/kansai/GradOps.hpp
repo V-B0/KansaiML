@@ -35,4 +35,14 @@ Tensor broadcast_scalar(const Tensor& grad_output, std::vector<int64_t> shape, f
 Tensor matmul_nt(const Tensor& a, const Tensor& b);
 Tensor matmul_tn(const Tensor& a, const Tensor& b);
 
+// Sums `grad` down to `target_shape` -- the general broadcasting vjp
+// add/sub/mul's own eager backward_fn closures (core/src/Tensor.cpp)
+// already use directly via cpu::reduce_to_shape; this is that same
+// operation exposed as a first-class KIR op instead, for kir.grad's
+// vjp rules to build a backward *graph* out of, the same reason
+// sum_axis0/matmul_nt/matmul_tn exist as graph-visible ops above rather
+// than staying C++-closure-only. sum_axis0 is the fixed 2D "sum over
+// axis 0" special case of exactly this; this is its general N-D form.
+Tensor reduce_to_shape(const Tensor& grad, std::vector<int64_t> target_shape);
+
 } // namespace kan
