@@ -358,6 +358,152 @@ Tensor Tensor::mean() const {
     return out;
 }
 
+Tensor Tensor::reshape(std::vector<int64_t> new_shape) const {
+    const Tensor& x = *this;
+    int64_t n = numel_of(new_shape);
+    if (n != x.numel())
+        throw std::runtime_error("reshape: number of elements must match");
+
+    Tensor out = Tensor::zeros(std::move(new_shape), false);
+    cpu::copy(x.data_ptr(), out.data_ptr(), n);
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "reshape";
+        node->inputs = {x};
+        auto orig_shape = x.shape();
+        node->backward_fn = [orig_shape](const Tensor& grad_output) -> std::vector<Tensor> {
+            Tensor grad_x = Tensor::zeros(orig_shape, false);
+            cpu::copy(grad_output.data_ptr(), grad_x.data_ptr(), grad_x.numel());
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
+Tensor Tensor::transpose(int64_t dim0, int64_t dim1) const {
+    const Tensor& x = *this;
+    int64_t nd = x.ndim();
+    if (dim0 < 0 || dim0 >= nd || dim1 < 0 || dim1 >= nd)
+        throw std::runtime_error("transpose: dim out of range");
+
+    auto out_shape = x.shape();
+    std::swap(out_shape[dim0], out_shape[dim1]);
+    Tensor out = Tensor::zeros(out_shape, false);
+    cpu::transpose(x.data_ptr(), x.shape().data(), nd, dim0, dim1, out.data_ptr());
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "transpose";
+        node->inputs = {x};
+        auto x_shape = x.shape();
+        node->backward_fn = [x_shape, out_shape, dim0, dim1, nd](const Tensor& grad_output) -> std::vector<Tensor> {
+            // transpose swapping the same two axes is its own inverse:
+            // applying it again to grad_output (shaped like `out`, i.e.
+            // x_shape with dim0/dim1 already swapped) restores x's
+            // original shape and element order.
+            Tensor grad_x = Tensor::zeros(x_shape, false);
+            cpu::transpose(grad_output.data_ptr(), out_shape.data(), nd, dim0, dim1, grad_x.data_ptr());
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
+Tensor Tensor::slice(int64_t dim, int64_t start, int64_t stop) const {
+    const Tensor& x = *this;
+    int64_t nd = x.ndim();
+    if (dim < 0 || dim >= nd)
+        throw std::runtime_error("slice: dim out of range");
+    if (start < 0 || stop > x.shape()[dim] || start >= stop)
+        throw std::runtime_error("slice: invalid [start, stop) range");
+
+    auto out_shape = x.shape();
+    out_shape[dim] = stop - start;
+    Tensor out = Tensor::zeros(out_shape, false);
+    cpu::slice(x.data_ptr(), x.shape().data(), nd, dim, start, stop, out.data_ptr());
+
+    if (x.requires_grad()) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "slice";
+        node->inputs = {x};
+        auto x_shape = x.shape();
+        node->backward_fn = [x_shape, dim, start, stop, nd](const Tensor& grad_output) -> std::vector<Tensor> {
+            // Zero everywhere except the range that was actually read --
+            // that range never received a contribution from anywhere
+            // else, and grad_x is fresh (Tensor::zeros), so this is a
+            // plain scatter, not an accumulate.
+            Tensor grad_x = Tensor::zeros(x_shape, false);
+            cpu::scatter_range(grad_output.data_ptr(), x_shape.data(), nd, dim, start, stop, grad_x.data_ptr());
+            return {grad_x};
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
+Tensor Tensor::cat(const std::vector<Tensor>& tensors, int64_t dim) {
+    if (tensors.empty())
+        throw std::runtime_error("cat: need at least one tensor");
+    int64_t nd = tensors[0].ndim();
+    if (dim < 0 || dim >= nd)
+        throw std::runtime_error("cat: dim out of range");
+
+    auto out_shape = tensors[0].shape();
+    int64_t total = 0;
+    for (const auto& t : tensors) {
+        if (t.ndim() != nd)
+            throw std::runtime_error("cat: all tensors must have the same rank");
+        for (int64_t d = 0; d < nd; ++d) {
+            if (d != dim && t.shape()[d] != out_shape[d])
+                throw std::runtime_error("cat: shapes must match on every dim except `dim`");
+        }
+        total += t.shape()[dim];
+    }
+    out_shape[dim] = total;
+
+    Tensor out = Tensor::zeros(out_shape, false);
+    int64_t offset = 0;
+    bool any_grad = false;
+    for (const auto& t : tensors) {
+        cpu::scatter_range(t.data_ptr(), out_shape.data(), nd, dim, offset, offset + t.shape()[dim],
+                            out.data_ptr());
+        offset += t.shape()[dim];
+        any_grad = any_grad || t.requires_grad();
+    }
+
+    if (any_grad) {
+        auto node = std::make_shared<GradNode>();
+        node->name = "cat";
+        node->inputs = tensors;
+        std::vector<int64_t> sizes;
+        sizes.reserve(tensors.size());
+        for (const auto& t : tensors) sizes.push_back(t.shape()[dim]);
+        node->backward_fn = [sizes, dim](const Tensor& grad_output) -> std::vector<Tensor> {
+            // The inverse of cat's own forward: each input's own
+            // gradient is exactly the slice of grad_output at the same
+            // offset that input was written to -- reusing Tensor::slice
+            // directly rather than a separate backward-only kernel.
+            std::vector<Tensor> grads;
+            grads.reserve(sizes.size());
+            int64_t off = 0;
+            for (auto sz : sizes) {
+                grads.push_back(grad_output.slice(dim, off, off + sz));
+                off += sz;
+            }
+            return grads;
+        };
+        out.set_grad_node(node);
+        out.set_requires_grad(true);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------
 // backward() — standard reverse-mode: topo-sort the graph reachable from
 // this tensor, seed its own gradient with ones, then walk in reverse

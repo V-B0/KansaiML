@@ -84,6 +84,27 @@ public:
     // on day one).
     Tensor conv2d(const Tensor& weight, const Tensor& bias, int64_t stride, int64_t padding) const;
 
+    // General tensor manipulation -- unlike every op above, these don't
+    // change values, only which position each element sits at. All
+    // three copy (this codebase has no non-owning "view" that shares
+    // another Tensor's Storage): reshape's copy is a straight memcpy
+    // (row-major reshape never reorders bytes, just reinterprets the
+    // same flat sequence under new shape boundaries), transpose's and
+    // slice's genuinely move data. A real zero-copy view would need
+    // StoragePool's pooling to become aware of aliased buffers (two
+    // Tensors sharing one Storage, with different lifetimes) --
+    // unattempted, real future work, not silently assumed safe here.
+    Tensor reshape(std::vector<int64_t> new_shape) const;
+    Tensor transpose(int64_t dim0, int64_t dim1) const;
+    Tensor slice(int64_t dim, int64_t start, int64_t stop) const;
+
+    // Concatenates `tensors` along `dim` -- every other dimension must
+    // already match across all of them. Static (not a method) since
+    // there's no single natural "self" among an arbitrary-length list
+    // of tensors being joined, the same reason Tensor::zeros/ones/randn
+    // are static rather than instance methods.
+    static Tensor cat(const std::vector<Tensor>& tensors, int64_t dim);
+
     std::vector<float> to_vector() const;
 
     TensorData* impl_ptr() const { return impl_.get(); }

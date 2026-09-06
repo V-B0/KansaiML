@@ -57,6 +57,11 @@ NB_MODULE(_core, m) {
         .def("mean", &Tensor::mean, nb::call_guard<nb::gil_scoped_release>())
         .def("conv2d", &Tensor::conv2d, nb::arg("weight"), nb::arg("bias"), nb::arg("stride"), nb::arg("padding"),
              nb::call_guard<nb::gil_scoped_release>())
+        .def("reshape", &Tensor::reshape, nb::arg("shape"), nb::call_guard<nb::gil_scoped_release>())
+        .def("transpose", &Tensor::transpose, nb::arg("dim0"), nb::arg("dim1"),
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("slice", &Tensor::slice, nb::arg("dim"), nb::arg("start"), nb::arg("stop"),
+             nb::call_guard<nb::gil_scoped_release>())
         .def("__add__", &Tensor::add)
         .def("__sub__", &Tensor::sub)
         .def("__mul__", &Tensor::mul)
@@ -68,6 +73,7 @@ NB_MODULE(_core, m) {
           nb::arg("requires_grad") = false, nb::arg("seed") = 0);
     m.def("from_flat", &Tensor::from_flat, nb::arg("data"), nb::arg("shape"),
           nb::arg("requires_grad") = false);
+    m.def("cat", &Tensor::cat, nb::arg("tensors"), nb::arg("dim"), nb::call_guard<nb::gil_scoped_release>());
 
     m.def("fused_bias_relu", &fused_bias_relu, nb::arg("x"), nb::arg("bias"),
           nb::call_guard<nb::gil_scoped_release>());

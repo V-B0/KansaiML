@@ -16,10 +16,15 @@ So a DeviceMesh's entries don't name a physical location a tensor gets
 moved to -- they name which backend's interpreter processes a given
 shard's graph. That's a real, honest distinction from a mesh spanning
 actual separate memory spaces (multiple discrete GPUs, or multiple
-machines), and it's why splitting/gathering here goes through
-tolist()/from_flat() rather than anything resembling a network
+machines), and it's why splitting/gathering here is just Tensor.slice/
+core.cat (kansai's own native shape ops, see python/kansai's own
+general-tensor-ops work) rather than anything resembling a network
 transfer -- there's nothing to transfer, only a decision about which
 compute path runs on which slice of already-shared memory.
+_split_tensor/_concat_tensors used to go through tolist()/from_flat()
+instead, back when Kansai had no slice/cat kernel of its own at all --
+that gap is what this module's own history called out repeatedly as a
+real, stated limitation, closed now.
 
 dtensor_run itself is still forward-only -- no grad_node is attached to
 anything it computes, same as run_metal/run_planned before it.
@@ -155,65 +160,26 @@ def _chunk_sizes(total: int, n: int) -> list:
 
 
 def _split_tensor(tensor, dim: int, n: int) -> list:
-    """Splits `tensor` into `n` pieces along `dim`. Reference-level, not
-    a native kernel: goes through tolist()/from_flat() since Kansai has
-    no slice op yet -- the same "prototype the semantics in Python
-    before committing to a real kernel" approach kir.py itself took for
-    the IR, not an oversight."""
-    shape = list(tensor.shape)
-    flat = tensor.tolist()
-    sizes = _chunk_sizes(shape[dim], n)
-
-    outer = 1
-    for d in shape[:dim]:
-        outer *= d
-    inner = 1
-    for d in shape[dim + 1:]:
-        inner *= d
-    dim_size = shape[dim]
-
+    """Splits `tensor` into `n` pieces along `dim`, via Tensor.slice --
+    kansai's own native shape kernel (backend/cpu's slice/scatter_range,
+    see core/src/Tensor.cpp), not a Python re-implementation. Used to go
+    through tolist()/from_flat() instead, back when Kansai had no slice
+    kernel of its own; that was the reference-level "prototype the
+    semantics before committing to a real kernel" tradeoff kir.py's IR
+    itself made too, not a permanent design choice."""
+    sizes = _chunk_sizes(tensor.shape[dim], n)
     pieces = []
     offset = 0
     for size in sizes:
-        piece_shape = list(shape)
-        piece_shape[dim] = size
-        piece_flat = [0.0] * (outer * size * inner)
-        for o in range(outer):
-            src_start = o * dim_size * inner + offset * inner
-            dst_start = o * size * inner
-            length = size * inner
-            piece_flat[dst_start:dst_start + length] = flat[src_start:src_start + length]
-        pieces.append(core.from_flat(piece_flat, piece_shape))
+        pieces.append(tensor.slice(dim, offset, offset + size))
         offset += size
     return pieces
 
 
 def _concat_tensors(tensors: list, dim: int):
-    """The inverse of _split_tensor."""
-    shapes = [list(t.shape) for t in tensors]
-    dim_sizes = [s[dim] for s in shapes]
-    out_shape = list(shapes[0])
-    out_shape[dim] = sum(dim_sizes)
-
-    outer = 1
-    for d in out_shape[:dim]:
-        outer *= d
-    inner = 1
-    for d in out_shape[dim + 1:]:
-        inner *= d
-
-    out_flat = [0.0] * (outer * out_shape[dim] * inner)
-    flats = [t.tolist() for t in tensors]
-
-    offset = 0
-    for flat, size in zip(flats, dim_sizes):
-        for o in range(outer):
-            src_start = o * size * inner
-            dst_start = o * out_shape[dim] * inner + offset * inner
-            length = size * inner
-            out_flat[dst_start:dst_start + length] = flat[src_start:src_start + length]
-        offset += size
-    return core.from_flat(out_flat, out_shape)
+    """The inverse of _split_tensor -- core.cat, kansai's own native
+    concatenation kernel."""
+    return core.cat(tensors, dim)
 
 
 class DTensor:

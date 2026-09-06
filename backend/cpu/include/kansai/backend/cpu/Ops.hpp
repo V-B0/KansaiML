@@ -76,4 +76,43 @@ void add_bias_nchw(const float* x, const float* bias, float* out,
 void sum_over_batch_and_spatial(const float* dy, float* db,
                                  int64_t N, int64_t C, int64_t HW);
 
+// General shape ops -- unlike the fixed-rank kernels above (matmul's
+// M/K/N, conv2d's im2col/col2im), these work on any rank via an
+// explicit shape array, not a name per dimension. Still "no autograd
+// knowledge, just moves numbers" -- shape is just a more general form
+// of the same kind of dimension parameter matmul/conv2d already take.
+
+// Permutes x (row-major, `ndim` dims described by `shape`) into `out`
+// with axes dim0 and dim1 exchanged -- out's own shape is `shape` with
+// those two entries swapped. A real data reorder (not a metadata-only
+// view): this codebase has no stride concept, every Tensor is always
+// fully packed row-major, so transposing anything but the last two
+// axes of a 2D tensor genuinely moves every element. O(n) in the
+// tensor's element count, with one coordinate decomposition per
+// element -- not vectorized or blocked; a real, unattempted lever if
+// this ever shows up as a bottleneck.
+void transpose(const float* x, const int64_t* shape, int64_t ndim,
+               int64_t dim0, int64_t dim1, float* out);
+
+// Copies x's [start, stop) sub-range along `dim` into `out` (sized for
+// the resulting shape: `shape` with dim's extent replaced by
+// stop - start). The same outer/inner/dim_size block-copy shape
+// python/kansai/distributed.py's _split_tensor already uses -- ported
+// to C++ here for the same operation at native speed instead of going
+// through tolist()/from_flat().
+void slice(const float* x, const int64_t* shape, int64_t ndim,
+           int64_t dim, int64_t start, int64_t stop, float* out);
+
+// The mirror image of slice: writes `x` (shaped like a [start, stop)
+// sub-range) into `out`'s corresponding range along `dim`, where `out`
+// is already sized for `full_shape`. Two distinct callers, one
+// primitive: slice's own backward (scatter a cotangent into an
+// otherwise-zero gradient at the range that was actually read) and
+// Tensor::cat's forward (write each input into its own disjoint slot
+// of the concatenated output) are the same "place this sub-range at
+// this offset" operation -- ranges never overlap in either use, so
+// this is a plain write, never an accumulate.
+void scatter_range(const float* x, const int64_t* full_shape, int64_t ndim,
+                    int64_t dim, int64_t start, int64_t stop, float* out);
+
 } // namespace kan::cpu

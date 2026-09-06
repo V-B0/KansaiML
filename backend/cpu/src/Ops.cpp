@@ -1,6 +1,7 @@
 #include "kansai/backend/cpu/Ops.hpp"
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 #ifdef KANSAI_USE_ACCELERATE
 #include <Accelerate/Accelerate.h>
@@ -176,6 +177,75 @@ void sum_over_batch_and_spatial(const float* dy, float* db, int64_t N, int64_t C
             for (int64_t i = 0; i < HW; ++i) s += row[i];
             db[c] += s;
         }
+    }
+}
+
+namespace {
+// Row-major strides for `shape` (ndim entries): stride[ndim-1] = 1,
+// stride[i] = stride[i+1] * shape[i+1]. Shared by transpose's own
+// input- and output-side coordinate math.
+void row_major_strides(const int64_t* shape, int64_t ndim, int64_t* strides) {
+    strides[ndim - 1] = 1;
+    for (int64_t i = ndim - 2; i >= 0; --i) strides[i] = strides[i + 1] * shape[i + 1];
+}
+} // namespace
+
+void transpose(const float* x, const int64_t* shape, int64_t ndim,
+               int64_t dim0, int64_t dim1, float* out) {
+    std::vector<int64_t> strides(static_cast<size_t>(ndim));
+    row_major_strides(shape, ndim, strides.data());
+
+    std::vector<int64_t> out_shape(shape, shape + ndim);
+    std::swap(out_shape[dim0], out_shape[dim1]);
+    std::vector<int64_t> out_strides(static_cast<size_t>(ndim));
+    row_major_strides(out_shape.data(), ndim, out_strides.data());
+
+    int64_t n = 1;
+    for (int64_t i = 0; i < ndim; ++i) n *= shape[i];
+
+    std::vector<int64_t> coord(static_cast<size_t>(ndim));
+    for (int64_t idx = 0; idx < n; ++idx) {
+        int64_t rem = idx;
+        for (int64_t d = 0; d < ndim; ++d) {
+            coord[d] = rem / strides[d];
+            rem %= strides[d];
+        }
+        std::swap(coord[dim0], coord[dim1]);
+        int64_t oidx = 0;
+        for (int64_t d = 0; d < ndim; ++d) oidx += coord[d] * out_strides[d];
+        out[oidx] = x[idx];
+    }
+}
+
+void slice(const float* x, const int64_t* shape, int64_t ndim,
+           int64_t dim, int64_t start, int64_t stop, float* out) {
+    int64_t outer = 1;
+    for (int64_t i = 0; i < dim; ++i) outer *= shape[i];
+    int64_t inner = 1;
+    for (int64_t i = dim + 1; i < ndim; ++i) inner *= shape[i];
+    int64_t dim_size = shape[dim];
+    int64_t size = stop - start;
+
+    for (int64_t o = 0; o < outer; ++o) {
+        const float* src = x + o * dim_size * inner + start * inner;
+        float* dst = out + o * size * inner;
+        std::memcpy(dst, src, static_cast<size_t>(size * inner) * sizeof(float));
+    }
+}
+
+void scatter_range(const float* x, const int64_t* full_shape, int64_t ndim,
+                    int64_t dim, int64_t start, int64_t stop, float* out) {
+    int64_t outer = 1;
+    for (int64_t i = 0; i < dim; ++i) outer *= full_shape[i];
+    int64_t inner = 1;
+    for (int64_t i = dim + 1; i < ndim; ++i) inner *= full_shape[i];
+    int64_t dim_size = full_shape[dim];
+    int64_t size = stop - start;
+
+    for (int64_t o = 0; o < outer; ++o) {
+        const float* src = x + o * size * inner;
+        float* dst = out + o * dim_size * inner + start * inner;
+        std::memcpy(dst, src, static_cast<size_t>(size * inner) * sizeof(float));
     }
 }
 

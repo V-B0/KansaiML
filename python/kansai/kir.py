@@ -161,10 +161,68 @@ class TraceValue:
         nid = self.graph.add("mean", [self.node_id], [1], self.dtype)
         return TraceValue(self.graph, nid, [1], self.dtype)
 
+    def reshape(self, shape):
+        n = 1
+        for d in self.shape:
+            n *= d
+        m = 1
+        for d in shape:
+            m *= d
+        if n != m:
+            raise ValueError(f"reshape: number of elements must match ({self.shape} -> {shape})")
+        nid = self.graph.add("reshape", [self.node_id], list(shape), self.dtype, new_shape=list(shape))
+        return TraceValue(self.graph, nid, list(shape), self.dtype)
+
+    def transpose(self, dim0, dim1):
+        nd = len(self.shape)
+        if not (0 <= dim0 < nd and 0 <= dim1 < nd):
+            raise ValueError(f"transpose: dim out of range for shape {self.shape}")
+        out_shape = list(self.shape)
+        out_shape[dim0], out_shape[dim1] = out_shape[dim1], out_shape[dim0]
+        nid = self.graph.add("transpose", [self.node_id], out_shape, self.dtype, dim0=dim0, dim1=dim1)
+        return TraceValue(self.graph, nid, out_shape, self.dtype)
+
+    def slice(self, dim, start, stop):
+        nd = len(self.shape)
+        if not (0 <= dim < nd):
+            raise ValueError(f"slice: dim out of range for shape {self.shape}")
+        if not (0 <= start < stop <= self.shape[dim]):
+            raise ValueError(f"slice: invalid range [{start}, {stop}) for dim {dim} of shape {self.shape}")
+        out_shape = list(self.shape)
+        out_shape[dim] = stop - start
+        nid = self.graph.add("slice", [self.node_id], out_shape, self.dtype, dim=dim, start=start, stop=stop)
+        return TraceValue(self.graph, nid, out_shape, self.dtype)
+
     __add__ = add
     __sub__ = sub
     __mul__ = mul
     __matmul__ = matmul
+
+
+def cat(tensors, dim):
+    """Traces a `cat` node -- module-level, not a TraceValue method,
+    since it's naturally variadic over multiple TraceValues rather than
+    a single `self` (the same reason core.cat is a static Tensor method,
+    not an instance one)."""
+    if not tensors:
+        raise ValueError("cat: need at least one tensor")
+    nd = len(tensors[0].shape)
+    if not (0 <= dim < nd):
+        raise ValueError(f"cat: dim out of range for shape {tensors[0].shape}")
+    out_shape = list(tensors[0].shape)
+    total = 0
+    for t in tensors:
+        if len(t.shape) != nd:
+            raise ValueError("cat: all tensors must have the same rank")
+        for d in range(nd):
+            if d != dim and t.shape[d] != out_shape[d]:
+                raise ValueError(f"cat: shapes must match on every dim except {dim}: {t.shape} vs {out_shape}")
+        total += t.shape[dim]
+    out_shape[dim] = total
+
+    graph = tensors[0].graph
+    nid = graph.add("cat", [t.node_id for t in tensors], out_shape, tensors[0].dtype, dim=dim)
+    return TraceValue(graph, nid, out_shape, tensors[0].dtype)
 
 
 def trace(fn, *example_inputs) -> Graph:
@@ -231,6 +289,21 @@ def run(graph: Graph, *args) -> "core.Tensor":
         if node.op == "conv2d":
             x, w, b = (values[i] for i in node.inputs)
             values[node.id] = x.conv2d(w, b, node.attrs["stride"], node.attrs["padding"])
+            continue
+        if node.op == "reshape":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.reshape(node.attrs["new_shape"])
+            continue
+        if node.op == "transpose":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.transpose(node.attrs["dim0"], node.attrs["dim1"])
+            continue
+        if node.op == "slice":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.slice(node.attrs["dim"], node.attrs["start"], node.attrs["stop"])
+            continue
+        if node.op == "cat":
+            values[node.id] = core.cat([values[i] for i in node.inputs], node.attrs["dim"])
             continue
         fn = _OP_TABLE[node.op]
         values[node.id] = fn(*(values[i] for i in node.inputs))
@@ -485,6 +558,21 @@ def run_fused(graph: Graph, *args) -> "core.Tensor":
             x, w, b = (values[i] for i in node.inputs)
             values[node.id] = x.conv2d(w, b, node.attrs["stride"], node.attrs["padding"])
             continue
+        if node.op == "reshape":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.reshape(node.attrs["new_shape"])
+            continue
+        if node.op == "transpose":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.transpose(node.attrs["dim0"], node.attrs["dim1"])
+            continue
+        if node.op == "slice":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.slice(node.attrs["dim"], node.attrs["start"], node.attrs["stop"])
+            continue
+        if node.op == "cat":
+            values[node.id] = core.cat([values[i] for i in node.inputs], node.attrs["dim"])
+            continue
         fn = _OP_TABLE[node.op]
         values[node.id] = fn(*(values[i] for i in node.inputs))
 
@@ -675,6 +763,17 @@ def run_planned(graph: Graph, plan: MemoryPlan, pool, *args) -> "core.Tensor":
             elif node.op == "conv2d":
                 cx, cw, cb = (values[i] for i in node.inputs)
                 values[node.id] = cx.conv2d(cw, cb, node.attrs["stride"], node.attrs["padding"])
+            elif node.op == "reshape":
+                (rx,) = (values[i] for i in node.inputs)
+                values[node.id] = rx.reshape(node.attrs["new_shape"])
+            elif node.op == "transpose":
+                (tx,) = (values[i] for i in node.inputs)
+                values[node.id] = tx.transpose(node.attrs["dim0"], node.attrs["dim1"])
+            elif node.op == "slice":
+                (sx,) = (values[i] for i in node.inputs)
+                values[node.id] = sx.slice(node.attrs["dim"], node.attrs["start"], node.attrs["stop"])
+            elif node.op == "cat":
+                values[node.id] = core.cat([values[i] for i in node.inputs], node.attrs["dim"])
             else:
                 fn = _OP_TABLE[node.op]
                 values[node.id] = fn(*(values[i] for i in node.inputs))
@@ -764,6 +863,72 @@ def _vjp_mean(bwd, node, primal_id, g_out, by_id):
     return [grad_x]
 
 
+def _vjp_reshape(bwd, node, primal_id, g_out, by_id):
+    x_id = node.inputs[0]
+    x_shape = by_id[x_id].shape
+    grad_x = bwd.add("reshape", [g_out], x_shape, node.dtype, new_shape=list(x_shape))
+    return [grad_x]
+
+
+def _vjp_transpose(bwd, node, primal_id, g_out, by_id):
+    # transpose swapping the same two axes is its own inverse -- see
+    # Tensor::transpose's own backward_fn (core/src/Tensor.cpp) for the
+    # identical reasoning at the eager level.
+    x_id = node.inputs[0]
+    x_shape = by_id[x_id].shape
+    dim0, dim1 = node.attrs["dim0"], node.attrs["dim1"]
+    grad_x = bwd.add("transpose", [g_out], x_shape, node.dtype, dim0=dim0, dim1=dim1)
+    return [grad_x]
+
+
+def _vjp_slice(bwd, node, primal_id, g_out, by_id):
+    """Builds slice's backward (zero everywhere except the [start, stop)
+    range that was actually read) out of existing ops rather than a new
+    backward-only IR primitive: cat g_out back together with zero
+    constants padding out the dimensions on either side that slice
+    dropped. Skips a padding piece entirely wherever it would be empty
+    (start == 0, or stop == the full dimension) rather than emitting a
+    zero-size cat operand."""
+    x_id = node.inputs[0]
+    x_shape = by_id[x_id].shape
+    dim, start, stop = node.attrs["dim"], node.attrs["start"], node.attrs["stop"]
+    full_size = x_shape[dim]
+
+    pieces = []
+    if start > 0:
+        pre_shape = list(x_shape)
+        pre_shape[dim] = start
+        pieces.append(bwd.add("constant", [], pre_shape, node.dtype, value=core.zeros(pre_shape)))
+    pieces.append(g_out)
+    if stop < full_size:
+        post_shape = list(x_shape)
+        post_shape[dim] = full_size - stop
+        pieces.append(bwd.add("constant", [], post_shape, node.dtype, value=core.zeros(post_shape)))
+
+    if len(pieces) == 1:
+        return [pieces[0]]  # the slice already covered the whole dimension -- nothing to pad
+    grad_x = bwd.add("cat", pieces, list(x_shape), node.dtype, dim=dim)
+    return [grad_x]
+
+
+def _vjp_cat(bwd, node, primal_id, g_out, by_id):
+    """The exact inverse of slice's own vjp above: each input's gradient
+    is just the slice of g_out at the offset that input was written to
+    during cat's forward -- reusing the "slice" op directly instead of a
+    dedicated backward-only primitive, the same way Tensor::cat's own
+    eager backward_fn reuses Tensor::slice (core/src/Tensor.cpp)."""
+    dim = node.attrs["dim"]
+    grads = []
+    offset = 0
+    for inp_id in node.inputs:
+        size = by_id[inp_id].shape[dim]
+        piece_shape = list(by_id[inp_id].shape)
+        grad_piece = bwd.add("slice", [g_out], piece_shape, node.dtype, dim=dim, start=offset, stop=offset + size)
+        grads.append(grad_piece)
+        offset += size
+    return grads
+
+
 _VJP_RULES = {
     "add": _vjp_add,
     "sub": _vjp_sub,
@@ -772,6 +937,10 @@ _VJP_RULES = {
     "relu": _vjp_relu,
     "sum": _vjp_sum,
     "mean": _vjp_mean,
+    "reshape": _vjp_reshape,
+    "transpose": _vjp_transpose,
+    "slice": _vjp_slice,
+    "cat": _vjp_cat,
 }
 
 
@@ -1041,6 +1210,31 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
         if node.op == "conv2d":
             x, w, b = (values[i] for i in node.inputs)
             values[node.id] = core.metal_conv2d(x, w, b, node.attrs["stride"], node.attrs["padding"])
+            continue
+        # reshape/transpose/slice/cat have no Metal kernel yet -- same
+        # honest CPU fallback matmul_nt/matmul_tn/relu_backward/
+        # sum_axis0/broadcast_scalar already take via _OP_TABLE below,
+        # just special-cased here too since these ops need node.attrs
+        # (a shape, a pair of dims, a range), which _OP_TABLE's plain
+        # positional-Tensor-args dispatch can't carry. Pure data
+        # movement, not compute, so the round trip to CPU costs a lot
+        # less relatively than it would for an actual FLOP-heavy op --
+        # still real, unattempted future work to give these dedicated
+        # Metal kernels, the same gap Conv2d itself had before Phase 3.
+        if node.op == "reshape":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.reshape(node.attrs["new_shape"])
+            continue
+        if node.op == "transpose":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.transpose(node.attrs["dim0"], node.attrs["dim1"])
+            continue
+        if node.op == "slice":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = x.slice(node.attrs["dim"], node.attrs["start"], node.attrs["stop"])
+            continue
+        if node.op == "cat":
+            values[node.id] = core.cat([values[i] for i in node.inputs], node.attrs["dim"])
             continue
         fn = _OP_TABLE[node.op]
         values[node.id] = fn(*(values[i] for i in node.inputs))

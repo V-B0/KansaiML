@@ -39,6 +39,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | 2 — KIR | Tracing, fusion, memory pooling, source-transform autograd | ✅ done |
 | 3 — GPU backend | Real Metal compute (tiled kernel + MPS, full op + Conv2d coverage) | ✅ done |
 | 4 — Distributed | `DeviceMesh`/`DTensor`, distributed gradients, concurrent dispatch, int8 quantization, serialization | ✅ done |
+| — Core ops | `reshape`/`transpose`/`slice`/`cat`, full autograd + KIR integration | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -78,7 +79,15 @@ round-trips a trained model's parameters bit-for-bit (not approximately)
 through a pickle-free file format, for both a `Sequential` and a
 `Conv2d` model, with four distinct failure modes (shape mismatch,
 missing/unexpected parameters, a corrupted file) each rejected with a
-specific error rather than a silent wrong load.
+specific error rather than a silent wrong load; the new `reshape`/
+`transpose`/`slice`/`cat` ops (full autograd — eager and `kir.grad` —
+plus all four KIR interpreters) are checked against central-difference
+gradients and, for `transpose`, at a 3D permutation across non-adjacent
+axes rather than only the easy case; `distributed.py`'s own split/concat
+are three lines apiece on top of these now, replacing roughly sixty
+lines of manual Python stride bookkeeping that used to exist specifically
+because Kansai had no slice/cat kernel — a real internal caller adopting
+the new ops on day one, not a capability sitting unused.
 
 ## Why
 
@@ -157,7 +166,9 @@ Python (Tensor, nn.Module, optim)
 
 - `core/` — `Tensor`, `Storage`, the pooled allocator, and the
   tape-based eager autograd engine
-- `backend/cpu/` — raw kernels (Accelerate-backed `matmul` on macOS)
+- `backend/cpu/` — raw kernels (Accelerate-backed `matmul` on macOS,
+  plus shape-generic `transpose`/`slice`/`scatter_range` for
+  `reshape`/`transpose`/`slice`/`cat`)
 - `backend/metal/` — real Metal compute: a hand-tiled kernel,
   `MPSMatrixMultiplication`, and batched elementwise dispatch, all
   zero-copy over page-aligned tensor storage

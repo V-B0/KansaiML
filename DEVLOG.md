@@ -994,10 +994,122 @@ serialization and KIR `Graph` serialization (both above), any form of
 versioned migration between checkpoint format revisions (there's only
 ever been the one, `"KAN1"`), and a C++ bulk reader/writer -- this goes
 through `Tensor.tolist()`/`core.from_flat()` the same "prototype in
-Python first" way `distributed.py`'s split/concat and `quantize.py`'s
-(de)quantization already do, fine at this project's own model sizes, a
-real un-optimized cost (one Python float object per element, both
-directions) at a size large enough for that to matter.
+Python first" way `quantize.py`'s (de)quantization already does, fine at
+this project's own model sizes, a real un-optimized cost (one Python
+float object per element, both directions) at a size large enough for
+that to matter. (`distributed.py`'s split/concat used to be in this same
+category -- see the next section for why that's no longer true.)
+
+## General tensor ops: reshape, transpose, slice, cat
+
+Every op this codebase had before now computed *values*; none of them
+could reorganize a tensor's own *shape*. That gap was real and repeatedly
+self-documented, not discovered late: `distributed.py`'s own
+`_split_tensor`/`_concat_tensors` went through `tolist()`/`from_flat()`
+specifically because "Kansai has no slice op yet," stated in that
+function's own docstring three separate times across this project's
+history. Closed now with four new ops, all added at every layer this
+codebase's other ops already go through -- `backend/cpu` kernels,
+`Tensor` methods with real `GradNode` backward functions, nanobind
+bindings (GIL-released, like every other compute-heavy one), KIR tracing
+(`TraceValue` methods plus a module-level `kir.cat`), all four
+interpreters (`run`, `run_fused`, `run_planned`, `run_metal`), and
+`kir.grad`'s vjp rules -- not a special, second-class op category bolted
+on beside the real ones.
+
+**`reshape`** is a pure reinterpretation: row-major reshape never
+reorders a single byte, it only moves where the shape boundaries fall
+across the same flat sequence, so the "kernel" is literally `cpu::copy`
+(a `memcpy`) into a freshly shaped buffer. Its own backward is exactly
+itself, run again with the original shape.
+
+**`transpose(dim0, dim1)`** is the opposite case: a genuine data
+permutation, not a metadata change, because this codebase has no stride
+concept at all -- every `Tensor` is always fully packed row-major, so
+swapping any two axes (not just the trailing two of a 2D matrix)
+requires actually moving every element. The new `cpu::transpose` kernel
+computes this generically for any rank: decompose each flat input index
+into N-D coordinates via that shape's own row-major strides, swap the
+two coordinates at `dim0`/`dim1`, recompute the output's flat index from
+*its* strides (the same shape with those two sizes swapped), write.
+O(n) with one coordinate decomposition per element -- correct and
+general, not vectorized or blocked; a real, unattempted lever if this
+ever shows up as a bottleneck. Verified specifically at a 3D transpose
+across *non-adjacent* axes (`dim0=0, dim1=2` on a `(2,3,4)` tensor), not
+just the easy trailing-two-axes case a naive implementation could get
+right by accident. Backward: swapping the same two axes is its own
+inverse, so transpose's own backward is transpose again, same `dim0`/
+`dim1`, applied to the cotangent.
+
+**`slice(dim, start, stop)`** extracts a contiguous sub-range along one
+axis -- the exact outer/inner/dim_size block-copy math
+`distributed.py`'s own `_split_tensor` already had in Python, ported to
+C++ (`cpu::slice`) for native speed. Its backward needed a real design
+choice: rather than inventing a new backward-only "unslice" IR
+primitive, it's built from existing ops -- `cat` the incoming gradient
+back together with zero `constant` nodes padding out whatever `slice`
+dropped on either side (skipping a padding piece entirely wherever it
+would be zero-sized, i.e. `start == 0` or `stop` reaches the dimension's
+full size). All three shapes of that logic -- padding on both sides,
+one side only, or neither -- are exercised directly in
+`tests/test_shape_ops.py`, not just the common middle case.
+
+**`cat(tensors, dim)`** is the mirror image of `slice`, and reuses the
+same primitive in the opposite direction: `cpu::scatter_range` (shared
+with `slice`'s own backward) writes each input into its own disjoint
+offset of the output -- disjoint by construction, so this is always a
+plain write, never an accumulate. `cat`'s own backward is, in turn,
+built from `slice`: each input's gradient is exactly the range of the
+cotangent at the offset that input was originally written to. Three ops
+(`transpose`'s self-inverse, `slice`↔`cat`'s mutual inverse via a shared
+`scatter_range` kernel) covering four gradient rules, not four
+independent backward kernels -- the same "reuse a forward-shaped op as
+its own vjp building block" instinct `Conv2d`'s backward already applied
+(`matmul_nt`/`matmul_tn` instead of a dedicated `conv2d_backward`).
+
+All four **copy**, none of them **view**: no `Tensor` shares another's
+`Storage`. A real zero-copy view -- meaningful for `reshape` especially,
+since its data literally doesn't move -- would need `StoragePool`'s
+pooling to become aware of aliased buffers (two `Tensor`s sharing one
+`Storage` with different lifetimes); today the pool's release logic
+assumes exclusive ownership tied to one node's liveness, and handing a
+view's buffer back to the free list while another `Tensor` still aliases
+it would be a silent correctness bug, not a missing optimization. Real,
+unattempted future work, not assumed safe.
+
+No Metal kernels for any of the four yet, on purpose, matching Conv2d's
+own history (CPU first, Metal added later in a separate pass): all four
+fall back to the CPU implementation inside `run_metal`, the same honest
+fallback path `matmul_nt`/`matmul_tn`/`relu_backward`/`sum_axis0`/
+`broadcast_scalar` already use there for the exact same reason. Verified
+end-to-end anyway, on both backends: `tests/test_shape_ops.py` runs
+every op's full stack -- forward value, eager backward against central
+differences (the same gold-standard bar `test_grad_check.py` holds every
+other op to), and the complete KIR path (`trace` → all four interpreters
+→ `kir.grad`) checked against eager -- with Metal-path checks included
+wherever `core.metal_available()`.
+
+**A concrete proof this was worth building, not just an abstract
+capability**: `distributed.py`'s `_split_tensor`/`_concat_tensors` are
+now three lines apiece (`tensor.slice(dim, offset, offset + size)` in a
+loop; `core.cat(tensors, dim)`), replacing roughly sixty lines of
+manual outer/inner/stride bookkeeping over Python lists -- the exact
+gap this module's own docstring called out as a known, stated
+limitation across three separate places in this project's history,
+closed by the first real consumer of the new ops rather than staying a
+demo capability with nothing depending on it. Every distributed test
+(`test_distributed.py`, `test_distributed_grad.py`,
+`test_distributed_concurrency.py`) still passes unchanged against this
+refactor, including the concurrency benchmark's own ~1.53x measurement
+-- confirming the native ops didn't just work in isolation, they slot
+into an existing, real caller with no behavior change.
+
+Not attempted here, stated up front: general NumPy-style broadcasting
+for `add`/`sub`/`mul` (still exactly one hardcoded pattern, the
+`(batch, features) + (features,)` bias case) -- a separate, also-
+substantial piece of work touching the elementwise kernels and their
+vjp rules rather than shape/layout, deliberately scoped out of this pass
+rather than rushed alongside it. A real next step, not forgotten.
 
 ## Build
 
