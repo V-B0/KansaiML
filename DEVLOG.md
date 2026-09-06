@@ -1,0 +1,612 @@
+# Kansai devlog
+
+The engineering diary: every design decision, every benchmark actually
+run, every bug found and how, in the order it happened. See
+[README.md](README.md) for the project overview, build instructions, and
+current status at a glance -- this file is the detailed record behind it.
+
+Milestone 0 (Phase 1) is done: a CPU-only tensor engine with working
+reverse-mode autograd, proven by training a 2-layer MLP on XOR. Phase 2
+(KIR) is done -- see below. A real Metal (Phase 3) backend now also
+exists, on the same terms: real GPU kernels, tested, benchmarked
+honestly.
+
+## What's here
+
+- `core/` — `Tensor`, `Storage`, `StoragePool` (the memory planner's
+  pooled allocator), and the autograd engine (`GradNode` +
+  `Tensor::backward()`, a tape-based reverse-mode implementation)
+- `backend/cpu/` — raw float-buffer kernels (Accelerate-backed `matmul`
+  on macOS, portable triple-loop fallback elsewhere)
+- `backend/metal/` — a real Metal compute backend: a hand-written,
+  16x16-tiled MSL `matmul` (compiled at runtime via
+  `MTLDevice::newLibraryWithSource`, dispatched through
+  `MTLComputeCommandEncoder`) plus `bias_relu` (fused) and `add_bias`;
+  `matmul_mps` (Apple's `MPSMatrixMultiplication`) is what actually
+  reaches parity with Accelerate and is `run_metal`'s default matmul --
+  see the Phase 3 section for the honest comparison between all three
+- `python/` — nanobind bindings (`_core`) plus `kansai.nn` (now including
+  `Conv2d`) / `kansai.optim`
+- `python/kansai/kir.py` — KIR prototype: `Graph`/`Node` schema, an
+  operator-overload tracer (`kir.trace`, `kir.jit`), a reference
+  interpreter (`kir.run`), dead code elimination
+  (`kir.dead_code_elimination`), pattern-matched elementwise fusion
+  (`kir.elementwise_fusion`, `kir.run_fused`), a memory planner
+  (`kir.plan_memory`, `kir.run_planned`), and source-transform autograd
+  (`kir.grad`, `kir.find_constant`)
+- `tests/test_xor.py` — the Milestone 0 acceptance test
+- `tests/test_kir_trace.py` — the Phase 2 tracing smoke test: trace/replay
+  parity with eager, DCE correctness (including on an unused
+  placeholder), and a full XOR training loop run entirely through the
+  jit'd forward pass
+- `tests/test_kir_fusion.py` — the Phase 2 fusion smoke test:
+  correctness on both known fused patterns plus a timing benchmark
+  proving the fused path is actually faster, not just numerically equal
+- `tests/test_grad_check.py` — numerical gradient checking (central
+  differences) for matmul and the Linear+ReLU forward shape, against
+  first principles rather than "training still converges"
+- `tests/test_kir_memory_planner.py` — plan correctness (no
+  overlapping-liveness nodes share a slot), safety across many pooled
+  runs with fresh random inputs, the pool actually converging instead of
+  growing, the forward-only safety guard, and a timing benchmark at a
+  scale where pooling is measured to actually win (see below for where
+  it doesn't)
+- `tests/test_kir_grad.py` — source-transform autograd: numerical
+  gradient checks against central differences with the eager engine
+  never involved, an exact cross-check against the eager engine as an
+  independent second implementation, and a full XOR training loop where
+  `.backward()` is never called at all
+- `tests/test_metal_backend.py` — Phase 3: kernel correctness against
+  CPU, `run_metal` correctness end-to-end on the fused Linear->ReLU->
+  Linear graph, a size-sweep benchmark against Accelerate (see below for
+  the honest result), and the batched-elementwise-chain benchmark on a
+  real (not synthetic) chained graph
+- `tests/test_conv2d.py` — Conv2d: forward checked against an
+  independent direct/naive nested-loop reference (not just a
+  self-consistency check), backward checked numerically, a tiny conv
+  net trained by ordinary SGD to a real, checkable near-zero-loss target
+  (not a threshold picked by guessing -- see the file for why an
+  earlier classification-shaped target had an unreachable ~0.365
+  theoretical floor), and KIR trace/run/run_planned integration
+
+## Phase 2 status
+
+Built: the KIR node/graph schema, a tracer (`kir.trace`), a naive
+interpreter (`kir.run`), `kir.jit` (shape-specialized trace + cache +
+replay), and dead code elimination as the first optimization pass. The
+interpreter dispatches back to the real, autograd-tracked `Tensor` ops in
+traced order, so `backward()` and the optimizer work through a jit'd
+forward pass exactly as they do in eager mode — verified by training XOR
+to convergence through `kir.jit(model.__call__)` instead of calling
+`model(x)` directly.
+
+This is a Python-side prototype of the schema, not the production IR —
+per the project plan, KIR is meant to live in C++ as the real contract
+between the frontend and every backend. Prototyping the tracing and pass
+semantics here first, cheaply, is what de-risks that C++ implementation.
+
+Elementwise fusion is also built (`kir.elementwise_fusion` +
+`kir.run_fused`): it recognizes two chains -- `bias_add -> relu` (every
+Linear layer's forward epilogue) and `sub -> mul(self)` (the diff*diff
+core of MSE loss) -- and replaces each match with a single node that
+runs a dedicated, straight-line C++ kernel in one pass instead of two or
+three. It's a small, explicit lookup table of known patterns, not a
+general "fuse any elementwise chain" compiler, and that was a real
+finding, not a design choice made up front: a first version *was*
+general, compiling arbitrary chains to a tiny per-element bytecode
+interpreted by a generic stack machine. It was correct but measured
+~7x *slower* than running the ops unfused, because interpreting a
+bytecode per element can't be auto-vectorized, and for ops this cheap
+(a single flop each) that dispatch overhead swamps the memory bandwidth
+it was supposed to save. The pattern-matched version -- each recognized
+chain gets its own plain, vectorizable loop, same style as the unfused
+kernels -- measures a genuine ~2.2x speedup on a 2M-element benchmark
+(`tests/test_kir_fusion.py`). Forward-only, deliberately: a fused
+node's output carries no `grad_node`, so it's for inference/benchmarking
+paths, not for dropping into a training loop as-is.
+
+Layout optimization is also built, in a scoped-down form worth being
+explicit about: the roadmap's original "layout optimizer" bullet meant
+NCHW ↔ NHWC, which has no material to work with yet -- Kansai has no
+`Conv2d` or 4D tensor at all (it was listed in Phase 1's roadmap but
+never actually built in Milestone 0). What *is* real and load-bearing
+today: `matmul`'s backward pass used to materialize a full transposed
+copy of one operand (`transpose2d`) before its two gradient matmuls --
+an extra allocation and a full read+write pass over memory for
+something BLAS already does for free via its transpose flag. Replaced
+with `matmul_nt`/`matmul_tn` (backend/cpu/Ops.hpp), which read the
+original buffer directly (`CblasTrans`, or the portable fallback's
+swapped indexing) -- same underlying principle as NCHW/NHWC layout
+optimization (avoid physically moving data; choose how it's *read*
+instead), just applied to where it actually matters in this codebase.
+Measured ~7x faster for a single grad_a computation at a
+Linear(512→512)-at-batch-256 size (a standalone benchmark, since the
+old code path no longer exists to compare against in-repo). Correctness
+is verified by `test_grad_check.py`'s numerical gradient check, which
+is a stronger guarantee than comparing against the old implementation
+would have been -- it validates the new kernels from first principles.
+
+The memory planner is also built, and it's the one optimization this
+session where the honest story is genuinely mixed rather than a clean
+win. `kir.plan_memory(graph)` does real liveness analysis (each node's
+last-use index) plus a greedy slot assignment (same family as
+linear-scan register allocation) -- on the traced Linear->ReLU->Linear
+forward, 5 nodes need a buffer but only 1 slot is ever concurrently
+live, since it's a strict chain with no branching. `kir.run_planned`
+executes a graph pooling every intermediate through a `StoragePool`
+(backend: a first-fit free list) instead of malloc'ing fresh per node,
+releasing each buffer the instant its last consumer (per the plan) has
+run. Every op reaches the pool completely transparently -- the pool
+hooks into `Tensor::zeros()`, the one place every op already builds its
+output, so `add`/`matmul`/`relu`/etc needed zero changes.
+
+Measured, not assumed: at the tiny XOR scale, pooling is a net *loss*
+(~0.8-0.95x) -- the Python-level release bookkeeping plus its handful of
+extra nanobind calls per run costs more than the malloc/free it avoids
+for a few dozen floats. It crosses over, measured, around feature-dim
+~1000 at batch 128: large enough that a fresh buffer's page faults
+(touching never-before-mapped memory) cost more than this function's
+own fixed per-call overhead, so reusing an already-resident buffer wins
+outright -- 1.25-1.28x measured at dim 1024-2048. Same lesson as
+elementwise fusion's first (bytecode-interpreter) attempt, applied
+without needing to relearn it: measure the actual crossover, because
+"avoids work" doesn't automatically mean "faster" once there's fixed
+overhead on the path doing the avoiding.
+
+Forward-only and enforced, not just documented: `run_planned` asserts
+every input has `requires_grad=False`, refusing to run rather than risk
+a pooled buffer getting reused while a `GradNode` still expects to read
+it during a later `.backward()` -- silent memory corruption is a far
+worse failure mode than a wrong forward value, so this is a hard check.
+The graph's own output is deliberately never auto-released (the
+function can't know how long the caller wants to keep it); the caller
+calls `core.release_to_pool(pool, result)` once done with it, same as
+any pooled allocator -- forgetting to do so was the first bug this pass
+actually tripped over during testing (the output alone re-mallocing
+every call, since nothing told the pool it was free).
+
+Source-transform autograd is also built now: `kir.grad(graph, wrt)`
+returns a *new* Graph computing gradients, not a tape replayed at
+runtime -- the last of the project's original design decisions that was
+still open. Every op in the forward graph is re-embedded into the new
+graph first (so vjp rules have primal values available -- relu's needs
+its input's sign, mul's needs the other operand), then walked in
+reverse applying one vjp rule per op, accumulating cotangents into any
+node with more than one consumer -- the same algorithm
+`Tensor::backward()` already runs over the eager tape, just building
+graph nodes here instead of executing real ops. `kir.find_constant`
+locates the node holding a specific parameter Tensor, for building the
+`wrt` list. A handful of ops needed exposing as first-class,
+forward-only primitives to make this possible: `matmul_nt`/`matmul_tn`
+(the same transpose-avoiding kernels the layout optimization built, now
+also reachable from a *graph*, not just Tensor::matmul's own C++
+backward closure), `relu_backward`, `sum_axis0` (bias-add's vjp), and
+`broadcast_scalar` (sum/mean's vjp -- spreading a scalar cotangent back
+out to a shape). A graph with more than one requested gradient returns
+them packed into a `"tuple"` node, unpacked into a real Python tuple by
+`run()`/`run_fused()`'s dispatch loops.
+
+Verified three ways, each a stronger claim than the last:
+numerically, against central differences, with the eager engine never
+invoked anywhere in the check (`kir.trace` -> `kir.grad` -> `kir.run`,
+start to finish); exactly, cross-checked against the eager engine as an
+independent second implementation of the same math (both came back
+identical to the bit -- unsurprising once you notice both paths
+bottom out in the very same `matmul_nt`/`matmul_tn`/etc. kernels, but
+worth having as a check that isn't just "close enough"); and
+practically, training XOR to convergence with `.backward()` never
+called anywhere in the loop -- gradients come entirely from running the
+graph `kir.grad()` built once, ahead of time.
+
+The honest cost, measured rather than left implicit: a training step
+through `kir.grad()` takes about 1.6x as long as eager `backward()`,
+because the backward graph recomputes the *entire* forward pass
+internally (vjp rules need primal values, and this doesn't yet share
+them with a separately-run forward graph) on top of the general
+overhead of a Python-level graph interpreter versus calling eager
+`Tensor` methods directly. A joint forward+backward graph sharing primal
+computation would remove the doubled forward pass; not built here.
+
+Must run on an *unfused*, *unplanned* graph, in that order deliberately:
+apply `elementwise_fusion`/`plan_memory` to `grad()`'s result afterward
+if wanted, never before, since the vjp rules are written against the
+unfused op vocabulary. And a `grad()`-produced (multi-output, `"tuple"`)
+graph doesn't work with `run_planned` yet -- see that function's own
+docstring for the specific, understood hazard (a returned gradient's
+buffer could be handed to a later node before the caller reads it) and
+why it fails loudly (`KeyError`) rather than unsafely.
+
+Not yet built: an actual layout optimizer once there's a layout-
+sensitive op (Conv2d) for one to work on, and differentiating through
+the backward graph itself (higher-order gradients).
+
+Known limitations:
+
+- `kir.jit` bakes any non-traced operand (a Module's weight/bias) into
+  the graph as a constant node holding a *reference* to that Tensor.
+  This stays correct across a training loop only because `SGD.step()`
+  mutates parameters in place — a functional/immutable parameter-update
+  scheme would break it silently. Solving that properly (weights as
+  their own kind of graph input, not a baked-in constant) is later
+  Phase 2 work.
+- `Linear`'s weight init draws from `random_device` unless given an
+  explicit `seed`. With plain SGD and ReLU, an unlucky init can push
+  every hidden unit permanently negative within the first ~20 steps
+  ("dying ReLU": all-zero gradient forever after, loss stuck predicting
+  the batch mean). A 20-trial sweep at `lr=0.5` failed on 10 of them;
+  `lr=0.1` failed on 0/20 over 1000 steps but still 1/50 -- real, if
+  rare. `tests/test_xor.py` and `test_kir_trace.py` pass explicit,
+  swept-and-verified seeds for exactly this reason: a smoke test that
+  passes or fails by the luck of an unseeded RNG isn't actually testing
+  anything reliably.
+- Numerically gradient-checking a ReLU network is inherently fragile
+  right at a near-zero pre-activation: perturbing by +/-EPS can flip the
+  ReLU gate on only one side of the central difference, producing a
+  large discrepancy that reflects the check, not the engine. Found this
+  directly: `test_grad_check.py` originally shared one `random.seed(0)`
+  across two unrelated test blocks, and adding the matmul check before
+  the Linear+ReLU one silently shifted the second block's values onto
+  exactly this boundary with zero changes to that block's own code.
+  Fixed by giving each block its own `random.Random(seed)` instance —
+  no shared global RNG state across unrelated sections — plus an
+  explicit assertion that no pre-activation sits within 0.05 of zero,
+  so a future coincidence like this fails with a clear message instead
+  of a confusing gradient mismatch.
+
+## Phase 3 status: a real Metal backend
+
+`backend/metal/` runs actual GPU compute on this machine's own GPU --
+three MSL shaders (`matmul`, `bias_relu`, `add_bias`), compiled at
+runtime via `MTLDevice::newLibraryWithSource` (this machine has only
+Command Line Tools, not full Xcode, so the offline `metal`/`metallib`
+compilers aren't available -- runtime compilation doesn't need them),
+dispatched through `MTLComputeCommandEncoder`. `kir.run_metal(graph,
+*args)` takes an *already-fused* graph (`elementwise_fusion`'s output)
+and dispatches `matmul` and `fused_bias_relu` to Metal, a plain
+bias-broadcast `add` (a layer's unactivated final output) to
+`metal_add_bias`, and everything else (the loss computation -- tiny,
+and not what this demonstrates) to CPU. Correctness is verified at the
+kernel level and end-to-end on the real Linear->ReLU->Linear graph,
+matching CPU to within expected floating-point reduction-order
+differences (GPU and CPU sum in different orders; exact bit-for-bit
+agreement was never the right bar).
+
+The honest performance result: **Metal loses to Accelerate at every
+size tested**, from 64x64 up to 2048x2048 for matmul (0.00x-0.19x) and
+from 0.1M to 16.8M elements for a single fused bias+relu kernel call
+(0.03x-0.67x) -- though the gap consistently narrows as size grows in
+both cases, which is the interesting part. Two real, separate causes,
+not one:
+
+1. **Accelerate is exceptional on Apple Silicon.** It uses the AMX
+   matrix coprocessor -- a specialized hardware matrix-multiply unit --
+   not just NEON/AVX-style vectorization. Beating it needs a seriously
+   optimized GPU kernel (shared-memory tiling, register blocking) or
+   Apple's own MPSGraph, which likely exploits its own specialized
+   hardware paths. The naive kernel here (one GPU thread per output
+   element, no tiling at all) was never going to be competitive on raw
+   matmul FLOPs -- proving the pipeline and the correctness was the
+   actual goal of writing it by hand instead of reaching for MPSGraph
+   immediately. Still true, still the single biggest lever left on the
+   matmul path -- not addressed by the batching below, which is about
+   the elementwise kernels specifically.
+2. **The original dispatch design paid real, avoidable overhead on
+   every call**: `newBufferWithBytes` copies host memory into a new
+   Metal buffer for every argument, and each op got its own command
+   buffer plus a blocking `waitUntilCompleted` -- no overlap, no
+   batching multiple ops into one command buffer before synchronizing
+   once. For the elementwise kernels (bandwidth-bound, no tiling needed
+   to be competitive in principle) this was very likely the dominant
+   cost, not the compute itself -- which the next section fixes.
+
+### Batching the elementwise kernels into one command buffer
+
+Fixed: `metal::run_elementwise_chain` (backend/metal) encodes a whole
+sequence of `bias_relu`/`add_bias` steps into ONE command buffer with
+ONE `waitUntilCompleted`, each step's output staying resident on the GPU
+and feeding directly into the next step's input -- a new encoder per
+step (ended before the next begins), which is the standard way to chain
+several dispatches without an explicit fence, since Metal's automatic
+hazard tracking makes each step's writes visible to the next step's
+reads within one command buffer. Only the first upload and the final
+download ever touch host memory, however long the chain.
+
+Measured on an isolated synthetic chain (N steps of alternating
+bias_relu/add_bias, nothing else involved): **4-10x faster** than
+calling the equivalent stepwise functions N times, depending on batch
+size and chain length -- confirming the per-call round trip really was
+the dominant cost, not the compute.
+
+Wiring this into `kir.run_metal` needed a second, independent fix, not
+just calling the new function: `elementwise_fusion`'s greedy single-use
+grouping absorbs a layer's `add,relu` pair *and* the next layer's
+unactivated `add` into one three-member group whenever nothing else
+consumes the first layer's output, and the fusion pass used to require
+a group to match one whole known pattern (`("add","relu")` or
+`("sub","mul")`) -- a 3-member group matched neither, so *nothing* in
+it got fused at all, silently, for any graph shaped like two chained
+layers. Confirmed this directly on a real traced graph before fixing
+it, not assumed. Fixed by having `elementwise_fusion` greedily segment
+a group into a *sequence* of known 2-node patterns (`_segment_group`)
+instead of requiring the whole group to match one shape -- a group
+longer than a single recognized pair now fuses each recognizable pair
+inside it, chained to whatever's on either side, rather than being
+rejected wholesale. `run_metal` then batches any run of consecutive
+`fused_bias_relu`/bias-broadcast-`add` nodes it finds (there can be
+more than one such run per graph, separated by matmuls, each batched
+independently) into a single `metal_elementwise_chain` call.
+
+Measured on the real, now-correctly-fused graph (one matmul feeding a
+fused bias+relu immediately followed by another layer's bias-add, batch
+128, dim 512): **1.22x** -- smaller than the isolated benchmark's
+4-10x, because savings scale with how long the elementwise-only run is,
+and this graph has only a two-step run bookended by one matmul (whose
+own cost dominates and isn't touched by this fix). A deeper network
+with more consecutive elementwise steps between matmuls -- or fusing
+matmul itself into the same command buffer -- would show a larger
+share of the isolated benchmark's win; not attempted here.
+
+### Tiling the matmul kernel
+
+Fixed, partially: the naive kernel (one GPU thread per output element,
+reading full rows of A and columns of B straight from device memory
+every time) meant every thread in a threadgroup was independently
+re-fetching the *same* data its neighbors were already fetching -- no
+reuse at all, purely global-memory-bandwidth bound. `matmul_kernel` now
+stages one 16x16 tile of A and one of B into threadgroup (on-chip
+shared) memory per step, synchronizes once via `threadgroup_barrier` so
+every thread has finished writing before any thread reads, then has all
+256 threads in the group reuse those two tiles for 256 multiply-adds
+each before moving to the next tile along K -- cutting global memory
+traffic by roughly 16x compared to the naive version. Boundary tiles (M,
+K, or N not a multiple of 16) are handled by zero-padding an
+out-of-range read and masking an out-of-range write, verified directly
+against CPU at several non-tile-aligned sizes (17x15x19, 100x50x77,
+even 1x1x1), not just the round numbers.
+
+Dispatch had to change alongside the kernel, not just the shader source:
+`dispatchThreadgroups:threadsPerThreadgroup:` (a fixed 16x16 per group)
+replaced `dispatchThreads:`, deliberately -- the tiled kernel needs
+*every* threadgroup to be the full 16x16 even at the M/N boundary, since
+every thread must participate in loading the shared tile (only its own
+output write is masked); `dispatchThreads`'s non-uniform threadgroup
+sizing at boundaries would have handed some boundary groups fewer
+threads than 256, leaving part of the shared tile never written by
+anyone.
+
+The shader source itself is generated via `[NSString stringWithFormat:]`
+now rather than a bare string literal, so the tile size is one real
+number substituted into the MSL text rather than a C preprocessor
+`#define` that a raw string literal would never have expanded in the
+first place (the offline symptom: Metal's compiler would have seen the
+literal text `KANSAI_MATMUL_TILE` as an undefined identifier) --
+including remembering to escape the two literal `%` (modulo) operators
+already in the bias kernels as `%%`, since `stringWithFormat:` treats
+every unescaped `%` as its own format specifier.
+
+Measured: tiling gets Metal to **0.22x** at 2048x2048 (up from 0.19x
+untiled) -- roughly 15-27% faster than the naive kernel across the
+sizes tested, but still 4-5x *slower* than Accelerate everywhere, not
+competitive. Single-level tiling with one output element per thread
+closes only part of the gap to a specialized, AMX-backed CPU BLAS
+implementation. The next section is what actually closes it.
+
+### Reaching parity: MPSMatrixMultiplication
+
+`metal::matmul_mps` calls Apple's own `MPSMatrixMultiplication`
+(Metal Performance Shaders) instead of the hand-written kernel --
+still genuinely "the Metal backend" (MPS dispatches as Metal compute
+through the same command-buffer machinery this project already uses),
+just Apple's professionally-tuned GEMM instead of reinventing one by
+hand. This was always the documented next step (see "Tiling the matmul
+kernel" above) once hand-tiling alone proved insufficient, not a
+change of plan.
+
+Measured, warmed up first (see below for why that matters): **MPS
+reaches parity with Accelerate around 2048x2048 (0.85x) and wins outright
+at 4096x4096 (1.12x) and beyond (1.23x at 8192x8192)** -- a real
+crossover, not a rounding-error win. Head to head against the hand-tiled
+kernel, MPS wins everywhere measured except a wash at the smallest size
+(64x64, 0.99x) -- up to **4.1x faster** at 4096x4096 -- so it replaced
+the hand-tiled kernel as `run_metal`'s default matmul dispatch; the
+hand-tiled kernel stays available under its own name (`metal_matmul`,
+`core.metal_matmul`) as the "written by hand" reference and for direct
+comparison, not deleted.
+
+The honest caveat, not swept under the rug: this crossover is
+size-shaped, not universal. Large, roughly square matrices are where MPS
+wins -- the realistic shape a Linear layer's forward pass actually
+produces (a *small* batch dimension against *large* feature dimensions,
+e.g. 128x4096 @ 4096x4096) still loses to Accelerate, **0.35x**,
+because a thin M dimension means less total work to amortize the fixed
+per-call dispatch overhead (buffer creation, command buffer, blocking
+wait) against, regardless of how large K and N are. `run_metal` uses
+MPS unconditionally rather than switching between kernels by shape,
+since it's still a strict upgrade over the hand-tiled kernel at every
+size measured, including this one (1.54x faster than hand-tiled at this
+exact shape) -- "competitive with Accelerate" and "the best of the
+options this backend has" are different claims, and this section is
+honest about which one is true where.
+
+Caught before it produced a misleading number: MPS (like most libraries
+of its kind) pays a one-time kernel-selection/compilation cost on its
+*first* call at a new problem shape. An early, un-warmed benchmark run
+produced a 1024x1024 result *slower* than both its 512x512 and 2048x2048
+neighbors -- caught by noticing the non-monotonic shape, not by
+assuming the first number was right. Every benchmark here now makes one
+untimed warm-up call at each exact shape before starting the timed loop,
+standard practice for any kernel library with first-use compilation,
+applied because it was needed, not on principle alone.
+
+Register blocking, double-buffering, or a larger tile in the hand-tiled
+kernel remain real options for anyone who wants to keep pushing the
+hand-written path specifically rather than leaning on MPS. Given CUDA
+is physically impossible on this machine (no NVIDIA GPU exists to
+target) and Vulkan would mean testing against the very same GPU through
+an extra translation layer (MoltenVK), Metal was the only backend that
+could be verified end-to-end on real hardware in this pass.
+
+### Eliminating the copy: `newBufferWithBytesNoCopy`
+
+The remaining overhead in every Metal call up to this point was
+architectural, not computational: `newBufferWithBytes` copies host
+memory into a *separate* Metal-owned buffer on every single call, and
+the result gets copied *back* to host memory (`memcpy` from
+`buf_out.contents`) after every dispatch too -- on Apple Silicon, where
+CPU and GPU already share the same physical RAM, both copies are pure
+waste, an artifact of the implementation rather than anything the
+hardware actually requires.
+
+`newBufferWithBytesNoCopy:length:options:deallocator:` wraps existing
+host memory directly, with two hard requirements: the pointer must be
+page-aligned, and the caller keeps owning the memory (`deallocator:nil`
+here, since a `kan::Tensor`'s `Storage` already manages that lifetime;
+letting Metal *also* try to free it would double-free). `Storage`
+(`core/Storage.cpp`) didn't meet the first requirement before -- plain
+`malloc` on this platform aligns to 16 bytes, not the page size -- so
+its allocator now goes through `posix_memalign`, rounding every request
+up to at least one full page. That's a real, if small in absolute
+terms, cost: every tensor now has a floor of one page (16KB on Apple
+Silicon) regardless of how few bytes it logically needs. `nbytes()` was
+changed to report that actual (rounded-up) size rather than the
+originally requested one -- the only other consumer, `StoragePool`'s
+free-list size check, only becomes *more* permissive by seeing the true
+figure, so nothing broke there.
+
+With every `Storage` guaranteed page-aligned, every Metal function
+(`matmul`, `matmul_mps`, `bias_relu`, `add_bias`,
+`run_elementwise_chain`) now wraps its input *and output* buffers
+directly via a shared `wrap_no_copy` helper instead of allocating and
+copying. The output side removes the trailing `memcpy` entirely -- the
+GPU writes straight into the `Tensor`'s own memory, and
+`waitUntilCompleted` is exactly the synchronization point that makes
+those writes safe to read from the CPU immediately after. In
+`run_elementwise_chain` specifically, only the *first* input and the
+*last* step's output touch NoCopy wrapping; the intermediate buffers
+between steps are pure GPU scratch with no corresponding host tensor,
+so there's nothing for them to wrap.
+
+Measured before touching any Metal code: applying only the page-aligned
+`Storage` change and rerunning the existing suite caught a real, if
+minor, thing on its own -- a benchmark assertion (`batching should be
+faster on the real graph`) that had been sitting right at the noise
+floor started failing intermittently (confirmed by rerunning the exact
+same comparison three times with no code change in between: 0.90x,
+1.01x, 1.07x). Not a regression from this work, but a pre-existing
+fragility this work's rebuild happened to surface; fixed by taking the
+median of five repeated trials instead of one, the standard fix for a
+benchmark this close to sub-millisecond noise -- not by loosening the
+threshold.
+
+Measured after NoCopy: the whole matmul comparison moved, not just the
+weak point.
+
+| Shape | Before (copy) | After (NoCopy) |
+|---|---|---|
+| 512x512 | 0.21-0.40x | 0.38-0.40x |
+| 2048x2048 | 0.76-0.85x | **1.08-1.60x** |
+| 4096x4096 | 1.09-1.15x | **1.50-1.57x** |
+| 128x4096 @ 4096x4096 (realistic layer) | **0.32-0.35x** | **1.28-1.31x** |
+
+That last row is the one that matters most: the realistic thin-batch
+shape a Linear layer's forward pass actually produces was the backend's
+one clear weak point two commits ago, losing to Accelerate by 3x. It
+now *wins*. That's exactly consistent with the diagnosis at the time --
+a thin batch dimension means less compute to amortize *fixed* dispatch
+overhead against, and this change is precisely what removed that fixed
+cost (two copies per call, gone) rather than adding more compute
+throughput. The elementwise batching benchmark moved too (1.27x on this
+run, consistent with the 1.1-1.3x range measured previously) --
+expected, since eliminating the copies helps every call along that path
+equally, not just matmul's.
+
+Not attempted here: extending NoCopy (or the page-alignment it depends
+on) to any future backend that doesn't share Metal's unified-memory
+assumption -- a discrete GPU with real host/device memory separation
+would need actual transfers regardless of alignment, and this
+optimization is specific to Apple Silicon's architecture, not a general
+technique that would carry over unmodified to, say, a hypothetical CUDA
+backend.
+
+## Conv2d
+
+`Tensor::conv2d` (NCHW, `(N,Cin,H,W)` input against `(Cout,Cin,kH,kW)`
+weight) is real, not a stub: forward is im2col (unfold each batch
+item's input into a `(Cin*kH*kW, Hout*Wout)` patch matrix) followed by
+one `matmul` call per batch item -- the same Accelerate-backed kernel
+every other op in this codebase already uses, rather than a
+hand-written convolution inner loop. Backward reuses the same
+transpose-avoiding `matmul_nt`/`matmul_tn` the layout-optimization work
+built for `Tensor::matmul`'s own backward, plus `col2im` (im2col's
+inverse: a scatter-*add*, since overlapping patches at stride < kernel
+size means multiple output positions contribute to the same input
+pixel) for the gradient wrt the input.
+
+Correctness is checked two genuinely independent ways on purpose, not
+one: forward against a direct, textbook nested-loop convolution with no
+im2col or matmul anywhere in it (a self-consistency check like
+gradient-checking the *same* forward implementation would never catch
+an indexing bug -- both sides would reflect the identical mistake), then
+backward against central differences. A tiny `nn.Conv2d` then trains by
+ordinary SGD on a task with a *known, exactly representable* target (a
+3x3 filter regressing each non-overlapping patch to its own pixel sum,
+representable exactly by an all-ones kernel and zero bias) rather than a
+threshold picked by guessing: it converges to essentially zero loss and
+the learned weight comes out as `[1,1,1,1,1,1,1,1,1]`, exactly the
+kernel that reproduces a sum. An earlier version of that same sanity
+check used a sign-classification target instead, whose achievable MSE
+for any linear (activation-free) model turns out to be ~0.365 by a
+symmetry argument -- an assertion threshold below that would have failed
+regardless of whether conv2d's gradients were correct, which is exactly
+the kind of test that looks like it's checking correctness while
+actually just checking whether the target was reachable at all.
+
+KIR integration is real but partial, on purpose: `kir.trace` records
+`conv2d` as a first-class node, and `kir.run`/`kir.run_planned` both
+dispatch it correctly (verified against eager). Not wired in:
+`elementwise_fusion` (no known fused pattern involves conv2d -- nothing
+to gain from pretending otherwise) and `run_metal` (no Metal conv
+kernel exists yet). Both simply have no case for `"conv2d"`, so a graph
+containing one raises a clear `KeyError` there rather than silently
+mishandling it.
+
+NCHW only, deliberately: no layout optimizer exists yet to choose
+between NCHW and NHWC, so there was nothing to gain from supporting
+both from day one. Conv2d existing now is what actually gives that
+optimizer something to work on -- building it was the whole point of
+the "an actual layout optimizer once there's a layout-sensitive op"
+line in this README's own earlier Phase 2 section. Not attempted here;
+a natural next step whenever it's worth picking up.
+
+## Build
+
+Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`
+installed in that Python's environment:
+
+```bash
+python3 -m pip install --user nanobind
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+The compiled extension lands directly in `python/kansai/`, so there's no
+install step.
+
+## Run
+
+```bash
+python3 tests/test_xor.py
+```
+
+## Design notes
+
+- Only `float32` is implemented; `DType` is an enum specifically so more
+  dtypes can be added later without touching call sites.
+- `add`/`matmul`/etc. are autograd-aware: they build a `GradNode` that
+  captures its parent tensors and a backward closure. `backward()` does a
+  DFS topo-sort over that graph and applies each closure in reverse.
+- Parameter updates (`Tensor::add_`) bypass the graph entirely — they're
+  not part of the forward computation, so they shouldn't be tracked.
+- `matmul`'s backward pass needs transposes; those are computed as plain
+  buffers inside the backward closure, not as their own differentiable op
+  (no second-order gradients in Milestone 0).
