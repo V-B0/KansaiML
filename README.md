@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/V-B0/KansaiML/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/V-B0/KansaiML/actions/workflows/tests.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg"></a>
   <img alt="Status" src="https://img.shields.io/badge/status-active%20development-orange.svg">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Apple%20Silicon-lightgrey.svg">
@@ -50,6 +51,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — Indexing/`Embedding` | `index_select` (repeat-accumulating backward), token-lookup `nn.Embedding` | ✅ done |
 | — Comparisons/`where` | `gt`/`lt`/`eq` (deliberately non-differentiable), boolean-style `where` | ✅ done |
 | — `AdamW` | Decoupled weight decay (Loshchilov & Hutter, 2019), not L2 | ✅ done |
+| — Packaging/CI | `pip install`-able (`scikit-build-core`), GitHub Actions on Apple Silicon | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -203,14 +205,27 @@ Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`.
 Apple Silicon is the only tested target (Accelerate for CPU, Metal +
 MetalPerformanceShaders for GPU).
 
+Either `pip install` it directly (via `pyproject.toml`'s
+`scikit-build-core` + `nanobind` build backend — no manual CMake
+invocation needed, and this is what [CI](.github/workflows/tests.yml)
+itself builds and imports on every push to check the packaging stays
+real, not just configured):
+
+```bash
+python3 -m pip install .
+```
+
+or build in place from the source tree, with no install step at all —
+the compiled extension lands directly in `python/kansai/`:
+
 ```bash
 python3 -m pip install --user nanobind
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-The compiled extension lands directly in `python/kansai/`, so there's
-no install step. Then:
+Then, from the source tree (skip the `sys.path` line if you `pip
+install`ed instead):
 
 ```python
 import sys; sys.path.insert(0, "python")

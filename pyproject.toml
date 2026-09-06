@@ -1,0 +1,39 @@
+[build-system]
+requires = ["scikit-build-core>=0.9", "nanobind>=1.9"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "kansai"
+version = "0.1.0"
+description = "A deep learning framework built without the compromises PyTorch made when it still had to ship in 2016."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [{ name = "Valentino" }]
+keywords = ["deep-learning", "autograd", "metal", "apple-silicon", "tensor"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Operating System :: MacOS",
+]
+
+[project.urls]
+Homepage = "https://github.com/V-B0/KansaiML"
+Repository = "https://github.com/V-B0/KansaiML"
+
+# Every claim in DEVLOG.md/README.md was actually run on Apple Silicon
+# (Accelerate for CPU, Metal + MetalPerformanceShaders for GPU) --
+# nothing here has ever been built or tested on Linux/x86, so this
+# isn't a portability guarantee, just an honest packaging of what's
+# already true of the project.
+[tool.scikit-build]
+minimum-version = "0.9"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["python/kansai"]
+
+[tool.scikit-build.cmake.define]
+CMAKE_BUILD_TYPE = "Release"

@@ -1,0 +1,85 @@
+name: tests
+
+# macos-14 is GitHub's Apple Silicon (M1) runner -- the ONLY target
+# this project has ever been built or tested on (Accelerate for CPU,
+# Metal + MetalPerformanceShaders for GPU; see README.md's own
+# Quickstart). Every test file that touches the Metal path already
+# gates it behind `if core.metal_available()`, so this stays green
+# whether or not the runner's sandboxed GPU access reports available --
+# it's checking the real CPU path unconditionally either way, and the
+# real Metal path whenever the runner happens to allow it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: python3 -m pip install --upgrade pip nanobind
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+
+      - name: Run test suite
+        run: |
+          for f in tests/test_*.py; do
+            echo "=== $f ==="
+            python3 "$f"
+          done
+
+  build-wheel:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Real end-to-end packaging check, not just "the config parses":
+      # build an actual wheel via the pyproject.toml build-system, pip
+      # install it into a clean environment, then import kansai and run
+      # a real training loop -- entirely outside the source tree, the
+      # same way any real pip user's environment would exercise it.
+      - name: Build wheel
+        run: |
+          python3 -m pip install --upgrade pip build
+          python3 -m build --wheel -o dist
+
+      - name: Install wheel and verify end to end
+        run: |
+          python3 -m pip install dist/*.whl
+          cd /tmp
+          python3 -c "
+          import kansai
+          from kansai import nn, optim
+
+          X = kansai.tensor([[0, 0], [0, 1], [1, 0], [1, 1]])
+          Y = kansai.tensor([[0], [1], [1], [0]])
+          model = nn.Sequential(nn.Linear(2, 8, seed=3), nn.ReLU(), nn.Linear(8, 1, seed=4))
+          opt = optim.AdamW(model.parameters(), lr=0.05, weight_decay=0.0)
+          for _ in range(300):
+              pred = model(X)
+              diff = pred.sub(Y)
+              loss = diff.mul(diff).mean()
+              model.zero_grad()
+              loss.backward()
+              opt.step()
+          final = loss.tolist()[0]
+          print('final loss:', final)
+          assert final < 0.05, 'pip-installed kansai failed to train XOR to convergence'
+          print('pip-installed kansai works end to end.')
+          "

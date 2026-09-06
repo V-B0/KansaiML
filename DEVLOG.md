@@ -1943,6 +1943,59 @@ confirmed to leave the parameter completely unchanged when
 `test_adam.py` trains with plain `Adam`, to the identical convergence
 bar.
 
+## Packaging and CI
+
+Two real, previously-confirmed-absent gaps: nothing made Kansai
+`pip install`-able, and nothing ran the test suite automatically. Both
+close here, and neither was left as "config that looks plausible" --
+each was actually run and its real output checked, the same bar every
+feature above is held to.
+
+`pyproject.toml` uses `scikit-build-core` (nanobind's own recommended
+build backend for exactly this CMake+nanobind combination) rather than
+a hand-rolled `setup.py`. The existing `python/CMakeLists.txt` already
+had a `set_target_properties(... LIBRARY_OUTPUT_DIRECTORY
+".../python/kansai")` line that drops the compiled extension straight
+into the source tree for the no-install local-dev workflow the
+Quickstart already documented -- left completely unchanged, since
+that's a real, working path people already rely on. Packaging needed
+one new, additive line instead: `install(TARGETS _core LIBRARY
+DESTINATION kansai)`, which only fires when `cmake --install` actually
+runs (i.e. only inside `scikit-build-core`'s own wheel-build step, a
+plain `cmake --build build` never touches it) -- so the two paths
+coexist without either one changing the other's behavior.
+
+Actually verified rather than assumed correct: built a real wheel
+(`python3 -m build --wheel`) in a from-scratch isolated venv, installed
+it into a SEPARATE clean venv with no relationship to the source tree
+at all, then ran `import kansai` and a full XOR training loop
+(`Sequential` → `AdamW` → convergence) from `/tmp`, nowhere near the
+repository -- confirming the wheel is real and self-contained, not
+just "the build didn't error." It converged to loss `5.1e-15` and
+`core.metal_available()` reported `True` even from the installed
+wheel, off the source tree entirely.
+
+CI is one GitHub Actions workflow (`.github/workflows/tests.yml`) with
+two jobs, both on `macos-14` -- GitHub's Apple Silicon (M1) runner, the
+ONLY target this project has ever built or run on; a Linux or Intel
+runner would be testing a platform nothing here has ever been verified
+against, so it isn't used. The `test` job configures and builds via
+plain CMake, then runs every `tests/test_*.py` file exactly as a
+developer would locally. The `build-wheel` job repeats the exact
+manual verification above, automatically, on every push: build the
+wheel, `pip install` it, import it from outside the checkout, and
+train XOR to convergence -- so a packaging regression (a missing
+`install()` rule, a wrong `wheel.packages` path, anything that would
+make the *published* package broken even while the source-tree dev
+workflow kept working) gets caught by CI itself, not discovered by the
+first person who actually tries to `pip install` it. Every existing
+test file already gates its own Metal-path assertions behind
+`if core.metal_available()` (established well before this session,
+back when Metal support first landed), so the suite stays meaningful
+whether or not the CI runner's sandboxed GPU access reports available
+-- no CI-specific skip logic had to be added anywhere for this to
+work correctly.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`
