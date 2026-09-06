@@ -844,6 +844,77 @@ be useful); activation quantization; quantization-aware training
 (continuing to train through int8 weights, rather than quantizing only
 after training finishes); and, as above, an actual int8 GEMM kernel.
 
+## Concurrent dispatch
+
+Every earlier section of this Phase 4 work stated the same limitation:
+`dtensor_run`/`dtensor_grad` dispatch to each mesh device in a plain
+Python loop, one after another, because nanobind didn't release the
+GIL around any binding in this codebase -- so even driving "cpu" and
+"metal" from separate Python threads wouldn't have overlapped their
+execution; the GIL would serialize them exactly as if they were one
+loop. Closed now, on both ends of that gap.
+
+`python/bindings.cpp`: every compute-heavy binding the "cpu" and
+"metal" dispatch paths actually call -- the plain `Tensor` methods
+(`add`, `sub`, `mul`, `matmul`, `relu`, `sum`, `mean`, `conv2d`), the
+backward-only ops `kir.grad`'s vjp rules emit (`matmul_nt`, `matmul_tn`,
+`relu_backward`, `sum_axis0`, `broadcast_scalar`), and every `metal_*`
+function -- now carries `nb::call_guard<nb::gil_scoped_release>()`.
+Each one is pure C++ number-crunching on the buffers it's handed (an
+Accelerate call, a hand-written loop, or a Metal dispatch's own
+synchronous `waitUntilCompleted`), touching no Python object once
+inside, so releasing the GIL for that duration is safe -- and it's
+exactly what lets another Python thread's own such call proceed
+concurrently instead of waiting on the GIL. Checked before relying on
+it, not assumed: Metal's command queue is documented thread-safe for
+concurrent command-buffer creation from multiple threads (Apple's own
+Metal Best Practices Guide), `state()`'s (`backend/metal/MetalOps.mm`)
+one-time lazy initialization is a function-local `static`, which
+C++11 already guarantees is thread-safe against concurrent first
+callers, and the CPU backend's kernels touch only the buffers passed
+to them -- no shared mutable state for two threads to race on. The one
+real exception, stated rather than glossed over: `kir.run_planned`'s
+`StoragePool` is a genuinely shared, non-thread-safe free-list;
+`dtensor_run`/`dtensor_grad` never use pooling, and combining pooled
+execution with concurrent dispatch is unverified, unattempted future
+work, not silently assumed safe by this change.
+
+`python/kansai/distributed.py`: a new `_run_parallel(work_fns)` runs
+each device's work on its own `threading.Thread` and returns results in
+device order (re-raising any thread's exception from the main thread
+afterward, rather than losing it the way an uncaught exception in a
+`threading.Thread` target normally would). `dtensor_run` and
+`dtensor_grad` both build their per-device closures up front, fuse the
+graph for the "metal" device up front too (not lazily inside a thread,
+where two "metal" entries in the same mesh racing the same
+`is None` check would be exactly the kind of unsynchronized-shared-
+state bug the rest of this change explicitly doesn't extend to), then
+dispatch through `_run_parallel` instead of a plain `for` loop.
+
+Measured, not just argued: `tests/test_distributed_concurrency.py`
+times a 4096×4096 matmul, split 2048+2048 rows across `["cpu",
+"metal"]`, three ways -- "cpu" alone, "metal" alone, and through
+`dtensor_run`'s real concurrent dispatch -- and checks the concurrent
+wall time against the naive (serial) sum of the other two. First
+attempt used a smaller (2048×2048, split 1024+1024) shape, where each
+call lands in the single-digit milliseconds; three back-to-back runs
+of that version came back 1.49x, then failed at 1.15x, then failed at
+0.90x (concurrent dispatch measured *slower* than serial) -- at that
+scale, thread creation and OS scheduling overhead is a large enough
+fraction of the total time to swamp the actual concurrency signal, the
+same kind of noise-floor problem the elementwise-batching benchmark hit
+earlier in this project, fixed the same way: not by loosening the
+assertion, but by sizing the workload so real compute dominates over
+fixed overhead. At 4096×4096 (tens of milliseconds per call), seven
+repeated trials came back 27.12-27.35ms for the concurrent path against
+a 41.5-41.8ms naive serial sum -- three independent full runs of the
+test measured 1.52x, 1.53x, 1.53x, consistent to within noise. The
+concurrent time (~27ms) landing close to "cpu alone"'s own solo time
+(~25.8ms) rather than partway between it and the naive sum is the
+clearest sign of what's actually happening: "metal"'s ~15.7ms leg is
+almost entirely hidden inside "cpu"'s own leg's duration, close to the
+best case two genuinely concurrent, unequal-duration tasks can achieve.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

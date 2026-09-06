@@ -31,18 +31,70 @@ for -- all-reduce (sum) for a Replicate()'d one, all-gather (concat)
 for a Shard()'d one. See its own docstring for the full design and the
 loss-scaling subtlety that comes with it.
 
-No real concurrency either: dtensor_run dispatches to each device in a
-plain Python loop, one after another. nanobind doesn't release the GIL
-around any binding in this codebase, so even calling the CPU and Metal
-paths from separate Python threads wouldn't overlap their execution
-today -- true concurrent dispatch is a real, separate piece of work
-(releasing the GIL around the blocking Metal calls specifically, since
-they already do their own synchronous wait), not something this module
-does for free.
+Real concurrency, not simulated: every compute-heavy nanobind binding
+this module's dispatch touches -- the plain Tensor ops kir.run uses on
+"cpu", and every metal_* function kir.run_metal uses on "metal" -- is
+bound with `nb::call_guard<nb::gil_scoped_release>()` (see
+python/bindings.cpp), so each one releases Python's GIL for the
+duration of its own blocking C++ call (an Accelerate routine, or a
+Metal dispatch's own synchronous `waitUntilCompleted`). _run_parallel
+(below) runs each device's work on its own Python `threading.Thread`;
+with the GIL released inside each device's actual compute, two threads
+genuinely execute their C++ calls concurrently rather than being
+serialized by the GIL the way plain Python threads normally are. Safe
+to do: Metal's command queue is documented thread-safe for concurrent
+command-buffer creation from multiple threads (Apple's Metal Best
+Practices Guide), and the CPU backend's Accelerate calls and hand-
+written kernels touch only the buffers passed to them, not any shared
+mutable state -- see backend/metal/MetalOps.mm's `state()` (a
+function-local static, whose one-time initialization C++11 already
+makes thread-safe) and backend/cpu's stateless kernels. The one real
+caveat: this doesn't extend to `kir.run_planned`'s `StoragePool` (a
+genuinely shared, non-thread-safe free-list) -- dtensor_run/dtensor_grad
+never use it, and combining pooled execution with concurrent dispatch
+is unattempted, unverified future work, not silently assumed safe.
+Measured, not just argued: tests/test_distributed_concurrency.py times
+"cpu"-alone and "metal"-alone against the same work run concurrently
+through dtensor_run, and the concurrent wall time comes in well under
+their naive sum.
 """
+
+import threading
 
 from . import _core as core
 from . import kir
+
+
+def _run_parallel(work_fns: list) -> list:
+    """Runs each zero-arg callable in `work_fns` on its own
+    threading.Thread and returns their results in the same order --
+    real overlap between threads depends entirely on the callables'
+    own C++ calls releasing the GIL (see the module docstring); without
+    that, Python's GIL would serialize these threads the same as
+    calling them one after another, just with extra thread-scheduling
+    overhead on top. A raised exception from any thread is re-raised
+    here (from the main thread, after every thread has finished) rather
+    than silently lost, which is what happens by default when an
+    exception escapes a threading.Thread's target."""
+    results: list = [None] * len(work_fns)
+    errors: list = [None] * len(work_fns)
+
+    def runner(i):
+        try:
+            results[i] = work_fns[i]()
+        except Exception as e:  # noqa: BLE001 -- re-raised below, not swallowed
+            errors[i] = e
+
+    threads = [threading.Thread(target=runner, args=(i,)) for i in range(len(work_fns))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for e in errors:
+        if e is not None:
+            raise e
+    return results
 
 
 class DeviceMesh:
@@ -204,7 +256,9 @@ def dtensor_run(graph, output_placement, *dtensor_args) -> DTensor:
     device's real backend -- kir.run for "cpu", kir.run_metal (on an
     elementwise_fusion'd copy of the graph, matching run_metal's own
     contract) for "metal". Each shard's result comes from that backend's
-    actual interpreter, not a simulation of one.
+    actual interpreter, not a simulation of one, and every device runs
+    concurrently on its own thread (see _run_parallel and the module
+    docstring for why that's real overlap, not just extra threads).
 
     All DTensor arguments must already share the same mesh, and (since
     `graph` was traced once, against one representative shape) every
@@ -226,19 +280,24 @@ def dtensor_run(graph, output_placement, *dtensor_args) -> DTensor:
         if dt.mesh is not mesh:
             raise ValueError("all DTensor arguments must share the same DeviceMesh")
 
-    fused_graph = None
-    results = []
+    # Built once, up front, rather than lazily inside a thread: a mesh
+    # could in principle list "metal" more than once, and racing two
+    # threads on the same `fused_graph is None` check is exactly the
+    # kind of unsynchronized-shared-state bug the rest of this module's
+    # concurrency claim explicitly does NOT extend to.
+    fused_graph = kir.elementwise_fusion(graph) if "metal" in mesh.devices else None
+
+    work_fns = []
     for i, device in enumerate(mesh.devices):
         shard_inputs = [dt.shards[i] for dt in dtensor_args]
         if device == "cpu":
-            results.append(kir.run(graph, *shard_inputs))
+            work_fns.append(lambda shard_inputs=shard_inputs: kir.run(graph, *shard_inputs))
         elif device == "metal":
-            if fused_graph is None:
-                fused_graph = kir.elementwise_fusion(graph)
-            results.append(kir.run_metal(fused_graph, *shard_inputs))
+            work_fns.append(lambda shard_inputs=shard_inputs: kir.run_metal(fused_graph, *shard_inputs))
         else:
             raise ValueError(f"unknown device {device!r}")
 
+    results = _run_parallel(work_fns)
     return DTensor(mesh, output_placement, results)
 
 
@@ -336,19 +395,23 @@ def dtensor_grad(graph, wrt: list, wrt_placements: list, *dtensor_args) -> list:
 
     bwd_graph = kir.grad(graph, wrt)
 
-    fused_bwd_graph = None
-    per_device_results = []
+    # Same up-front (not lazy-inside-a-thread) fusion as dtensor_run,
+    # and the same real concurrent dispatch via _run_parallel -- see
+    # both of their own docstrings for why.
+    fused_bwd_graph = kir.elementwise_fusion(bwd_graph) if "metal" in mesh.devices else None
+
+    work_fns = []
     for i, device in enumerate(mesh.devices):
         shard_inputs = [dt.shards[i] for dt in dtensor_args]
         if device == "cpu":
-            out = kir.run(bwd_graph, *shard_inputs)
+            work_fns.append(lambda shard_inputs=shard_inputs: kir.run(bwd_graph, *shard_inputs))
         elif device == "metal":
-            if fused_bwd_graph is None:
-                fused_bwd_graph = kir.elementwise_fusion(bwd_graph)
-            out = kir.run_metal(fused_bwd_graph, *shard_inputs)
+            work_fns.append(lambda shard_inputs=shard_inputs: kir.run_metal(fused_bwd_graph, *shard_inputs))
         else:
             raise ValueError(f"unknown device {device!r}")
-        per_device_results.append(out if isinstance(out, tuple) else (out,))
+
+    raw_results = _run_parallel(work_fns)
+    per_device_results = [out if isinstance(out, tuple) else (out,) for out in raw_results]
 
     results = []
     for j, placement in enumerate(wrt_placements):

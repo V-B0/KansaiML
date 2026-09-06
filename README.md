@@ -38,7 +38,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | 1 — Foundation | Tensor/autograd core, CPU backend, `nn`/`optim` | ✅ done |
 | 2 — KIR | Tracing, fusion, memory pooling, source-transform autograd | ✅ done |
 | 3 — GPU backend | Real Metal compute (tiled kernel + MPS, full op + Conv2d coverage) | ✅ done |
-| 4 — Distributed | `DeviceMesh`/`DTensor`, distributed gradients, int8 quantization | 🟡 in progress |
+| 4 — Distributed | `DeviceMesh`/`DTensor`, distributed gradients, concurrent dispatch, int8 quantization | 🟡 in progress |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -67,7 +67,13 @@ post-training int8 weight quantization (`QTensor`/`QLinear`) measures
 an exact 4.00x memory reduction (1 byte/element vs 4), with round-trip
 error bounded by the known quantization step and a quantized XOR model
 still classifying every input correctly — a real, honest memory-only
-win (no int8 GEMM kernel exists yet, so there's no FLOPs claim attached).
+win (no int8 GEMM kernel exists yet, so there's no FLOPs claim attached);
+`dtensor_run`/`dtensor_grad` now dispatch every mesh device on its own
+thread with the GIL released around each device's actual compute
+(`nb::call_guard<nb::gil_scoped_release>()` on every hot binding), and
+a 4096×4096 matmul split across `["cpu", "metal"]` measures a real,
+repeatable 1.52-1.53x speedup over running the same two device-legs one
+after another — genuine overlap, not just extra threads.
 
 ## Why
 
@@ -154,7 +160,9 @@ Python (Tensor, nn.Module, optim)
   interpreters (`run`, `run_fused`, `run_planned`, `run_metal`)
 - `python/kansai/distributed.py` — `DeviceMesh`, `DTensor`,
   `Shard`/`Replicate` placements, `dtensor_run` (forward), and
-  `dtensor_grad` (backward, with auto-inserted collectives)
+  `dtensor_grad` (backward, with auto-inserted collectives) — both
+  dispatch every mesh device on its own real, concurrently-overlapping
+  thread
 - `python/kansai/quantize.py` — post-training int8 weight quantization
   (`QTensor`, `QLinear`), standalone and inference-only
 - `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`,
