@@ -53,6 +53,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — `AdamW` | Decoupled weight decay (Loshchilov & Hutter, 2019), not L2 | ✅ done |
 | — Packaging/CI | `pip install`-able (`scikit-build-core`), GitHub Actions on Apple Silicon | ✅ done |
 | — Training utilities | `clip_grad_norm_`, `StepLR`, `CosineAnnealingLR` | ✅ done |
+| — `Dataset`/`DataLoader` | Map-style, per-epoch reshuffle, replaces every hand-rolled batching loop | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -191,7 +192,15 @@ and combine correctly across multiple parameters at once;
 point including both endpoints; and, practically, `Adam` +
 `clip_grad_norm_` + `CosineAnnealingLR` trained together — with
 clipping CONFIRMED to actually engage on the first step, not a silent
-no-op — reach loss `~0`.
+no-op — reach loss `~0`. `DataLoader` (map-style, per-epoch reshuffle
+via its own `random.Random` instance, independent of global `random`
+state — confirmed by perturbing global state in between and getting
+the identical order anyway) is checked to match manual slicing exactly
+when unshuffled, visit every example exactly once per epoch when
+shuffled, and reshuffle rather than repeat across successive epochs;
+practically, retraining `test_embedding.py`'s own marker-token
+classifier through a real `Dataset`/`DataLoader` instead of its
+original hand-rolled batching reaches the identical 100% test accuracy.
 
 ## Why
 
@@ -306,6 +315,8 @@ Python (Tensor, nn.Module, optim)
   `AvgPool2d`, `MaxPool2d`, `Dropout`, `MultiHeadAttention`, `Embedding`,
   `Sequential`, `SGD`, `Adam`, `AdamW`, `clip_grad_norm_`, `StepLR`,
   `CosineAnnealingLR`
+- `python/kansai/data.py` — `Dataset`, `DataLoader` (map-style,
+  per-epoch reshuffle, no worker-process plumbing)
 - `tests/` — every claim above, checked: numerical gradient checks,
   cross-checks between independent implementations, and benchmarks that
   assert real speedups rather than just printing numbers

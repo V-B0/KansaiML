@@ -2057,6 +2057,67 @@ gradient norm 2.95 against `max_norm=0.5`, not a silent no-op) and
 training, while the model still reaches loss `~0` -- proving the three
 pieces compose correctly together, not just individually.
 
+## Dataset and DataLoader
+
+Every training loop in this project up to now -- `test_embedding.py`'s
+`MarkerClassifier`, `test_optim_utils.py`'s practical check,
+`examples/mnist/train_mnist.py` -- had been writing the same
+"shuffle a list of indices, slice it into chunks" boilerplate by hand.
+`python/kansai/data.py` is that pattern extracted once, and closes it
+for real training loops going forward, the next real target being
+attention-based training on actual text.
+
+Map-style only: a `Dataset` is anything with `__len__`/`__getitem__`
+(the base class exists to document intent and give a clear
+`NotImplementedError` rather than a confusing `TypeError` -- `DataLoader`
+itself only ever calls `len(dataset)`/`dataset[i]`, so a plain list
+already satisfies the whole interface, no subclassing required).
+Deliberately no multi-process worker pool, no pinned memory, no custom
+samplers -- Kansai has no threading/IPC infrastructure that would make
+out-of-process workers meaningful (`distributed.py`'s own concurrent
+dispatch is real threads across `DeviceMesh` devices, a different
+problem), and nothing in this project's own training loops has ever
+been slow enough for data loading to be the bottleneck. Adding that
+plumbing now would be exactly the premature generality this project's
+own conventions avoid.
+
+`_default_collate` stops at "grouped into per-field Python lists," not
+built into a `Tensor` -- a batch of `(x, y)` tuples becomes
+`(list_of_x, list_of_y)` via `zip(*items)`, the exact shape every
+training loop above already builds by hand. Deliberately NOT forced
+further into a `core.Tensor`: different model inputs need different
+shapes from the identical loader (a flat `Tensor` for a `Linear`
+layer's features, a plain nested list of ints for `nn.Embedding`'s
+token ids -- see `Tensor::index_select`'s own doc comment for why
+indices are plain ints, never a `Tensor`), so committing to one
+Tensor-construction convention inside the loader would be wrong for
+half of what it needs to feed.
+
+`DataLoader(dataset, batch_size, shuffle, seed, drop_last)` reshuffles
+on every fresh `__iter__()` call (matching PyTorch's own per-epoch
+reshuffle semantics: two consecutive `for batch in loader:` loops over
+the same instance get two different orderings, both covering every
+example) using its OWN `random.Random(seed)` instance, not the global
+`random` module -- so a fixed seed makes a run reproducible completely
+independent of whatever else in the process has called `random.*`.
+
+Verified: `shuffle=False` batch order matches manual slicing exactly
+(the baseline every other test's own hand-rolled batching loop already
+implicitly trusted); `shuffle=True` reproducibility across two
+independently constructed loaders sharing a seed, confirmed
+independent of the global `random` module's state by deliberately
+perturbing it in between and getting the identical order anyway;
+every example visited exactly once per epoch (a set-equality check
+against `range(n)`, not just "output looks shuffled"); successive
+epochs from the SAME loader instance reshuffle rather than repeat;
+`drop_last`'s effect on both the trailing partial batch and `__len__()`;
+`_default_collate`'s tuple-transposition and plain-value cases; and,
+practically, retraining `test_embedding.py`'s own marker-token
+classifier through a real `Dataset`/`DataLoader` instead of its
+original hand-rolled batching, to the identical 100% test-accuracy
+bar -- a genuine drop-in replacement for a real `Embedding`-based
+model, not just correct in isolation.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`
