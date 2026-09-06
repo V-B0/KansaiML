@@ -174,9 +174,8 @@ class TraceValue:
         # and a batched_matmul_nt/_tn + reduce_to_shape path using the
         # identical 2D-shape check this method uses, so both paths of
         # this forward op get a real, working backward through
-        # kir.grad now -- not just eager .backward() (conv2d still has
-        # the analogous gap; a real, separate, unattempted piece of
-        # work, not fixed here).
+        # kir.grad now -- not just eager .backward() (conv2d had the
+        # analogous gap too; also closed now, see _vjp_conv2d below).
         other = self._coerce(other)
         if len(self.shape) == 2 and len(other.shape) == 2:
             if self.shape[1] != other.shape[0]:
@@ -483,6 +482,20 @@ def run(graph: Graph, *args) -> "core.Tensor":
             x, w, b = (values[i] for i in node.inputs)
             values[node.id] = x.conv2d(w, b, node.attrs["stride"], node.attrs["padding"])
             continue
+        if node.op == "conv2d_backward_bias":
+            (g_out,) = (values[i] for i in node.inputs)
+            values[node.id] = core.conv2d_backward_bias(g_out)
+            continue
+        if node.op == "conv2d_backward_weight":
+            cx, g_out = (values[i] for i in node.inputs)
+            values[node.id] = core.conv2d_backward_weight(cx, g_out, node.shape, node.attrs["stride"],
+                                                            node.attrs["padding"])
+            continue
+        if node.op == "conv2d_backward_input":
+            cw, g_out = (values[i] for i in node.inputs)
+            values[node.id] = core.conv2d_backward_input(cw, g_out, node.shape, node.attrs["stride"],
+                                                           node.attrs["padding"])
+            continue
         if node.op == "reshape":
             (x,) = (values[i] for i in node.inputs)
             values[node.id] = x.reshape(node.attrs["new_shape"])
@@ -780,6 +793,20 @@ def run_fused(graph: Graph, *args) -> "core.Tensor":
         if node.op == "conv2d":
             x, w, b = (values[i] for i in node.inputs)
             values[node.id] = x.conv2d(w, b, node.attrs["stride"], node.attrs["padding"])
+            continue
+        if node.op == "conv2d_backward_bias":
+            (g_out,) = (values[i] for i in node.inputs)
+            values[node.id] = core.conv2d_backward_bias(g_out)
+            continue
+        if node.op == "conv2d_backward_weight":
+            cx, g_out = (values[i] for i in node.inputs)
+            values[node.id] = core.conv2d_backward_weight(cx, g_out, node.shape, node.attrs["stride"],
+                                                            node.attrs["padding"])
+            continue
+        if node.op == "conv2d_backward_input":
+            cw, g_out = (values[i] for i in node.inputs)
+            values[node.id] = core.conv2d_backward_input(cw, g_out, node.shape, node.attrs["stride"],
+                                                           node.attrs["padding"])
             continue
         if node.op == "reshape":
             (x,) = (values[i] for i in node.inputs)
@@ -1144,6 +1171,28 @@ def _vjp_matmul(bwd, node, primal_id, g_out, by_id):
     return [grad_a, grad_b]
 
 
+def _vjp_conv2d(bwd, node, primal_id, g_out, by_id):
+    """conv2d's own vjp -- previously entirely absent from _VJP_RULES
+    (a real, previously-documented gap, the same shape matmul's own
+    batched-backward gap was until that got closed earlier this
+    session): three independent GradOps-backed nodes
+    (conv2d_backward_bias/_weight/_input), each recomputing im2col on
+    its own rather than sharing the single pass Tensor::conv2d's own
+    eager backward_fn closure fuses them into -- the graph has no
+    multi-output node at all (see GradOps.hpp's own comment on these
+    three), so three separate ops is the only way to express this,
+    the same reason matmul_nt/matmul_tn are two ops rather than one."""
+    x_id, w_id, b_id = node.inputs
+    x_shape, w_shape, b_shape = by_id[x_id].shape, by_id[w_id].shape, by_id[b_id].shape
+    stride, padding = node.attrs["stride"], node.attrs["padding"]
+    grad_b = bwd.add("conv2d_backward_bias", [g_out], b_shape, node.dtype)
+    grad_w = bwd.add("conv2d_backward_weight", [primal_id[x_id], g_out], w_shape, node.dtype,
+                      stride=stride, padding=padding)
+    grad_x = bwd.add("conv2d_backward_input", [primal_id[w_id], g_out], x_shape, node.dtype,
+                      stride=stride, padding=padding)
+    return [grad_x, grad_w, grad_b]
+
+
 def _vjp_relu(bwd, node, primal_id, g_out, by_id):
     x_id = node.inputs[0]
     grad_x = bwd.add("relu_backward", [primal_id[x_id], g_out], node.shape, node.dtype)
@@ -1407,6 +1456,7 @@ _VJP_RULES = {
     "sum_dim": _vjp_sum_dim,
     "max_dim": _vjp_max_dim,
     "index_select": _vjp_index_select,
+    "conv2d": _vjp_conv2d,
     "gt": _vjp_compare,
     "lt": _vjp_compare,
     "eq": _vjp_compare,
@@ -1716,6 +1766,27 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
         if node.op == "conv2d":
             x, w, b = (values[i] for i in node.inputs)
             values[node.id] = core.metal_conv2d(x, w, b, node.attrs["stride"], node.attrs["padding"])
+            continue
+        # conv2d's own backward ops have no Metal kernel either -- same
+        # honest CPU fallback as reshape/transpose/etc. immediately
+        # below (im2col/col2im's per-batch-item loop isn't the kind of
+        # elementwise/GEMM work metal_conv2d's own forward path covers).
+        if node.op == "conv2d_backward_bias":
+            flush_chain()
+            (g_out,) = (values[i] for i in node.inputs)
+            values[node.id] = core.conv2d_backward_bias(g_out)
+            continue
+        if node.op == "conv2d_backward_weight":
+            flush_chain()
+            cx, g_out = (values[i] for i in node.inputs)
+            values[node.id] = core.conv2d_backward_weight(cx, g_out, node.shape, node.attrs["stride"],
+                                                            node.attrs["padding"])
+            continue
+        if node.op == "conv2d_backward_input":
+            flush_chain()
+            cw, g_out = (values[i] for i in node.inputs)
+            values[node.id] = core.conv2d_backward_input(cw, g_out, node.shape, node.attrs["stride"],
+                                                           node.attrs["padding"])
             continue
         # reshape/transpose/slice/cat have no Metal kernel yet -- same
         # honest CPU fallback matmul_nt/matmul_tn/relu_backward/

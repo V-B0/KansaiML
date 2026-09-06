@@ -84,4 +84,22 @@ Tensor leaky_relu_backward(const Tensor& input, const Tensor& grad_output, float
 Tensor index_select_backward(const Tensor& grad_output, int64_t dim, std::vector<int64_t> indices,
                               std::vector<int64_t> input_shape);
 
+// conv2d's own vjp, exposed as THREE separate first-class ops rather
+// than one -- exactly how matmul's own vjp above is matmul_nt/matmul_tn
+// as two independent ops rather than one fused call, so kir.grad's
+// backward graph can express "this input's own gradient" without every
+// vjp rule needing a multi-output KIR node (which the graph doesn't
+// support at all -- every node here has exactly one output, matching
+// every other op in this project's own IR). Each recomputes im2col
+// independently rather than sharing it the way Tensor::conv2d's own
+// eager backward_fn closure does in one pass -- a real, deliberate
+// "correct and clear before fused" cost, the same trade this project's
+// own Adam implementation already made (several separate un-fused
+// passes over a dedicated CUDA-style kernel).
+Tensor conv2d_backward_bias(const Tensor& grad_output);
+Tensor conv2d_backward_weight(const Tensor& x, const Tensor& grad_output, std::vector<int64_t> weight_shape,
+                               int64_t stride, int64_t padding);
+Tensor conv2d_backward_input(const Tensor& weight, const Tensor& grad_output, std::vector<int64_t> x_shape,
+                              int64_t stride, int64_t padding);
+
 } // namespace kan

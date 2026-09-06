@@ -231,4 +231,30 @@ if core.metal_available():
 else:
     print("metal conv2d: SKIPPED (no Metal device available)")
 
+# ---------------------------------------------------------------------
+# 6. kir.grad: conv2d previously had no vjp rule at all (the same gap
+#    matmul's own batched backward had until that got closed) --
+#    tracing a conv2d forward and differentiating it via kir.grad used
+#    to be a hard error. Closed via three independent GradOps-backed
+#    ops (conv2d_backward_bias/_weight/_input, since the graph has no
+#    multi-output node), checked against x2/w2/b2's own eager .grad
+#    values from section 2 above -- already independently verified
+#    there against central differences, so this only needs to confirm
+#    the TRACED path reaches the identical numbers, not re-derive
+#    correctness from scratch.
+# ---------------------------------------------------------------------
+
+grad_graph = kir.trace(lambda a, ww, bb: a.conv2d(ww, bb, stride2, padding2).sum(), x2, w2, b2)
+bwd = kir.grad(grad_graph, grad_graph.inputs)
+gx_kir, gw_kir, gb_kir = kir.run(bwd, x2, w2, b2)
+check_close("conv2d kir.grad() grad_x", gx_kir.tolist(), x2.grad.tolist(), TOL_FWD)
+check_close("conv2d kir.grad() grad_weight", gw_kir.tolist(), w2.grad.tolist(), TOL_FWD)
+check_close("conv2d kir.grad() grad_bias", gb_kir.tolist(), b2.grad.tolist(), TOL_FWD)
+
+if core.metal_available():
+    gx_m, gw_m, gb_m = kir.run_metal(kir.elementwise_fusion(bwd), x2, w2, b2)
+    check_close("conv2d kir.grad() via run_metal grad_x", gx_m.tolist(), x2.grad.tolist(), TOL_FWD)
+    check_close("conv2d kir.grad() via run_metal grad_weight", gw_m.tolist(), w2.grad.tolist(), TOL_FWD)
+    check_close("conv2d kir.grad() via run_metal grad_bias", gb_m.tolist(), b2.grad.tolist(), TOL_FWD)
+
 print("\nConv2d test passed.")

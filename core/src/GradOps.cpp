@@ -123,4 +123,52 @@ Tensor index_select_backward(const Tensor& grad_output, int64_t dim, std::vector
     return grad_input;
 }
 
+Tensor conv2d_backward_bias(const Tensor& grad_output) {
+    int64_t N = grad_output.shape()[0], Cout = grad_output.shape()[1];
+    int64_t HWout = grad_output.shape()[2] * grad_output.shape()[3];
+    Tensor grad_b = Tensor::zeros({Cout}, false);
+    cpu::sum_over_batch_and_spatial(grad_output.data_ptr(), grad_b.data_ptr(), N, Cout, HWout);
+    return grad_b;
+}
+
+Tensor conv2d_backward_weight(const Tensor& x, const Tensor& grad_output, std::vector<int64_t> weight_shape,
+                               int64_t stride, int64_t padding) {
+    int64_t N = x.shape()[0], Cin = x.shape()[1], H = x.shape()[2], W = x.shape()[3];
+    int64_t Cout = weight_shape[0], kH = weight_shape[2], kW = weight_shape[3];
+    int64_t Hout = grad_output.shape()[2], Wout = grad_output.shape()[3];
+    int64_t HWout = Hout * Wout;
+    int64_t colRows = Cin * kH * kW;
+
+    Tensor grad_w = Tensor::zeros(weight_shape, false);
+    std::vector<float> col(static_cast<size_t>(colRows * HWout));
+    std::vector<float> grad_w_step(static_cast<size_t>(Cout * colRows));
+    for (int64_t n = 0; n < N; ++n) {
+        const float* xn = x.data_ptr() + n * Cin * H * W;
+        const float* dyn = grad_output.data_ptr() + n * Cout * HWout;
+        cpu::im2col(xn, col.data(), Cin, H, W, kH, kW, stride, padding, Hout, Wout);
+        cpu::matmul_nt(dyn, col.data(), grad_w_step.data(), Cout, HWout, colRows);
+        cpu::axpy_(grad_w.data_ptr(), grad_w_step.data(), 1.0f, Cout * colRows);
+    }
+    return grad_w;
+}
+
+Tensor conv2d_backward_input(const Tensor& weight, const Tensor& grad_output, std::vector<int64_t> x_shape,
+                              int64_t stride, int64_t padding) {
+    int64_t Cin = x_shape[1], H = x_shape[2], W = x_shape[3];
+    int64_t Cout = weight.shape()[0], kH = weight.shape()[2], kW = weight.shape()[3];
+    int64_t Hout = grad_output.shape()[2], Wout = grad_output.shape()[3];
+    int64_t HWout = Hout * Wout;
+    int64_t colRows = Cin * kH * kW;
+
+    Tensor grad_x = Tensor::zeros(x_shape, false);
+    std::vector<float> dcol(static_cast<size_t>(colRows * HWout));
+    for (int64_t n = 0; n < x_shape[0]; ++n) {
+        const float* dyn = grad_output.data_ptr() + n * Cout * HWout;
+        float* dxn = grad_x.data_ptr() + n * Cin * H * W;
+        cpu::matmul_tn(weight.data_ptr(), dyn, dcol.data(), Cout, colRows, HWout);
+        cpu::col2im(dcol.data(), dxn, Cin, H, W, kH, kW, stride, padding, Hout, Wout);
+    }
+    return grad_x;
+}
+
 } // namespace kan

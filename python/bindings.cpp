@@ -139,6 +139,13 @@ NB_MODULE(_core, m) {
           nb::arg("negative_slope"), nb::call_guard<nb::gil_scoped_release>());
     m.def("index_select_backward", &index_select_backward, nb::arg("grad_output"), nb::arg("dim"),
           nb::arg("indices"), nb::arg("input_shape"), nb::call_guard<nb::gil_scoped_release>());
+    m.def("conv2d_backward_bias", &conv2d_backward_bias, nb::arg("grad_output"),
+          nb::call_guard<nb::gil_scoped_release>());
+    m.def("conv2d_backward_weight", &conv2d_backward_weight, nb::arg("x"), nb::arg("grad_output"),
+          nb::arg("weight_shape"), nb::arg("stride"), nb::arg("padding"),
+          nb::call_guard<nb::gil_scoped_release>());
+    m.def("conv2d_backward_input", &conv2d_backward_input, nb::arg("weight"), nb::arg("grad_output"),
+          nb::arg("x_shape"), nb::arg("stride"), nb::arg("padding"), nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<StoragePool>(m, "StoragePool")
         .def(nb::init<>())

@@ -2407,6 +2407,44 @@ ONE token total instead of the requested count -- caught by checking
 the actual output length against the requested token count, not just
 that the call didn't crash.)
 
+## Closing kir.grad's conv2d gap
+
+The last of the two previously-documented `kir.grad` scope gaps (batched
+matmul was the other, closed earlier this session) -- `conv2d` had NO
+vjp rule in `_VJP_RULES` at all, so tracing a `conv2d` forward and
+differentiating it via `kir.grad` was a hard error; eager `.backward()`
+was always fine.
+
+Closed via three independent GradOps-backed ops --
+`conv2d_backward_bias`/`_weight`/`_input` -- rather than one fused op:
+this project's graph has no multi-output node at all (every node has
+exactly one output), the same reason matmul's own vjp is two separate
+ops (`matmul_nt`/`matmul_tn`) rather than one. Each recomputes `im2col`
+independently rather than sharing the single pass `Tensor::conv2d`'s
+own eager `backward_fn` closure fuses everything into -- a real,
+deliberate "correct and clear before fused" cost, the same trade
+Adam's own un-fused multi-pass implementation already made.
+`conv2d_backward_weight`/`_input` each take `stride`/`padding` as KIR
+attrs and read their own output SHAPE (`weight_shape`/`x_shape`)
+straight from the node's own `node.shape` rather than as a separate
+attr -- the same trick `reduce_to_shape` already uses, since the
+output's shape and the "what shape am I computing a gradient for" info
+are exactly the same thing here.
+
+Verified: each of the three new ops checked directly against
+`Tensor::conv2d`'s own eager backward closure's output, to exact
+equality (matmul's own backward kernels being reused correctly, not
+just "some gradient came out"); the full KIR path -- `kir.trace`,
+all four interpreters (`run`/`run_fused`/`run_planned`/`run_metal`),
+and `kir.grad` -- checked against `test_conv2d.py`'s own already
+central-difference-verified eager `.grad` values (not re-deriving
+correctness, just confirming the traced path reaches the identical
+numbers), including `kir.grad`'s own output run back through
+`run_metal` specifically (conv2d's backward ops have no dedicated
+Metal kernel, so this exercises the CPU-fallback path `run_metal`
+already uses for reshape/transpose/etc., now proven correct for these
+three as well).
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

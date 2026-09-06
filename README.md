@@ -59,6 +59,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — Memory leak fix | Permanent `shared_ptr` cycle in exp/sqrt/reciprocal/tanh/sigmoid, found training a real transformer | ✅ fixed |
 | — tinyshakespeare capstone | Real transformer on real text, 2,000 steps, perplexity 10.5→8.28 | ✅ done |
 | — `no_grad()` | Reentrant context manager, skips graph-building for inference/validation | ✅ done |
+| — `kir.grad` conv2d | Closed the last of the two 2D/gap-scope holes — matmul was the other | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -274,7 +275,17 @@ capstone above ran into directly: `estimate_val_loss` and `generate`
 both built full, immediately-discarded backward graphs on every call
 before this existed. Checked to correctly restore prior state after
 the block exits (including on exception, and correctly when nested)
-while never changing the actual computed value.
+while never changing the actual computed value. `conv2d` was the other
+half of `kir.grad`'s scope gap alongside matmul — no vjp rule at all,
+so tracing a conv2d forward and differentiating it via `kir.grad` was a
+hard error, eager `.backward()` always fine. Closed with three
+independent ops (the graph has no multi-output node, the same reason
+matmul's own vjp is two ops rather than one), each checked directly
+against `Tensor::conv2d`'s own eager backward to exact equality, and
+the full traced path — including through `run_metal`, which has no
+dedicated conv2d-backward kernel and falls back to CPU the same way
+reshape/transpose already do — matching already central-difference-
+verified eager gradients exactly.
 
 ## Why
 
