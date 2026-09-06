@@ -52,6 +52,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — Comparisons/`where` | `gt`/`lt`/`eq` (deliberately non-differentiable), boolean-style `where` | ✅ done |
 | — `AdamW` | Decoupled weight decay (Loshchilov & Hutter, 2019), not L2 | ✅ done |
 | — Packaging/CI | `pip install`-able (`scikit-build-core`), GitHub Actions on Apple Silicon | ✅ done |
+| — Training utilities | `clip_grad_norm_`, `StepLR`, `CosineAnnealingLR` | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -181,7 +182,16 @@ subclassing `Adam` rather than duplicating its moment bookkeeping) is
 checked to match plain `Adam` exactly at `weight_decay=0`, and its
 decay term isolated with an honest zero-gradient Tensor (so `Adam`'s
 own update contributes nothing) matches the closed-form `p₀·(1 −
-lr·weight_decay)^steps` after 10 steps.
+lr·weight_decay)^steps` after 10 steps. `clip_grad_norm_` (one global
+L2 norm across every parameter's gradient combined, not clipped per-
+parameter) is checked to rescale a gradient to exactly `max_norm`
+while preserving its direction, leave an in-bounds gradient untouched,
+and combine correctly across multiple parameters at once;
+`CosineAnnealingLR` matches the closed-form SGDR schedule at every
+point including both endpoints; and, practically, `Adam` +
+`clip_grad_norm_` + `CosineAnnealingLR` trained together — with
+clipping CONFIRMED to actually engage on the first step, not a silent
+no-op — reach loss `~0`.
 
 ## Why
 
@@ -294,7 +304,8 @@ Python (Tensor, nn.Module, optim)
 - `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`, `Tanh`,
   `Sigmoid`, `GELU`, `LeakyReLU`, `Softmax`, `LayerNorm`, `BatchNorm1d`,
   `AvgPool2d`, `MaxPool2d`, `Dropout`, `MultiHeadAttention`, `Embedding`,
-  `Sequential`, `SGD`, `Adam`, `AdamW`
+  `Sequential`, `SGD`, `Adam`, `AdamW`, `clip_grad_norm_`, `StepLR`,
+  `CosineAnnealingLR`
 - `tests/` — every claim above, checked: numerical gradient checks,
   cross-checks between independent implementations, and benchmarks that
   assert real speedups rather than just printing numbers

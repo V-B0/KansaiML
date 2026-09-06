@@ -1996,6 +1996,67 @@ whether or not the CI runner's sandboxed GPU access reports available
 -- no CI-specific skip logic had to be added anywhere for this to
 work correctly.
 
+## Gradient clipping and LR schedulers
+
+The first slice of a broader push: close the remaining gaps standing
+between this project and training something real (a small transformer
+on actual text, not synthetic data) rather than continuing to add
+isolated ops. Gradient clipping and learning-rate schedules are the
+two training-loop utilities every serious setup reaches for and this
+project had neither of -- clipping in particular matters specifically
+because the next real target is attention-based training, a genuinely
+common source of the occasional huge-gradient batch that can wreck
+Adam's moment estimates for the rest of a run if nothing bounds it.
+
+`clip_grad_norm_(params, max_norm)` computes ONE global L2 norm across
+every parameter's gradient combined, not each parameter clipped to its
+own norm independently -- clipping per-parameter would change the
+relative scale between parameters and distort the update direction,
+not just its magnitude, which defeats the point. If the combined norm
+exceeds `max_norm`, every gradient is scaled down by the identical
+factor so the combined norm becomes exactly `max_norm`; left completely
+untouched otherwise. No new kernel, and no new plumbing to expose a
+`.grad` setter either (there isn't one, deliberately -- `.grad` is
+read-only, populated only by `backward()`): the existing `axpy_`-backed
+`add_`, aliased against its own tensor (`g.add_(g, alpha=clip_coef -
+1.0)`, computing exactly `g *= clip_coef`), is the same self-aliasing
+trick AdamW's own decoupled decay already established, applied here to
+`.grad` instead of the parameter itself.
+
+`StepLR` and `CosineAnnealingLR` both just read and write
+`optimizer.lr` directly -- every optimizer class (`SGD`/`Adam`/
+`AdamW`) already re-reads `self.lr` fresh inside its own `step()`
+rather than caching it once at construction, so external mutation
+between steps was ALREADY the mechanism a schedule needs; neither
+scheduler required touching the optimizer classes at all.
+`CosineAnnealingLR` follows the standard half-cosine SGDR schedule
+(Loshchilov & Hutter -- the same authors as `AdamW`), the pairing most
+commonly used with transformer training in practice, and clamps its
+own progress at `T_max` so calling `step()` past the schedule's end
+pins `lr` at `eta_min` rather than the cosine argument overshooting
+past π and the rate climbing back up.
+
+Verified: `clip_grad_norm_`'s returned norm against a hand-computed
+value; that clipping actually rescales a gradient to land at EXACTLY
+`max_norm` (checked by recomputing the norm after clipping, not just
+trusting the formula) while preserving its direction exactly; that a
+norm already within bounds is left completely untouched; that the
+norm combines correctly across MULTIPLE parameters at once, not
+clipped one at a time (confirmed with a two-parameter case where only
+their combined vector has the expected norm); and the all-`None`-grad
+case returns `0` rather than erroring. `StepLR` against the exact
+expected step sequence across several decay boundaries.
+`CosineAnnealingLR` against the closed-form formula at every point
+across a full schedule, including both endpoints (`base_lr` before any
+`step()`, exactly `eta_min` at `T_max`) and the post-`T_max` pin.
+Practically: training a model with `Adam` + `clip_grad_norm_` +
+`CosineAnnealingLR` together, with hyperparameters chosen so clipping
+is CONFIRMED to actually engage on the very first step (initial
+gradient norm 2.95 against `max_norm=0.5`, not a silent no-op) and
+`lr` is confirmed to have actually reached `eta_min` by the end of
+training, while the model still reaches loss `~0` -- proving the three
+pieces compose correctly together, not just individually.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

@@ -139,3 +139,105 @@ class AdamW(Adam):
                 if p.grad is not None:
                     p.add_(p, alpha=decay_alpha)
         super().step()
+
+
+def clip_grad_norm_(params, max_norm: float) -> float:
+    """The standard global-L2-norm gradient clipper: computes ONE norm
+    across every parameter's gradient combined (not per-parameter --
+    clipping each parameter's grad to its own norm independently would
+    change the relative scale between parameters, distorting the
+    update direction, not just its magnitude), and if that norm exceeds
+    `max_norm`, scales every gradient down by the same factor so the
+    combined norm becomes exactly `max_norm`. Left unchanged if the
+    norm is already within bounds -- this only ever shrinks, never
+    grows, a gradient.
+
+    Exists for the same reason every serious training loop reaches for
+    it: without it, a single unlucky batch producing a huge gradient
+    (a real, common failure mode training a transformer -- the
+    intended next use for this) can blow up Adam's moment estimates
+    for the rest of training, not just that one step.
+
+    Mutates every parameter's `.grad` IN PLACE via the existing
+    axpy_-backed `add_` (`g.add_(g, alpha=clip_coef - 1.0)` computes
+    exactly `g *= clip_coef`, the same self-aliasing trick AdamW's own
+    decoupled decay already uses) rather than replacing `p.grad` with
+    a new Tensor -- there's no setter for `.grad` exposed to Python at
+    all (it's read-only, populated only by `backward()`), so in-place
+    mutation of the existing storage is the only way this CAN work, not
+    just the way it happens to be written. No new kernel: the norm
+    itself is computed via `g.mul(g).sum()`, ops that already exist.
+
+    Returns the pre-clipping total norm (matching PyTorch's own
+    `clip_grad_norm_` return value), useful for logging even when no
+    clipping actually happened this step.
+    """
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        return 0.0
+
+    total_sq = 0.0
+    for g in grads:
+        total_sq += g.mul(g).sum().tolist()[0]
+    total_norm = total_sq ** 0.5
+
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1.0:
+        for g in grads:
+            g.add_(g, alpha=clip_coef - 1.0)
+    return total_norm
+
+
+class StepLR:
+    """Decays `optimizer.lr` by a factor of `gamma` every `step_size`
+    calls to `step()` -- the simplest possible learning-rate schedule,
+    a flat rate with periodic drops. Reads/writes `optimizer.lr`
+    directly rather than needing any change to the optimizer classes
+    themselves: every optimizer above (SGD/Adam/AdamW) already reads
+    `self.lr` fresh inside its own `step()` rather than caching it once
+    at construction, so mutating it externally between optimizer steps
+    is already exactly how a schedule is meant to take effect -- this
+    class is pure bookkeeping around that existing seam, not a new
+    integration point.
+    """
+
+    def __init__(self, optimizer, step_size: int, gamma: float = 0.1):
+        self.optimizer = optimizer
+        self.step_size = step_size
+        self.gamma = gamma
+        self.last_epoch = 0
+
+    def step(self):
+        self.last_epoch += 1
+        if self.last_epoch % self.step_size == 0:
+            self.optimizer.lr *= self.gamma
+
+
+class CosineAnnealingLR:
+    """Cosine-anneals `optimizer.lr` from its value AT CONSTRUCTION TIME
+    down to `eta_min` over `T_max` calls to `step()`, following the
+    standard half-cosine schedule (Loshchilov & Hutter's SGDR paper --
+    the same authors as AdamW above): smooth, monotonic decay that
+    starts and ends flat (zero slope at both `last_epoch=0` and
+    `last_epoch=T_max`) rather than `StepLR`'s abrupt drops -- the
+    schedule most commonly paired with transformer training in
+    practice, the intended next use for this.
+
+    `base_lr` is captured once from `optimizer.lr` at construction,
+    not re-read every `step()` -- the schedule is always relative to
+    where training started, so it stays well-defined even though
+    `step()` itself mutates `optimizer.lr` on every call.
+    """
+
+    def __init__(self, optimizer, T_max: int, eta_min: float = 0.0):
+        self.optimizer = optimizer
+        self.T_max = T_max
+        self.eta_min = eta_min
+        self.base_lr = optimizer.lr
+        self.last_epoch = 0
+
+    def step(self):
+        import math
+        self.last_epoch += 1
+        progress = min(self.last_epoch, self.T_max) / self.T_max
+        self.optimizer.lr = self.eta_min + (self.base_lr - self.eta_min) * (1 + math.cos(math.pi * progress)) / 2
