@@ -2534,6 +2534,31 @@ out-of-distribution batch's own; and, practically, a real
 `Conv2d` -> `BatchNorm2d` -> `ReLU` -> `Linear` network trained on a
 synthetic two-blob image classification task reaches 100% accuracy.
 
+## Verifying serialize.py against every newer layer type
+
+Not a new feature -- a real gap in test COVERAGE closed: `save`/`load`
+predate `Embedding`, `TransformerBlock`, `MultiHeadAttention`, and
+`BatchNorm2d` entirely, and go purely through `Module.named_parameters()`'s
+own generic recursion (see `serialize.py`'s own docstring), never
+anything layer-specific -- so the mechanism SHOULD already work with
+all of them without any change. "Should, in principle" isn't the same
+claim as "does, checked" -- so it got checked directly: a model
+composing `Embedding` + two `TransformerBlock`s (each nesting
+`MultiHeadAttention`/`LayerNorm`/`Linear`/`GELU`) + `LayerNorm` +
+`Linear`, trained/initialized, saved, and loaded into a freshly (and
+differently) seeded instance, with the loaded model's forward output
+matching the original's to exact equality.
+
+Also specifically checked `BatchNorm2d`'s `running_mean`/`running_var`
+-- buffers, not parameters, so entirely OUTSIDE `named_parameters()`'s
+own scope and never touched by `save`/`load` at all, the same
+deliberate boundary every real framework's own `state_dict` convention
+draws. Confirmed by training real running statistics into one
+instance, saving, loading into a fresh instance, and checking its
+eval-mode output does NOT match the original -- proving the buffers
+were correctly left at the fresh instance's own defaults rather than
+silently (and wrongly) restored alongside `weight`/`bias`.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

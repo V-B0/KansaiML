@@ -5,8 +5,16 @@ loading an untrusted checkpoint can't execute code).
 
 Checked: a round trip through save()/load() reproduces a trained
 model's parameters bit-for-bit (float32 -> bytes -> float32 is lossless,
-not approximate) and its forward pass output exactly, for both a
-Sequential(Linear, ReLU, Linear) model and a Conv2d model; four distinct
+not approximate) and its forward pass output exactly, for a
+Sequential(Linear, ReLU, Linear) model, a Conv2d model, and a model
+composed of every layer type added AFTER this file was originally
+built (Embedding, TransformerBlock -- itself nesting MultiHeadAttention/
+LayerNorm/Linear/GELU -- and BatchNorm2d) -- confirming save()/load()'s
+generic named_parameters()-based mechanism actually still works with
+real newer layers, not just assumed to because it "should" in
+principle; BatchNorm2d's running_mean/running_var (buffers, not
+parameters) are confirmed correctly OUTSIDE this format's scope, left
+untouched by a load rather than silently restored; four distinct
 failure modes are rejected with a clear, specific error rather than a
 silent wrong load or a confusing crash; and the file's actual byte size
 matches what the header declares, computed independently rather than
@@ -14,6 +22,7 @@ just trusted.
 """
 
 import os
+import random
 import struct
 import sys
 import tempfile
@@ -97,6 +106,84 @@ serialize.save(conv, conv_path)
 fresh_conv = nn.Conv2d(2, 3, kernel_size=3, stride=1, padding=1, seed=77)
 serialize.load(fresh_conv, conv_path)
 check_close("loaded Conv2d forward output vs original", fresh_conv(conv_X).tolist(), conv_out_before)
+
+# ---------------------------------------------------------------------
+# 2b. Round trip on every layer type added AFTER serialize.py itself
+#     was built (Embedding, TransformerBlock -- itself nesting
+#     MultiHeadAttention/LayerNorm/Linear/GELU -- and BatchNorm2d,
+#     subclassing BatchNorm1d), composed together in one model. save()/
+#     load() go purely through named_parameters()'s own generic
+#     recursion (see serialize.py's own docstring), never anything
+#     layer-specific, so this SHOULD already work without serialize.py
+#     needing to know any of these types exist -- checked directly
+#     rather than just assumed, since "the mechanism is generic" is a
+#     claim worth actually exercising against real newer layers, not
+#     just believing.
+# ---------------------------------------------------------------------
+
+VOCAB, D_MODEL, HEADS, FF, LAYERS, BLOCK = 20, 16, 2, 32, 2, 6
+
+
+class TinyComposedModel(nn.Module):
+    def __init__(self, seed=0):
+        self.embed = nn.Embedding(VOCAB, D_MODEL, seed=seed)
+        self.blocks = [nn.TransformerBlock(D_MODEL, HEADS, FF, seed=seed + i + 1) for i in range(LAYERS)]
+        self.ln = nn.LayerNorm(D_MODEL)
+        self.head = nn.Linear(D_MODEL, VOCAB, seed=seed + 99)
+
+    def forward(self, ids):
+        x = self.embed(ids)
+        for block in self.blocks:
+            x = block(x)
+        return self.head(self.ln(x))
+
+
+rng = random.Random(0)
+composed_model = TinyComposedModel(seed=1)
+n_params = sum(p.numel() for _, p in composed_model.named_parameters())
+print(f"composed model (Embedding + {LAYERS}x TransformerBlock + LayerNorm + Linear): "
+      f"{n_params:,} parameters across {len(list(composed_model.named_parameters()))} tensors")
+
+batch_ids = [[rng.randint(0, VOCAB - 1) for _ in range(BLOCK)] for _ in range(3)]
+composed_out_before = composed_model(batch_ids).tolist()
+
+composed_path = os.path.join(tmpdir, "composed.kan")
+serialize.save(composed_model, composed_path)
+
+fresh_composed = TinyComposedModel(seed=999)  # different seed -- provably different init
+fresh_composed_before = fresh_composed(batch_ids).tolist()
+assert any(abs(a - b) > 1e-3 for a, b in zip(composed_out_before, fresh_composed_before)), \
+    "test setup bug: fresh model's output should differ from the trained model's before loading"
+
+serialize.load(fresh_composed, composed_path)
+check_close("loaded Embedding+TransformerBlock+LayerNorm+Linear model output vs original",
+            fresh_composed(batch_ids).tolist(), composed_out_before)
+
+# BatchNorm2d specifically -- also checks running_mean/running_var
+# (buffers, not parameters, so NOT covered by named_parameters()/the
+# round trip above at all) are correctly left at THIS model's own
+# fresh eval-mode defaults after a load, since save()/load() only ever
+# touch parameters -- a real, deliberate scope boundary (matching
+# every other framework's own state_dict convention), not an oversight
+# to fix here.
+bn2d = nn.BatchNorm2d(3)
+bn2d_X = kansai.randn([2, 3, 4, 4], std=1.0, seed=11)
+bn2d(bn2d_X)  # one training-mode call to give running_mean/running_var real, non-default values
+bn2d.eval()
+bn2d_out_before = bn2d(bn2d_X).tolist()
+
+bn2d_path = os.path.join(tmpdir, "bn2d.kan")
+serialize.save(bn2d, bn2d_path)
+
+fresh_bn2d = nn.BatchNorm2d(3)
+serialize.load(fresh_bn2d, bn2d_path)
+check_close("loaded BatchNorm2d weight/bias vs original", fresh_bn2d.weight.tolist(), bn2d.weight.tolist())
+check_close("loaded BatchNorm2d weight/bias vs original", fresh_bn2d.bias.tolist(), bn2d.bias.tolist())
+fresh_bn2d.eval()
+assert fresh_bn2d(bn2d_X).tolist() != bn2d_out_before, (
+    "fresh_bn2d's running_mean/running_var were never trained -- its eval-mode output SHOULD differ "
+    "from the original's, confirming load() correctly left buffers untouched (parameters-only scope)")
+print("BatchNorm2d save/load: weight/bias restored exactly, running_mean/running_var correctly untouched: OK")
 
 # ---------------------------------------------------------------------
 # 3. Failure modes: each rejected with a specific, useful error, not a
