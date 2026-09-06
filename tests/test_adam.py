@@ -1,7 +1,7 @@
 """Adam (Kingma & Ba, 2014) -- see python/kansai/optim.py's own
 docstring for what's implemented (the original paper's algorithm, no
-weight decay -- AdamW is a separate, unattempted addition) and why it
-was implemented in pure Python over existing Tensor ops rather than a
+weight decay -- AdamW, a separate class, has that) and why it was
+implemented in pure Python over existing Tensor ops rather than a
 dedicated kernel.
 
 Two independent checks: a step-by-step comparison against a pure-Python

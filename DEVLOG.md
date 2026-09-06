@@ -1898,6 +1898,51 @@ gradient is actually routed through whichever branch each individual
 example took, and it does, landing on `w_pos=2.0000`, `w_neg=-1.0000`
 to four decimal places.
 
+## AdamW
+
+`Adam`'s own docstring had said, since the day it shipped, that it
+deliberately didn't implement weight decay -- a real, separate,
+explicitly-flagged gap, not an oversight. Closed here as its own
+class, `AdamW(Adam)`, not a flag on `Adam` itself, for the same reason
+PyTorch keeps them separate: silently changing what "Adam" computes by
+adding an undocumented decay term would be a correctness surprise for
+anyone already relying on it, not a convenience.
+
+Decoupled decay (Loshchilov & Hutter, 2019), not the more naive L2-
+regularization approach: L2 would fold `weight_decay * p` into the
+gradient itself before Adam's own moment estimates ever see it, so it
+gets divided by `sqrt(v_hat)` along with the real gradient -- a
+parameter with a large gradient ends up decayed LESS, backwards from
+what "weight decay" is supposed to mean. Decoupled decay shrinks the
+parameter directly instead, `p *= (1 - lr * weight_decay)`, entirely
+outside the moment machinery -- same order of operations PyTorch's own
+`AdamW` uses (decay against the pre-step parameter, then the ordinary
+Adam update on the now-decayed value).
+
+Implementation is almost nothing on top of `Adam`: subclasses it
+rather than duplicating the moment bookkeeping, and the one new line
+is `p.add_(p, alpha=-lr*weight_decay)` before calling `super().step()`
+-- exactly `p *= (1 - lr*weight_decay)`, expressed through the
+existing `axpy_`-backed `add_` (safe to alias a tensor against itself:
+`axpy_` is a plain elementwise loop, `p[i] += alpha*p[i]`, no cross-
+index dependency). Zero new kernels, same "reuse what already exists"
+call every optimizer and composed layer in this project has made.
+
+Verified: with `weight_decay=0`, `AdamW.step()` produces the IDENTICAL
+parameter trajectory to plain `Adam.step()` given the same gradient
+sequence, step by step -- confirming the subclass changes nothing
+about the inherited update at the boundary condition where it
+shouldn't; the decay term isolated on its own, using a gradient that's
+a genuine Tensor (not `None` -- decay only applies when `p.grad` is
+set) but analytically exactly zero everywhere, so `Adam`'s own update
+contributes nothing (`m`/`v` stay at zero, `0/eps = 0`) and decay is
+provably the ONLY thing moving the parameter -- checked against the
+closed form `p₀ · (1 − lr·weight_decay)^steps` after 10 steps, and
+confirmed to leave the parameter completely unchanged when
+`weight_decay=0`; and, practically, `AdamW` trains the same XOR model
+`test_adam.py` trains with plain `Adam`, to the identical convergence
+bar.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`

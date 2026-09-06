@@ -26,11 +26,11 @@ class Adam:
     (and often momentum on top) to converge at a comparable rate.
 
     No weight decay here -- this is the original paper's algorithm, not
-    AdamW's decoupled-weight-decay variant, which is a real, separate,
-    unattempted addition (PyTorch ships them as two distinct classes for
-    exactly this reason: silently changing what "Adam" does by adding
-    an undocumented decay term would be a correctness surprise, not a
-    convenience).
+    AdamW's decoupled-weight-decay variant (see the AdamW class below),
+    kept as two distinct classes for exactly the reason PyTorch keeps
+    them distinct too: silently changing what "Adam" does by adding an
+    undocumented decay term would be a correctness surprise, not a
+    convenience.
 
     Implemented entirely from existing Tensor ops (mul, add, sub, sqrt,
     div, and general broadcasting for the scalar hyperparameters) rather
@@ -97,3 +97,45 @@ class Adam:
     def zero_grad(self):
         for p in self.params:
             p.zero_grad()
+
+
+class AdamW(Adam):
+    """Adam with DECOUPLED weight decay (Loshchilov & Hutter, 2019) --
+    the real, separate addition Adam's own docstring above says it
+    deliberately doesn't make. The difference from plain L2
+    regularization (which Adam doesn't implement either, but which is
+    the OTHER common way people bolt "weight decay" onto Adam) matters:
+    L2 would add `weight_decay * p` into the gradient itself, so it
+    gets divided by the second-moment estimate along with everything
+    else -- parameters with large gradients end up decayed less, which
+    is backwards from the intent. Decoupled decay instead shrinks the
+    parameter directly, `p *= (1 - lr * weight_decay)`, entirely
+    outside the moment estimates -- the same order of operations
+    PyTorch's own AdamW uses (decay first, against the pre-step
+    parameter, then the ordinary Adam update on the now-decayed
+    value), not a coincidence: it's what makes the decay rate behave
+    the way `weight_decay` is documented to.
+
+    Subclasses Adam rather than duplicating its moment bookkeeping --
+    the only difference is one extra in-place step before the
+    inherited Adam update runs. `p.add_(p, alpha=-lr*weight_decay)`
+    computes exactly `p *= (1 - lr*weight_decay)` via the existing
+    axpy_-backed add_ (safe to alias `p` against itself: axpy_ is a
+    plain elementwise loop, `p[i] += alpha*p[i]`, no cross-index
+    dependency), so this needs no new kernel either -- the same "reuse
+    what already exists" approach every optimizer/composed-layer
+    addition in this project has taken.
+    """
+
+    def __init__(self, params, lr: float = 1e-3, betas: tuple = (0.9, 0.999), eps: float = 1e-8,
+                 weight_decay: float = 0.01):
+        super().__init__(params, lr=lr, betas=betas, eps=eps)
+        self.weight_decay = weight_decay
+
+    def step(self):
+        if self.weight_decay != 0.0:
+            decay_alpha = -self.lr * self.weight_decay
+            for p in self.params:
+                if p.grad is not None:
+                    p.add_(p, alpha=decay_alpha)
+        super().step()

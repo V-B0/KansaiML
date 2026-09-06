@@ -49,6 +49,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — MultiHeadAttention | Real scaled dot-product attention, cross-attention, masking | ✅ done |
 | — Indexing/`Embedding` | `index_select` (repeat-accumulating backward), token-lookup `nn.Embedding` | ✅ done |
 | — Comparisons/`where` | `gt`/`lt`/`eq` (deliberately non-differentiable), boolean-style `where` | ✅ done |
+| — `AdamW` | Decoupled weight decay (Loshchilov & Hutter, 2019), not L2 | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -173,7 +174,12 @@ gradient into `a`/`b` at exactly the positions each branch was taken
 and never into `cond`, through both eager and the full traced
 `kir.grad` path; practically, training `where(x>0, w_pos·x, w_neg·x)`
 with `Adam` on a genuinely piecewise-linear target recovers both true
-slopes to four decimal places.
+slopes to four decimal places. `AdamW` (decoupled weight decay,
+subclassing `Adam` rather than duplicating its moment bookkeeping) is
+checked to match plain `Adam` exactly at `weight_decay=0`, and its
+decay term isolated with an honest zero-gradient Tensor (so `Adam`'s
+own update contributes nothing) matches the closed-form `p₀·(1 −
+lr·weight_decay)^steps` after 10 steps.
 
 ## Why
 
@@ -273,7 +279,7 @@ Python (Tensor, nn.Module, optim)
 - `python/kansai/{nn,optim}.py` — `Linear`, `Conv2d`, `ReLU`, `Tanh`,
   `Sigmoid`, `GELU`, `LeakyReLU`, `Softmax`, `LayerNorm`, `BatchNorm1d`,
   `AvgPool2d`, `MaxPool2d`, `Dropout`, `MultiHeadAttention`, `Embedding`,
-  `Sequential`, `SGD`, `Adam`
+  `Sequential`, `SGD`, `Adam`, `AdamW`
 - `tests/` — every claim above, checked: numerical gradient checks,
   cross-checks between independent implementations, and benchmarks that
   assert real speedups rather than just printing numbers
