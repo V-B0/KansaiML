@@ -42,6 +42,7 @@ benchmark, every bug, every dead end, in the order it happened.
 | — Core ops | `reshape`/`transpose`/`slice`/`cat`, general broadcasting, `sqrt`/`reciprocal`/`div`, `Adam` | ✅ done |
 | — Activations/losses | `tanh`/`sigmoid`/`gelu`/`leaky_relu`, `sum`/`mean`/`max(dim)`, `softmax`, `cross_entropy` | ✅ done |
 | — Normalization | `LayerNorm`, `BatchNorm1d`, `Module.train()`/`eval()` | ✅ done |
+| — Real benchmark | MNIST end to end: **97.58% test accuracy**, 31.7s | ✅ done |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
 through three independent execution paths (eager autograd, a jit'd KIR
@@ -117,7 +118,12 @@ statistics in eval mode rather than a fresh batch's (checked by feeding
 a wildly out-of-distribution example after training and confirming the
 output isn't the near-zero a fresh batch's own trivial statistics would
 give), and the same 3-class classifier reaches 100% accuracy again with
-either layer dropped in.
+either layer dropped in; on real MNIST (60,000 training / 10,000
+held-out test images, not a synthetic proxy), `Linear(784→256) →
+BatchNorm1d → ReLU → Linear(256→64) → ReLU → Linear(64→10)` trained with
+`Adam` reaches **97.58% test accuracy in 31.7s** (15 epochs, measured
+one real run, zero hyperparameter search) — see
+[`examples/mnist/`](examples/mnist/) to reproduce it.
 
 ## Why
 
@@ -220,6 +226,9 @@ Python (Tensor, nn.Module, optim)
 - `tests/` — every claim above, checked: numerical gradient checks,
   cross-checks between independent implementations, and benchmarks that
   assert real speedups rather than just printing numbers
+- `examples/mnist/` — the real end-to-end MNIST benchmark above,
+  kept separate from `tests/` (needs network access, takes tens of
+  seconds) rather than part of the fast/deterministic suite
 
 ## Documentation
 

@@ -1442,6 +1442,55 @@ classifier from the previous section trained twice more -- once with a
 accuracy, confirming each is a genuine working layer in a real training
 loop, not just forward-correct in isolation.
 
+## A real end-to-end benchmark: MNIST
+
+Every check in this project up to this point trained on XOR, a tiny
+synthetic conv net, or a hand-generated 2D Gaussian-blob classifier --
+each real in its own way (genuine gradients, genuine convergence), but
+each also small and synthetic enough that "the framework can train a
+real dataset end to end" was still an inference from smaller pieces,
+not something directly demonstrated. `examples/mnist/` closes that gap:
+real MNIST (60,000 training images, 10,000 held-out test images, actual
+handwritten digits 0-9, downloaded from the same mirror torchvision
+itself uses -- the original yann.lecun.com host has been unreliable for
+years), a real mini-batch training loop, and a real test-set accuracy
+number, using the same toolchain the rest of this devlog already proved
+piece by piece: `Linear`, `BatchNorm1d`, `ReLU`, `cross_entropy`, `Adam`.
+
+Deliberately kept separate from `tests/`: this needs network access (to
+download MNIST on first run) and takes tens of seconds, both properties
+the actual test suite -- fast, deterministic, no external dependencies
+-- is built around avoiding. `examples/mnist/download_mnist.py` parses
+the standard IDX ubyte format directly (stdlib `struct`/`gzip`/`array`
+only, no `numpy`, matching this project's own "built from scratch"
+identity even in an example script that isn't part of the framework
+itself) and caches the downloaded files under `examples/mnist/data/`
+(gitignored, so the ~11MB compressed dataset never enters git history).
+One real, stated simplification in `train_mnist.py`: the training set is
+shuffled once before training starts, not re-shuffled every epoch --
+Kansai has no gather/index-select op, so a genuine per-epoch reshuffle
+would mean rebuilding the full flat 60000x784 dataset every epoch
+instead of once; MNIST's own canonical file order isn't sorted by class
+already, so sequential mini-batches after the one shuffle still see a
+reasonable mix of digits each batch, a defensible middle ground for a
+benchmark script, not silently passed off as full per-epoch shuffling.
+
+Model: `Linear(784→256) → BatchNorm1d → ReLU → Linear(256→64) → ReLU →
+Linear(64→10)`, trained with `Adam` (`lr=1e-3`) and `cross_entropy`,
+batch size 128, 15 epochs. Measured, one real run on this machine:
+**97.58% test accuracy** (10,000 held-out images the model never
+trained on) in **31.7 seconds** total (≈2.1s/epoch, 468 batches/epoch)
+-- a perfectly ordinary result for a small MLP on MNIST (nowhere near
+the ~99.7% a tuned CNN reaches, and not trying to be -- the point of
+this benchmark is proving the training loop is real end to end, not
+chasing a leaderboard number), reached with zero hyperparameter search.
+Test accuracy is evaluated with `model.eval()` (so `BatchNorm1d`
+normalizes by its running statistics, not the test batch's own -- see
+the previous section for why that distinction is load-bearing here, not
+cosmetic) against the full 10,000-image test set, batched only to keep
+any one matmul at a modest size, not because a single 10000×784 matmul
+would actually trouble Accelerate.
+
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler, Python ≥ 3.9, and `nanobind`
