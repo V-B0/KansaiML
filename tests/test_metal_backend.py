@@ -235,4 +235,71 @@ print(f"  run_metal (batched elementwise): {t_batched*1e3:7.3f} ms/iter")
 print(f"  speedup: {t_unbatched/t_batched:.2f}x")
 assert t_batched < t_unbatched, "batching should be faster on the real graph, not just the synthetic benchmark"
 
+# ---------------------------------------------------------------------
+# 5. Completing Phase 3's op coverage: add/sub/mul/relu/sum/mean each
+#    got their own Metal kernel (run_metal used to fall back to CPU for
+#    all of these -- the loss computation, mostly). Correctness first,
+#    including the reduction kernel at sizes straddling its fixed
+#    256-thread width (255, 256, 257) specifically, since that boundary
+#    is exactly where an off-by-one in the grid-stride accumulation
+#    would show up and nowhere else.
+# ---------------------------------------------------------------------
+
+x1 = kansai.randn([8, 16], std=1.0, seed=30)
+x2 = kansai.randn([8, 16], std=1.0, seed=31)
+
+check_ops = [
+    ("metal_add", core.metal_add(x1, x2), x1.add(x2)),
+    ("metal_sub", core.metal_sub(x1, x2), x1.sub(x2)),
+    ("metal_mul", core.metal_mul(x1, x2), x1.mul(x2)),
+    ("metal_relu", core.metal_relu(x1), x1.relu()),
+    ("metal_fused_sub_square", core.metal_fused_sub_square(x1, x2), x1.sub(x2).mul(x1.sub(x2))),
+]
+for name, got, expected in check_ops:
+    d = max_diff(got.tolist(), expected.tolist())
+    assert d < TOL, f"{name} mismatch: {d}"
+    print(f"{name} matches CPU (max diff {d:.2e})")
+
+for n in (1, 4, 255, 256, 257, 1000, 100_000):
+    xn = kansai.randn([n], std=1.0, seed=200 + n)
+    d_sum = abs(core.metal_sum(xn).tolist()[0] - xn.sum().tolist()[0])
+    d_mean = abs(core.metal_mean(xn).tolist()[0] - xn.mean().tolist()[0])
+    # Reduction-order floating point error grows with n -- a looser,
+    # n-scaled tolerance here, not the fixed TOL above, is the honest
+    # bar for a sum of n independently-rounded terms.
+    assert d_sum < 1e-6 * n, f"metal_sum(n={n}) mismatch: {d_sum}"
+    assert d_mean < TOL, f"metal_mean(n={n}) mismatch: {d_mean}"
+print(f"metal_sum/metal_mean match CPU across sizes {[1, 4, 255, 256, 257, 1000, 100_000]} "
+      f"(255/256/257 straddle the reduction kernel's fixed 256-thread width)")
+
+# ---------------------------------------------------------------------
+# 6. The actual point: a full forward-and-loss graph -- matmul,
+#    fused_bias_relu, matmul, add, fused_sub_square, mean -- dispatched
+#    entirely through run_metal, with nothing falling back to CPU.
+#    Matches kir.run()'s CPU result exactly (well within TOL).
+# ---------------------------------------------------------------------
+
+loss_model = nn.Sequential(nn.Linear(2, 8, seed=3), nn.ReLU(), nn.Linear(8, 1, seed=4))
+loss_X = kansai.tensor([[0, 0], [0, 1], [1, 0], [1, 1]])
+loss_Y = kansai.tensor([[0], [1], [1], [0]])
+
+
+def forward_and_loss(x):
+    pred = loss_model(x)
+    diff = pred.sub(loss_Y)
+    return diff.mul(diff).mean()
+
+
+loss_graph = kir.trace(forward_and_loss, loss_X)
+loss_fused = kir.elementwise_fusion(loss_graph)
+loss_ops = [n.op for n in loss_fused.nodes]
+assert "conv2d" not in loss_ops  # sanity: this graph has no ops run_metal can't handle
+print(f"\nfull forward+loss graph: {loss_ops}")
+
+loss_cpu = kir.run(loss_graph, loss_X).tolist()
+loss_metal = kir.run_metal(loss_fused, loss_X).tolist()
+d_loss = abs(loss_cpu[0] - loss_metal[0])
+assert d_loss < TOL, f"full-graph loss mismatch: {d_loss}"
+print(f"full forward+loss on Metal matches CPU exactly (cpu={loss_cpu[0]:.6f}, metal={loss_metal[0]:.6f})")
+
 print("\nMetal backend test passed.")

@@ -902,15 +902,22 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
     as the default here: it's a strict upgrade in every case measured
     except a wash at the smallest sizes, and it's what actually gets
     Metal to parity with, or past, Accelerate at large problem sizes,
-    which hand tiling alone never reached); fused_bias_relu goes to
-    Metal; a plain bias-broadcast add (a layer's final, unactivated
-    output -- elementwise_fusion only fuses add+relu *pairs*, so a solo
-    add stays a solo add) goes to metal_add_bias; everything else
-    (sub/mul/sum/mean -- the loss computation, tiny and not what this is
-    meant to demonstrate) still runs on CPU. A real backend would cover
-    the whole op set; proving the contract holds for the two ops that
-    dominate a Linear layer's cost is the actual point here, not a
-    complete GPU op library.
+    which hand tiling alone never reached); fused_bias_relu and
+    fused_sub_square go to their dedicated Metal kernels; a plain
+    bias-broadcast add (a layer's final, unactivated output --
+    elementwise_fusion only fuses add+relu *pairs*, so a solo add stays
+    a solo add) goes to metal_add_bias. Every other op this graph
+    vocabulary has -- sub, mul, relu, sum, mean -- now has its own Metal
+    kernel too (see backend/metal/MetalOps.mm), completing what used to
+    be a real gap: the loss computation (sub -> mul -> mean, or the
+    fused_sub_square shape of it) used to fall back to CPU inside
+    run_metal even when everything upstream of it was GPU-resident.
+    conv2d goes to metal_conv2d: im2col on CPU (a memory-layout unfold,
+    not FLOP-heavy) followed by metal_matmul_mps per batch item for the
+    actual GEMM, plus the NCHW bias broadcast on Metal -- same
+    im2col+matmul structure as the CPU Conv2d, just with the GEMM (the
+    part that actually dominates runtime at any real channel count) on
+    the GPU instead of Accelerate.
 
     Consecutive bias_relu/add_bias nodes -- wherever one's only
     non-bias input is the immediately preceding one, e.g. a second
@@ -978,7 +985,38 @@ def run_metal(graph: Graph, *args) -> "core.Tensor":
             continue
         if node.op == "fused_sub_square":
             a, b = (values[i] for i in node.inputs)
-            values[node.id] = core.fused_sub_square(a, b)
+            values[node.id] = core.metal_fused_sub_square(a, b)
+            continue
+        if node.op == "add":
+            # Only a same-shape add ever reaches here -- a bias-broadcast
+            # one was already caught by _metal_elementwise_kind above and
+            # routed through the batched chain instead.
+            a, b = (values[i] for i in node.inputs)
+            values[node.id] = core.metal_add(a, b)
+            continue
+        if node.op == "sub":
+            a, b = (values[i] for i in node.inputs)
+            values[node.id] = core.metal_sub(a, b)
+            continue
+        if node.op == "mul":
+            a, b = (values[i] for i in node.inputs)
+            values[node.id] = core.metal_mul(a, b)
+            continue
+        if node.op == "relu":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = core.metal_relu(x)
+            continue
+        if node.op == "sum":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = core.metal_sum(x)
+            continue
+        if node.op == "mean":
+            (x,) = (values[i] for i in node.inputs)
+            values[node.id] = core.metal_mean(x)
+            continue
+        if node.op == "conv2d":
+            x, w, b = (values[i] for i in node.inputs)
+            values[node.id] = core.metal_conv2d(x, w, b, node.attrs["stride"], node.attrs["padding"])
             continue
         fn = _OP_TABLE[node.op]
         values[node.id] = fn(*(values[i] for i in node.inputs))

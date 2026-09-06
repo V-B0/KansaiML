@@ -190,11 +190,10 @@ assert final_loss < 0.01, "conv net did not learn the patch-sum task"
 
 # ---------------------------------------------------------------------
 # 4. KIR integration: trace() captures conv2d as a first-class node, and
-#    run()/run_planned() both dispatch it correctly. Not yet wired into
-#    elementwise_fusion (no fusable pattern involves conv2d) or
-#    run_metal (no Metal conv kernel exists) -- both would raise a clear
-#    error rather than silently mishandling a conv2d node, since neither
-#    has a case for it.
+#    run()/run_planned() both dispatch it correctly. Not wired into
+#    elementwise_fusion (no fusable pattern involves conv2d -- it would
+#    raise a clear error rather than silently mishandling the node,
+#    since no case exists for it there).
 # ---------------------------------------------------------------------
 
 kir_model = nn.Conv2d(2, 3, kernel_size=3, stride=1, padding=1, seed=5)
@@ -211,5 +210,25 @@ kir_plan = kir.plan_memory(kir_graph)
 kir_pool = core.StoragePool()
 out_planned = kir.run_planned(kir_graph, kir_plan, kir_pool, kir_X).tolist()
 check_close("kir.run_planned() conv2d vs eager", out_planned, out_eager, TOL_FWD)
+
+# ---------------------------------------------------------------------
+# 5. Metal conv2d: im2col (CPU) + metal_matmul_mps per batch item + a
+#    Metal NCHW bias broadcast (see core/src/MetalOps.cpp's metal_conv2d
+#    and backend/metal's add_bias_nchw kernel). Checked both directly
+#    (core.metal_conv2d vs the eager CPU conv2d) and through run_metal's
+#    dispatch, at a shape deliberately not tile-aligned (stride>1,
+#    padding>0, odd spatial size) to catch an im2col/output-indexing
+#    bug that a tile-aligned shape could hide.
+# ---------------------------------------------------------------------
+
+if core.metal_available():
+    out_metal_direct = core.metal_conv2d(kir_X, kir_model.weight, kir_model.bias,
+                                          kir_model.stride, kir_model.padding).tolist()
+    check_close("metal_conv2d vs eager", out_metal_direct, out_eager, TOL_FWD)
+
+    out_run_metal = kir.run_metal(kir_graph, kir_X).tolist()
+    check_close("kir.run_metal() conv2d vs eager", out_run_metal, out_eager, TOL_FWD)
+else:
+    print("metal conv2d: SKIPPED (no Metal device available)")
 
 print("\nConv2d test passed.")

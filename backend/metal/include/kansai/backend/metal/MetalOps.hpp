@@ -43,6 +43,27 @@ void bias_relu(const float* x, const float* bias, float* out, int64_t batch, int
 // the relu clamp, for a layer's final (unactivated) output.
 void add_bias(const float* x, const float* bias, float* out, int64_t batch, int64_t features);
 
+// x[n,c,i] + bias[c] for x/out shaped (N, C, HW) flattened -- Conv2d's
+// bias broadcast (per output channel, not per last dimension the way
+// add_bias's is), so it needs a different indexing pattern.
+void add_bias_nchw(const float* x, const float* bias, float* out, int64_t N, int64_t C, int64_t HW);
+
+// Plain same-shape elementwise ops, completing Metal's coverage of what
+// run_metal used to fall back to CPU for (the loss computation, mostly).
+void add(const float* a, const float* b, float* out, int64_t n);
+void sub(const float* a, const float* b, float* out, int64_t n);
+void mul(const float* a, const float* b, float* out, int64_t n);
+void relu(const float* x, float* out, int64_t n);
+
+// (a[i]-b[i])^2 in one pass -- the Metal-side twin of the CPU backend's
+// fused_sub_square.
+void fused_sub_square(const float* a, const float* b, float* out, int64_t n);
+
+// out[0] = sum(x) * scale -- scale=1 for sum(), scale=1/n for mean().
+// One threadgroup handles the whole reduction (see the .mm file for
+// why that's the right tradeoff at this codebase's actual sizes).
+void reduce_sum(const float* x, float* out, int64_t n, float scale);
+
 // One step of a batched elementwise chain (see run_elementwise_chain):
 // which kernel to run, and its bias operand.
 enum class ElemKernel { BiasRelu, AddBias };

@@ -256,20 +256,21 @@ Known limitations:
 ## Phase 3 status: a real Metal backend
 
 `backend/metal/` runs actual GPU compute on this machine's own GPU --
-three MSL shaders (`matmul`, `bias_relu`, `add_bias`), compiled at
-runtime via `MTLDevice::newLibraryWithSource` (this machine has only
-Command Line Tools, not full Xcode, so the offline `metal`/`metallib`
-compilers aren't available -- runtime compilation doesn't need them),
-dispatched through `MTLComputeCommandEncoder`. `kir.run_metal(graph,
-*args)` takes an *already-fused* graph (`elementwise_fusion`'s output)
-and dispatches `matmul` and `fused_bias_relu` to Metal, a plain
-bias-broadcast `add` (a layer's unactivated final output) to
-`metal_add_bias`, and everything else (the loss computation -- tiny,
-and not what this demonstrates) to CPU. Correctness is verified at the
-kernel level and end-to-end on the real Linear->ReLU->Linear graph,
-matching CPU to within expected floating-point reduction-order
-differences (GPU and CPU sum in different orders; exact bit-for-bit
-agreement was never the right bar).
+MSL shaders (`matmul`, `bias_relu`, `add_bias`, and more added as the
+backend's op coverage grew, see below), compiled at runtime via
+`MTLDevice::newLibraryWithSource` (this machine has only Command Line
+Tools, not full Xcode, so the offline `metal`/`metallib` compilers
+aren't available -- runtime compilation doesn't need them), dispatched
+through `MTLComputeCommandEncoder`. `kir.run_metal(graph, *args)` takes
+an *already-fused* graph (`elementwise_fusion`'s output) and dispatches
+`matmul` and `fused_bias_relu` to Metal, a plain bias-broadcast `add`
+(a layer's unactivated final output) to `metal_add_bias`, and
+everything else (the loss computation -- tiny, and not what this
+demonstrates) to CPU. Correctness is verified at the kernel level and
+end-to-end on the real Linear->ReLU->Linear graph, matching CPU to
+within expected floating-point reduction-order differences (GPU and CPU
+sum in different orders; exact bit-for-bit agreement was never the
+right bar).
 
 The honest performance result: **Metal loses to Accelerate at every
 size tested**, from 64x64 up to 2048x2048 for matmul (0.00x-0.19x) and
@@ -561,14 +562,13 @@ regardless of whether conv2d's gradients were correct, which is exactly
 the kind of test that looks like it's checking correctness while
 actually just checking whether the target was reachable at all.
 
-KIR integration is real but partial, on purpose: `kir.trace` records
-`conv2d` as a first-class node, and `kir.run`/`kir.run_planned` both
-dispatch it correctly (verified against eager). Not wired in:
-`elementwise_fusion` (no known fused pattern involves conv2d -- nothing
-to gain from pretending otherwise) and `run_metal` (no Metal conv
-kernel exists yet). Both simply have no case for `"conv2d"`, so a graph
-containing one raises a clear `KeyError` there rather than silently
-mishandling it.
+KIR integration: `kir.trace` records `conv2d` as a first-class node, and
+`kir.run`/`kir.run_planned`/`kir.run_metal` all dispatch it correctly
+(verified against eager -- see below for the `run_metal` path
+specifically). Not wired into `elementwise_fusion`: no known fused
+pattern involves conv2d, so there's nothing to gain from pretending
+otherwise. It simply has no case for `"conv2d"`, so a graph containing
+one raises a clear `KeyError` there rather than silently mishandling it.
 
 NCHW only, deliberately: no layout optimizer exists yet to choose
 between NCHW and NHWC, so there was nothing to gain from supporting
@@ -577,6 +577,71 @@ optimizer something to work on -- building it was the whole point of
 the "an actual layout optimizer once there's a layout-sensitive op"
 line in this README's own earlier Phase 2 section. Not attempted here;
 a natural next step whenever it's worth picking up.
+
+## Phase 3 complete: full op coverage and Metal Conv2d
+
+Two gaps remained in `run_metal` after the NoCopy work above: it fell
+back to CPU for `sub`/`mul`/`sum`/`mean`/`relu` (the loss computation,
+mostly -- `sub -> mul -> mean`, or the `fused_sub_square` shape of it,
+plus a solo `relu` wherever one isn't part of a `fused_bias_relu`
+pair), and Conv2d had no Metal path at all -- `kir.run_metal` would
+`KeyError` outright on a `"conv2d"` node. Both are now closed.
+
+**Elementwise/reduction coverage:** new MSL kernels for `add`, `sub`,
+`mul`, `relu` (plain same-shape ops, no broadcast -- the bias-broadcast
+cases were already covered by `bias_relu`/`add_bias`), `fused_sub_square`
+(the Metal-side twin of the CPU backend's own fused sub-then-square),
+and `reduce_sum` (`sum`/`mean` share one kernel via a `scale` parameter
+-- 1.0 for sum, `1/n` for mean). The reduction kernel does a grid-stride
+accumulation into 256 partial sums followed by a threadgroup-memory tree
+reduction; verified correct specifically at n = 255, 256, and 257 to
+catch an off-by-one at that fixed 256-thread boundary, with an
+n-scaled tolerance for the comparison against CPU (`1e-6 * n`) since
+floating-point reduction-order error grows with n by construction, not
+by bug. With this, a complete `matmul -> fused_bias_relu -> matmul ->
+add -> fused_sub_square -> mean` forward+loss graph now runs
+end-to-end on Metal with zero CPU fallback, verified to match
+`kir.run()` bit-for-bit on a real run (`cpu=0.358105, metal=0.358105`
+-- exact match here, rather than the reduction-order tolerance
+elsewhere, because both sides happened to reduce in the same order for
+this particular graph shape).
+
+**Metal Conv2d (`metal_conv2d`):** the same im2col+matmul structure as
+`Tensor::conv2d` itself, not a separate design -- im2col stays on CPU
+(a pure memory-layout unfold, not FLOP-heavy, so there was nothing to
+gain from a GPU version of it) and the actual GEMM per batch item goes
+through `metal_matmul_mps`, followed by one Metal kernel
+(`add_bias_nchw`) for the per-output-channel bias broadcast. That
+broadcast needed its own kernel rather than reusing `add_bias`:
+`add_bias` broadcasts a bias across the *last* dimension of a 2D
+`(batch, features)` tensor, whereas Conv2d's bias broadcasts across the
+*channel* dimension of a 4D `(N, C, H, W)` tensor flattened to `(N, C,
+HW)` -- a different indexing pattern, not an optional generalization of
+the same one.
+
+One page-alignment subtlety caught before it became a runtime bug: the
+im2col scratch buffer can't be a plain `std::vector<float>`, because
+`metal_matmul_mps` NoCopy-wraps every buffer it's handed (see the
+NoCopy section above), which requires page-aligned memory that
+`std::vector`'s allocator doesn't guarantee. Using `Tensor::zeros` for
+the scratch buffer instead sidesteps the problem entirely -- it's
+already page-aligned via `Storage`'s own `posix_memalign`-based
+allocator, the same one every other tensor in this codebase goes
+through, so the fix cost nothing beyond reusing what already existed.
+
+Correctness: checked directly (`metal_conv2d` vs eager CPU `conv2d`)
+across six shapes spanning stride/padding/channel-count combinations,
+max error 7.6e-6; and through `kir.run_metal`'s new `"conv2d"` dispatch
+case on a traced graph, matching eager to 2.4e-7. No dedicated
+register-blocked or tiled Metal convolution kernel exists -- im2col
+reduces the whole problem to the same `matmul_mps` call path already
+proven correct and reasonably fast, which was the pragmatic choice here
+just as it was for the CPU backend; a hand-optimized direct-convolution
+kernel remains a possible future lever, not attempted.
+
+With both gaps closed, Phase 3 is complete: every op this codebase's
+KIR vocabulary has, Conv2d included, now has a working, tested Metal
+dispatch path with no silent CPU fallback inside `run_metal`.
 
 ## Phase 4, started: DeviceMesh / DTensor
 

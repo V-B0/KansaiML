@@ -13,6 +13,20 @@ Tensor metal_matmul(const Tensor& a, const Tensor& b);
 Tensor metal_matmul_mps(const Tensor& a, const Tensor& b);
 Tensor metal_bias_relu(const Tensor& x, const Tensor& bias);
 Tensor metal_add_bias(const Tensor& x, const Tensor& bias);
+Tensor metal_add(const Tensor& a, const Tensor& b);
+Tensor metal_sub(const Tensor& a, const Tensor& b);
+Tensor metal_mul(const Tensor& a, const Tensor& b);
+Tensor metal_relu(const Tensor& x);
+Tensor metal_fused_sub_square(const Tensor& a, const Tensor& b);
+Tensor metal_sum(const Tensor& x);
+Tensor metal_mean(const Tensor& x);
+
+// im2col (CPU -- a memory-layout unfold, not FLOP-heavy, reusing the
+// exact kernel Tensor::conv2d itself uses) followed by one
+// metal_matmul_mps call per batch item for the actual GEMM, plus the
+// NCHW bias broadcast on Metal. Mirrors Tensor::conv2d's own structure;
+// see that method's declaration in Tensor.hpp for the shape contract.
+Tensor metal_conv2d(const Tensor& x, const Tensor& weight, const Tensor& bias, int64_t stride, int64_t padding);
 
 // Runs a sequence of elementwise ops (each kind either "bias_relu" or
 // "add_bias") as ONE Metal command buffer instead of one per step --

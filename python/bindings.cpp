@@ -99,7 +99,16 @@ NB_MODULE(_core, m) {
     m.def("metal_matmul_mps", &metal_matmul_mps, nb::arg("a"), nb::arg("b"));
     m.def("metal_bias_relu", &metal_bias_relu, nb::arg("x"), nb::arg("bias"));
     m.def("metal_add_bias", &metal_add_bias, nb::arg("x"), nb::arg("bias"));
+    m.def("metal_add", &metal_add, nb::arg("a"), nb::arg("b"));
+    m.def("metal_sub", &metal_sub, nb::arg("a"), nb::arg("b"));
+    m.def("metal_mul", &metal_mul, nb::arg("a"), nb::arg("b"));
+    m.def("metal_relu", &metal_relu, nb::arg("x"));
+    m.def("metal_fused_sub_square", &metal_fused_sub_square, nb::arg("a"), nb::arg("b"));
+    m.def("metal_sum", &metal_sum, nb::arg("x"));
+    m.def("metal_mean", &metal_mean, nb::arg("x"));
     m.def("metal_elementwise_chain", &metal_elementwise_chain, nb::arg("x"), nb::arg("kinds"), nb::arg("biases"));
+    m.def("metal_conv2d", &metal_conv2d, nb::arg("x"), nb::arg("weight"), nb::arg("bias"),
+          nb::arg("stride"), nb::arg("padding"));
 #else
     m.def("metal_available", []() { return false; });
 #endif

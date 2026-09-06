@@ -37,7 +37,7 @@ benchmark, every bug, every dead end, in the order it happened.
 |---|---|---|
 | 1 — Foundation | Tensor/autograd core, CPU backend, `nn`/`optim` | ✅ done |
 | 2 — KIR | Tracing, fusion, memory pooling, source-transform autograd | ✅ done |
-| 3 — GPU backend | Real Metal compute (tiled kernel + MPS, competitive at scale) | 🟡 in progress |
+| 3 — GPU backend | Real Metal compute (tiled kernel + MPS, full op + Conv2d coverage) | ✅ done |
 | 4 — Distributed | `DeviceMesh` + `DTensor` data model | 🟡 started — no distributed autograd yet |
 
 **Verified, not asserted:** a two-layer MLP trains XOR to convergence
@@ -50,11 +50,14 @@ Metal's `MPSMatrixMultiplication` path, paired with zero-copy buffers
 Accelerate from 2048² up (1.5-1.6x at 4096²) *and* at the thin-batch
 shape a real Linear layer's forward pass actually produces (1.3x at
 128×4096 @ 4096×4096 — a shape that lost 3x to Accelerate before the
-zero-copy work); `Conv2d`'s backward is checked against numerical
-differentiation and its forward against an independent reference
-implementation; a batch sharded across `DeviceMesh(["cpu", "metal"])`
-runs each shard through that device's real interpreter and gathers back
-to exactly the unsharded result.
+zero-copy work); every op in the KIR vocabulary, `Conv2d` included, now
+has a working Metal dispatch path (`kir.run_metal` has zero CPU
+fallback left), verified against CPU on a full forward+loss graph and,
+for `Conv2d` specifically, against an independent nested-loop reference
+implementation with error on the order of 1e-6; `Conv2d`'s backward is
+checked against numerical differentiation; a batch sharded across
+`DeviceMesh(["cpu", "metal"])` runs each shard through that device's
+real interpreter and gathers back to exactly the unsharded result.
 
 ## Why
 
